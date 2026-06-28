@@ -1,0 +1,50 @@
+# ── Local data: never publish ─────────────────────────────────────────
+# SQLite index/database (your browsing history + metadata cache)
+*.db
+*.sqlite
+*.sqlite3
+*.db-shm
+*.db-wal
+.index/
+
+# Thumbnail cache
+.thumbs/
+
+# Atomic-write temp files
+*.tmp
+
+# Personal runtime config (holds your extra media folder paths)
+sidebar_gallery_config.json
+
+# Personal layout/settings: the server rewrites this live. New installs use
+# the built-in defaults derived from section_catalog.json.
+sidebar_gallery_settings.json
+
+# Theme/preset exports: user-generated, and the app recreates this folder.
+themes/
+
+# ── Python ────────────────────────────────────────────────────────────
+__pycache__/
+*.py[cod]
+*.cpython*
+
+# ── Node ──────────────────────────────────────────────────────────────
+node_modules/
+
+# ── OS junk ───────────────────────────────────────────────────────────
+.DS_Store
+Thumbs.db
+
+# ── Local-only: dev notes, AI tooling, editor state (not for publish) ──
+Transcripts And ChatLogs/
+.agents/
+.gemini/
+.claude/
+tests/fixtures/
+
+
+# Local copies of README media (served from the media branch, not committed)
+/assets/
+
+# comfy node publish artifact
+node.zip

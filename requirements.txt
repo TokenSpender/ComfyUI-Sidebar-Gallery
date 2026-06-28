@@ -1,0 +1,19 @@
+# Python dependencies for ComfyUI Sidebar Gallery.
+#
+# A normal ComfyUI install already includes everything below, so most users
+# need to install nothing extra. These are listed for completeness and for
+# unusual environments.
+#
+# Pillow: reading images and building thumbnails.
+Pillow>=9.0.0
+
+# imageio-ffmpeg: ships a bundled ffmpeg binary, so video THUMBNAILS work with
+# no separate install. Used only as a fallback when ffmpeg isn't found on PATH.
+# (Many ComfyUI video nodes, e.g. VideoHelperSuite, already pull this in.)
+imageio-ffmpeg>=0.4.0
+
+# Note: aiohttp (used for the HTTP endpoints) ships with ComfyUI itself.
+# Note: video METADATA (duration / codec / fps) is read with ffprobe, which
+#       imageio-ffmpeg does NOT bundle. A normal ffmpeg install includes ffprobe
+#       on PATH; without it, thumbnails still work and those few fields are just
+#       left blank (no error). See the README.

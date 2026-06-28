@@ -1,0 +1,224 @@
+{
+  "_comment": "SBG section catalog: the single declarative source of truth for the metadata-section schema. The Python backend (server/schema.py) and the frontend (web/sbg-schema-data.js, generated from this file) both derive from it.",
+  "version": 1,
+
+  "flags": ["source_app", "initial_image", "has_workflow", "has_prompt", "prompt_enhanced"],
+
+  "sections": [
+    {
+      "key": "file_info", "section_id": "file_info", "title": "File Info", "kind": "fileinfo",
+      "search_field": "fileinfo", "search_aliases": ["file info"],
+      "summary_keys": ["resolution", "generation_resolution", "width", "height", "duration", "duration_seconds", "codec", "fps", "total_frames"],
+      "media": ["image", "video"],
+      "default": {
+        "style": "flat", "open": true,
+        "params": [
+          { "path": "filename", "label": "File" },
+          { "path": "path", "label": "Path" },
+          { "path": "filesize", "label": "Size" },
+          { "path": "resolution", "label": "Resolution" },
+          { "path": "generation_resolution", "label": "Gen Size" },
+          { "path": "modified", "label": "Modified" }
+        ],
+        "params_video": [
+          { "path": "filename", "label": "File" },
+          { "path": "path", "label": "Path" },
+          { "path": "filesize", "label": "Size" },
+          { "path": "resolution", "label": "Resolution" },
+          { "path": "generation_resolution", "label": "Gen Size" },
+          { "path": "duration", "label": "Duration" },
+          { "path": "codec", "label": "Codec" },
+          { "path": "fps", "label": "FPS" },
+          { "path": "total_frames", "label": "Frames" },
+          { "path": "modified", "label": "Modified" }
+        ]
+      }
+    },
+    {
+      "key": "model", "section_id": "models", "title": "Models", "kind": "scalar",
+      "search_field": "model", "search_aliases": ["models"],
+      "summary_keys": ["model", "vae", "clip_skip", "clip_models"],
+      "media": ["image", "video"],
+      "default": {
+        "style": "flat", "open": true,
+        "params": [
+          { "path": "model", "label": "Model" },
+          { "path": "vae", "label": "VAE" },
+          { "path": "clip_skip", "label": "Clip Skip" }
+        ]
+      }
+    },
+    {
+      "key": "positive_prompt", "section_id": "positive", "title": "Positive Prompt", "kind": "text",
+      "search_field": "prompt", "search_aliases": [],
+      "summary_keys": ["positive_prompt"],
+      "media": ["image", "video"],
+      "default": {
+        "style": "text", "open": true,
+        "params": [ { "path": "positive_prompt", "label": "Positive", "style": "text" } ]
+      }
+    },
+    {
+      "key": "negative_prompt", "section_id": "negative", "title": "Negative Prompt", "kind": "text",
+      "search_field": "prompt", "search_aliases": [],
+      "summary_keys": ["negative_prompt"],
+      "media": ["image", "video"],
+      "default": {
+        "style": "text", "open": false,
+        "params": [ { "path": "negative_prompt", "label": "Negative", "style": "text", "variant": "neg" } ]
+      }
+    },
+    {
+      "key": "initial_prompt", "section_id": "initial_prompt", "title": "Original Prompt (pre-enhance)", "kind": "text",
+      "search_field": "prompt", "search_aliases": [],
+      "summary_keys": ["initial_prompt"],
+      "media": ["image", "video"],
+      "default": {
+        "style": "text", "open": false,
+        "params": [ { "path": "initial_prompt", "label": "Original", "style": "text" } ]
+      }
+    },
+    {
+      "key": "samplers", "section_id": "sampling", "title": "Sampling", "kind": "array",
+      "search_field": "sampling", "search_aliases": ["sampler"],
+      "summary_keys": ["samplers", "shift", "sampling_type"],
+      "media": ["image", "video"],
+      "default": {
+        "style": "cards", "open": true, "source": "samplers", "highlow": true,
+        "params": [
+          { "path": "label", "style": "title" },
+          { "path": "sampler_name", "label": "Sampler", "style": "pill" },
+          { "path": "scheduler", "label": "Scheduler", "style": "pill" },
+          { "path": "steps", "label": "Steps", "style": "pill", "format": "{v} steps" },
+          { "path": "cfg", "label": "CFG", "style": "pill", "format": "CFG {v}" },
+          { "path": "denoise", "label": "Denoise", "style": "pill", "format": "denoise {v}" },
+          { "path": "seed", "label": "Seed", "style": "detail" }
+        ]
+      }
+    },
+    {
+      "key": "loras", "section_id": "loras", "title": "LoRAs", "kind": "array",
+      "search_field": "lora", "search_aliases": ["loras"],
+      "summary_keys": ["loras"],
+      "media": ["image", "video"],
+      "default": {
+        "style": "cards", "open": true, "source": "loras", "highlow": true,
+        "params": [
+          { "path": "name", "style": "title" },
+          { "path": "strength_model", "label": "model", "style": "pill", "variant": "accent", "format": "model {v}" },
+          { "path": "strength_clip", "label": "clip", "style": "pill", "variant": "accent", "format": "clip {v}" }
+        ]
+      }
+    },
+    {
+      "key": "controlnet", "section_id": "controlnet", "title": "ControlNet", "kind": "array",
+      "search_field": "controlnet", "search_aliases": [],
+      "summary_keys": ["controlnet"],
+      "media": ["image", "video"],
+      "default": {
+        "style": "cards", "open": false, "source": "controlnet",
+        "params": [
+          { "path": "model", "style": "title" },
+          { "path": "preprocessor", "label": "prep", "style": "pill", "format": "prep: {v}" },
+          { "path": "strength", "label": "strength", "style": "pill", "format": "str {v}" },
+          { "path": "weight", "label": "weight", "style": "pill", "format": "w {v}" },
+          { "path": "start_percent", "label": "start", "style": "pill", "format": "start {v}" },
+          { "path": "end_percent", "label": "end", "style": "pill", "format": "end {v}" },
+          { "path": "guidance_start", "label": "start", "style": "pill", "format": "start {v}" },
+          { "path": "guidance_end", "label": "end", "style": "pill", "format": "end {v}" }
+        ]
+      }
+    },
+    {
+      "key": "adetailer", "section_id": "adetailer", "title": "ADetailer", "kind": "array",
+      "search_field": "adetailer", "search_aliases": [],
+      "summary_keys": ["adetailer"],
+      "media": ["image", "video"],
+      "default": {
+        "style": "cards", "open": false, "source": "adetailer",
+        "params": [
+          { "path": "model", "style": "title" },
+          { "path": "steps", "label": "steps", "style": "pill", "format": "{v} steps" },
+          { "path": "cfg", "label": "cfg", "style": "pill", "format": "CFG {v}" },
+          { "path": "denoise", "label": "denoise", "style": "pill", "format": "denoise {v}" }
+        ]
+      }
+    },
+    {
+      "key": "upscaling", "section_id": "upscaling", "title": "Upscaling", "kind": "array",
+      "search_field": "upscaling", "search_aliases": [],
+      "summary_keys": ["upscaling"],
+      "media": ["image", "video"],
+      "default": {
+        "style": "cards", "open": false, "source": "upscaling",
+        "params": [
+          { "path": "model", "label": "model", "style": "pill" },
+          { "path": "upscale_method", "label": "method", "style": "pill" },
+          { "path": "scale_by", "label": "scale", "style": "pill", "format": "{v}×" }
+        ]
+      }
+    },
+    {
+      "key": "interpolation", "section_id": "interpolation", "title": "Interpolation", "kind": "array",
+      "search_field": "interpolation", "search_aliases": [],
+      "summary_keys": ["interpolation"],
+      "media": ["image", "video"],
+      "default": {
+        "style": "cards", "open": false, "source": "interpolation",
+        "params": [
+          { "path": "type", "label": "type", "style": "pill" },
+          { "path": "multiplier", "label": "mult", "style": "pill", "format": "{v}×" },
+          { "path": "source_fps", "label": "src fps", "style": "pill", "format": "src {v} fps" },
+          { "path": "model_name", "label": "model", "style": "pill" }
+        ]
+      }
+    },
+    {
+      "key": "mmaudio", "section_id": "mmaudio", "title": "MMAudio", "kind": "object",
+      "search_field": "mmaudio", "search_aliases": [],
+      "summary_keys": ["mmaudio"],
+      "media": ["image", "video"],
+      "default": {
+        "style": "cards", "open": true, "source": "mmaudio",
+        "params": [
+          { "path": "steps", "label": "steps", "style": "pill", "format": "{v} steps" },
+          { "path": "cfg", "label": "cfg", "style": "pill", "format": "CFG {v}" },
+          { "path": "duration", "label": "duration", "style": "pill", "format": "{v}s" },
+          { "path": "seed", "label": "seed", "style": "detail" },
+          { "path": "prompt", "label": "Prompt", "style": "text" },
+          { "path": "negative_prompt", "label": "Negative", "style": "text", "variant": "neg" }
+        ]
+      }
+    },
+    {
+      "key": "extra", "section_id": "extra", "title": "Extra Metadata", "kind": "object",
+      "search_field": "extra", "search_aliases": ["extra metadata", "details"],
+      "summary_keys": ["extra"],
+      "media": ["image", "video"],
+      "default": {
+        "style": "flat", "open": false,
+        "params": [ { "path": "extra.*" } ]
+      }
+    },
+    {
+      "key": "workflow_nodes", "section_id": "workflow_nodes", "title": "Workflow Nodes", "kind": "nodes",
+      "search_field": "workflow_nodes", "search_aliases": ["workflow nodes"],
+      "summary_keys": ["workflow_nodes"],
+      "media": ["image", "video"],
+      "default": {
+        "style": "nodes", "open": false,
+        "params": []
+      }
+    },
+    {
+      "key": "raw", "section_id": "raw", "title": "Raw Metadata", "kind": "raw",
+      "search_field": null, "search_aliases": [],
+      "summary_keys": [],
+      "media": ["image", "video"],
+      "default": {
+        "style": "raw", "open": false,
+        "params": []
+      }
+    }
+  ]
+}

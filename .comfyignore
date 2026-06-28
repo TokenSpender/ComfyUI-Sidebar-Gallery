@@ -1,0 +1,4 @@
+# Kept out of the Comfy Registry package (developer-only, not needed at runtime).
+tools/
+tests/
+assets/
