@@ -387,10 +387,27 @@ def delete_file(conn: sqlite3.Connection, root_id: str, relpath: str):
 
 # ── Incremental scan (fast) ───────────────────────────────────────────
 
+def _filter_scan_dirs(dirnames: list[str], excluded: set[str], *, skip_hidden: bool = True) -> None:
+    """Prune the os.walk subtree in place so the scanner skips whole folders.
+
+    Reassigning ``dirnames`` with a slice is what tells os.walk (topdown=True,
+    the default) not to descend into those directories. When ``skip_hidden`` is
+    True (default) hidden ``.``-prefixed folders (e.g. a ``.thumbs`` cache that
+    would otherwise duplicate images) are skipped; user-configured excluded
+    folder names are always skipped (compared lowercased).
+    """
+    dirnames[:] = [
+        d for d in dirnames
+        if not (skip_hidden and d.startswith(".")) and d.lower() not in excluded
+    ]
+
+
 def incremental_scan(
     root: AllowedRoot,
     *,
     read_metadata_fn: Callable[[str], dict | None] | None = None,
+    excluded_dirs: set[str] | None = None,
+    index_hidden_dirs: bool = False,
 ) -> tuple[int, int]:
     """Fast incremental scan: only update new/changed files.
 
@@ -406,7 +423,10 @@ def incremental_scan(
 
     # Collect all current files from filesystem
     disk_files: dict[str, tuple[str, str, int, float, float]] = {}  # relpath -> (ext, kind, size, mtime, ctime)
-    for dirpath, _dirnames, filenames in os.walk(base_abs):
+    excluded = excluded_dirs or set()
+    skip_hidden = not index_hidden_dirs
+    for dirpath, dirnames, filenames in os.walk(base_abs):
+        _filter_scan_dirs(dirnames, excluded, skip_hidden=skip_hidden)
         for name in filenames:
             ext = os.path.splitext(name)[1].lower()
             if ext not in ALL_MEDIA_EXTS:
@@ -497,6 +517,8 @@ def full_reindex(
     read_metadata_fn: Callable[[str], dict | None],
     *,
     batch_size: int = 50,
+    excluded_dirs: set[str] | None = None,
+    index_hidden_dirs: bool = False,
 ) -> int:
     """Full reindex: scan every file, parse every file's metadata.
 
@@ -524,7 +546,10 @@ def full_reindex(
     try:
         # Phase 1: scan filesystem
         disk_files: list[tuple[str, str, str, int, float, float]] = []
-        for dirpath, _dirnames, filenames in os.walk(base_abs):
+        excluded = excluded_dirs or set()
+        skip_hidden = not index_hidden_dirs
+        for dirpath, dirnames, filenames in os.walk(base_abs):
+            _filter_scan_dirs(dirnames, excluded, skip_hidden=skip_hidden)
             for name in filenames:
                 ext = os.path.splitext(name)[1].lower()
                 if ext not in ALL_MEDIA_EXTS:

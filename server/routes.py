@@ -392,10 +392,16 @@ def _start_full_reindex(roots: list[AllowedRoot]) -> bool:
         return False
 
     def _bg_reindex():
+        cfg = load_config()
+        excluded = set(cfg.excluded_dirs)
         ok = True
         for root in roots:
             try:
-                media_db.full_reindex(root, _read_metadata_for_db)
+                media_db.full_reindex(
+                    root, _read_metadata_for_db,
+                    excluded_dirs=excluded,
+                    index_hidden_dirs=cfg.index_hidden_dirs,
+                )
             except Exception as e:
                 ok = False
                 logging.getLogger("sbg").error("Reindex failed for %s: %s", root.root_id, e)
@@ -432,6 +438,8 @@ async def get_config(request: web.Request):
     return web.json_response(
         {
             "extra_roots": cfg.extra_roots,
+            "excluded_dirs": cfg.excluded_dirs,
+            "index_hidden_dirs": cfg.index_hidden_dirs,
             "roots": [{"id": r.root_id, "label": r.label, "path": r.path if r.root_id != "output" else None} for r in roots],
         }
     )
@@ -445,6 +453,8 @@ async def post_config(request: web.Request):
     return web.json_response(
         {
             "extra_roots": cfg.extra_roots,
+            "excluded_dirs": cfg.excluded_dirs,
+            "index_hidden_dirs": cfg.index_hidden_dirs,
             "roots": [{"id": r.root_id, "label": r.label, "path": r.path if r.root_id != "output" else None} for r in roots],
         }
     )
@@ -578,7 +588,10 @@ async def list_all_media(request: web.Request):
         elif force or not recently_scanned:
             _last_scan_times[root_id] = now
             loop = asyncio.get_running_loop()
-            scan_future = loop.run_in_executor(None, lambda: media_db.incremental_scan(root, read_metadata_fn=_read_metadata_for_db))
+            _scan_cfg = load_config()
+            _scan_excluded = set(_scan_cfg.excluded_dirs)
+            _scan_hidden = _scan_cfg.index_hidden_dirs
+            scan_future = loop.run_in_executor(None, lambda: media_db.incremental_scan(root, read_metadata_fn=_read_metadata_for_db, excluded_dirs=_scan_excluded, index_hidden_dirs=_scan_hidden))
             _inflight_scans[root_id] = scan_future
             scan_future.add_done_callback(lambda f, _rid=root_id: _clear_inflight_scan(f, _rid))
             if force:
@@ -709,7 +722,8 @@ async def list_new_media(request: web.Request):
         # Fallback: incremental scan
         since = float(body.get("since", 0))
         loop = asyncio.get_running_loop()
-        await loop.run_in_executor(None, lambda: media_db.incremental_scan(root, read_metadata_fn=_read_metadata_for_db))
+        _scan_cfg = load_config()
+        await loop.run_in_executor(None, lambda: media_db.incremental_scan(root, read_metadata_fn=_read_metadata_for_db, excluded_dirs=set(_scan_cfg.excluded_dirs), index_hidden_dirs=_scan_cfg.index_hidden_dirs))
         # Return all items from DB (frontend will diff)
         db_items = media_db.get_all(root_id)
         for row in db_items:

@@ -1,7 +1,7 @@
 [project]
 name = "comfyui-sidebar-gallery"
 description = "A ComfyUI extension that adds a media browser to the sidebar. It indexes the images and videos in your output folders, reads the generation metadata embedded in each file, and presents it as a structured, searchable panel. It supports images and videos made with ComfyUI, Automatic1111, Forge, SD.Next, and Fooocus."
-version = "1.0.2"
+version = "1.0.3"
 license = { file = "LICENSE" }
 requires-python = ">=3.9"
 dependencies = ["Pillow>=9.0.0", "imageio-ffmpeg>=0.4.0"]

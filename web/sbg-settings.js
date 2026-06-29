@@ -582,25 +582,32 @@ function renderSettings() {
   wrap.appendChild(_comboInput(S.MODEL_NAME_STYLE, "basename", ["basename", "relpath"], "Model Display", "Show model and LoRA names as just the filename (basename) or the full relative path."));
   wrap.appendChild(_toggle(S.META_TAB_PERSIST, false, "Remember Metadata Tab", "Keep the active metadata tab (Generated/Initial Image) when navigating between images."));
 
+  // Shared config POST: one place that checks the response, so a failed save
+  // surfaces as an error toast instead of a false "saved" message.
+  async function _postConfig(patch) {
+    const r = await fetch("/sidebar_gallery/config", {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify(patch),
+    });
+    if (!r.ok) throw new Error("Save failed (HTTP " + r.status + ")");
+    return r.json();
+  }
+  // Fetch the whole config once on open; both sections below reuse it (each
+  // re-fetches on its own only after the user edits that section).
+  const _loadCfg = () => fetch("/sidebar_gallery/config").then(r => r.json());
+
   // ── Folders: extra media roots shown in the folder picker and indexed ──
   wrap.appendChild(h("div", { class: "sbg-gs-section-title", text: "Folders", style: "margin-top:16px" }));
   wrap.appendChild(h("div", { class: "sbg-gs-desc", text: "Extra folders to browse and index alongside ComfyUI's output folder. Paths are on the machine running ComfyUI." }));
   const foldersList = h("div", {});
   wrap.appendChild(foldersList);
 
-  async function _postRoots(extraRoots) {
-    const r = await fetch("/sidebar_gallery/config", {
-      method: "POST",
-      headers: { "Content-Type": "application/json" },
-      body: JSON.stringify({ extra_roots: extraRoots }),
-    });
-    return r.json();
-  }
+  const _postRoots = (extraRoots) => _postConfig({ extra_roots: extraRoots });
 
-  async function _renderFolders() {
+  async function _renderFolders(cfg) {
     foldersList.innerHTML = "";
-    let cfg = { extra_roots: [], roots: [] };
-    try { cfg = await fetch("/sidebar_gallery/config").then(r => r.json()); } catch { }
+    if (!cfg) { try { cfg = await _loadCfg(); } catch { cfg = { extra_roots: [], roots: [] }; } }
     const row = (label, sub, removeRaw) => {
       const el = h("div", { class: "sbg-gs-row", style: "align-items:center" });
       el.appendChild(h("span", { class: "sbg-gs-label", text: label, title: sub || "" }));
@@ -609,7 +616,7 @@ function renderSettings() {
         const del = h("button", { class: "sbg-iconbtn sbg-iconbtn--danger", text: "🗑", title: "Remove this folder from the gallery (files on disk are not touched)" });
         del.addEventListener("click", async () => {
           try {
-            await _postRoots(cfg.extra_roots.filter(p => p !== removeRaw));
+            await _postRoots((cfg.extra_roots || []).filter(p => p !== removeRaw));
             showToast("Folder removed");
             if (galleryCtx.refreshConfig) await galleryCtx.refreshConfig();
             _renderFolders();
@@ -646,7 +653,101 @@ function renderSettings() {
     addWrap.appendChild(addBtn);
     foldersList.appendChild(addWrap);
   }
-  _renderFolders();
+
+  // ── Excluded folders: names skipped while scanning (+ optional hidden-folder skip) ──
+  wrap.appendChild(h("div", { class: "sbg-gs-section-title", text: "Excluded folders", style: "margin-top:16px" }));
+  wrap.appendChild(h("div", { class: "sbg-gs-desc", text: "Folder names to skip while scanning (e.g. thumbnails, backup). Matching is by folder name, not full path, and is not case-sensitive. Changes take effect on the next scan." }));
+  const excludedList = h("div", {});
+  wrap.appendChild(excludedList);
+
+  // Serialises edits in this section so two fast clicks can't race on a stale
+  // snapshot and lose an update.
+  let excludedBusy = false;
+
+  const _postExcluded = (excludedDirs) => _postConfig({ excluded_dirs: excludedDirs });
+
+  async function _renderExcluded(cfg) {
+    excludedList.innerHTML = "";
+    if (!cfg) { try { cfg = await _loadCfg(); } catch { cfg = { excluded_dirs: [] }; } }
+    const current = cfg.excluded_dirs || [];
+
+    // Toggle: include hidden (dot-prefixed) folders. Off by default = hidden folders skipped.
+    const hiddenChk = h("input", { type: "checkbox" });
+    hiddenChk.checked = !!cfg.index_hidden_dirs;
+    hiddenChk.addEventListener("change", async () => {
+      if (excludedBusy) { hiddenChk.checked = !hiddenChk.checked; return; }
+      excludedBusy = true;
+      try {
+        await _postConfig({ index_hidden_dirs: hiddenChk.checked });
+        showToast(hiddenChk.checked
+          ? "Hidden folders will be scanned on the next scan"
+          : "Hidden folders will be skipped on the next scan");
+        if (galleryCtx.refreshConfig) await galleryCtx.refreshConfig();
+      } catch (e) {
+        hiddenChk.checked = !hiddenChk.checked;
+        showToast("Failed to update: " + (e?.message || e));
+      } finally { excludedBusy = false; }
+    });
+    excludedList.appendChild(_settingRow("Include hidden folders", hiddenChk,
+      "Also scan folders whose names start with a dot (e.g. .thumbs). Off by default — hidden folders are skipped."));
+
+    const row = (name) => {
+      const el = h("div", { class: "sbg-gs-row", style: "align-items:center" });
+      el.appendChild(h("span", { class: "sbg-gs-label", text: name }));
+      const del = h("button", { class: "sbg-iconbtn sbg-iconbtn--danger", text: "🗑", title: "Stop excluding this folder (its files reappear on the next scan)" });
+      del.addEventListener("click", async () => {
+        if (excludedBusy) return;
+        excludedBusy = true;
+        try {
+          await _postExcluded(current.filter(d => d !== name));
+          showToast("Folder no longer excluded — it will be re-indexed on the next scan");
+          if (galleryCtx.refreshConfig) await galleryCtx.refreshConfig();
+          _renderExcluded();
+        } catch (e) { showToast("Failed to update: " + (e?.message || e)); }
+        finally { excludedBusy = false; }
+      });
+      el.appendChild(del);
+      return el;
+    };
+    if (current.length === 0) {
+      excludedList.appendChild(h("div", { class: "sbg-gs-row", style: "opacity:.5;font-size:11px", text: "No extra folders excluded." }));
+    } else {
+      for (const name of current) excludedList.appendChild(row(name));
+    }
+
+    const addWrap = h("div", { class: "sbg-gs-row", style: "align-items:center;gap:6px" });
+    const inp = h("input", { type: "text", class: "sbg-gs-input", placeholder: "thumbnails", style: "flex:1" });
+    const addBtn = h("button", { class: "sbg-btn sbg-btn--accent", text: "+ Add" });
+    const doAdd = async () => {
+      if (excludedBusy) return;
+      // Accept a plain name or a pasted path; keep just the last real path segment.
+      const name = (inp.value.split(/[\\/]/).filter(Boolean).pop() || "").trim().toLowerCase();
+      if (!name || name === "." || name === "..") { showToast("Enter a folder name to exclude"); return; }
+      if (current.includes(name)) { showToast("Already excluded"); inp.value = ""; return; }
+      excludedBusy = true;
+      try {
+        await _postExcluded([...current, name]);
+        showToast("Folder excluded — it will be skipped on the next scan");
+        inp.value = "";
+        if (galleryCtx.refreshConfig) await galleryCtx.refreshConfig();
+        _renderExcluded();
+      } catch (e) { showToast("Failed to add: " + (e?.message || e)); }
+      finally { excludedBusy = false; }
+    };
+    addBtn.addEventListener("click", doAdd);
+    inp.addEventListener("keydown", (ev) => { if (ev.key === "Enter") doAdd(); });
+    addWrap.appendChild(inp);
+    addWrap.appendChild(addBtn);
+    excludedList.appendChild(addWrap);
+  }
+
+  // Initial render: a single config fetch shared by both sections.
+  (async () => {
+    let cfg;
+    try { cfg = await _loadCfg(); } catch { }
+    _renderFolders(cfg);
+    _renderExcluded(cfg);
+  })();
 
   content.appendChild(wrap);
 }
