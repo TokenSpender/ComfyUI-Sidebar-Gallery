@@ -1,4 +1,4 @@
-/* ── Sidebar Gallery – Adaptive Theme ─────────────────────────── */
+/* ── Sidebar Gallery - Adaptive Theme ─────────────────────────── */
 
 :root {
   /* Inherit ComfyUI's theme variables when available, or use neutral dark */
@@ -294,27 +294,32 @@
   border-color: transparent;
 }
 
-.sbg-search-clear {
+.sbg-search-clear,
+.sbg-search-refresh {
   flex-shrink: 0;
   background: none;
   border: none;
-  color: var(--sbg-text-dim);
   cursor: pointer;
   padding: 4px 8px;
   font-size: 14px;
   line-height: 1;
-  opacity: 0;
-  transition: opacity var(--sbg-transition);
+  /* Only the active button (clear while searching, refresh when empty) is shown.
+     display:none keeps the hidden one out of the layout and unclickable. */
+  display: none;
 }
 
-.sbg-search-wrap:focus-within .sbg-search-clear,
-.sbg-search-wrap .sbg-search-clear--visible {
-  opacity: 1;
+.sbg-search-clear--visible,
+.sbg-search-refresh--visible {
+  display: inline-flex;
+  align-items: center;
 }
 
-.sbg-search-clear:hover {
-  color: var(--sbg-text);
-}
+/* Clear stays muted; refresh uses the user's accent colour (Appearance tab). */
+.sbg-search-clear { color: var(--sbg-text-dim); }
+.sbg-search-refresh { color: var(--sbg-accent); }
+
+.sbg-search-clear:hover { color: var(--sbg-text); }
+.sbg-search-refresh:hover { color: var(--sbg-accent); filter: brightness(1.2); }
 
 /* ── Search Tag Pills ────────────────────────────────────────────── */
 
@@ -358,7 +363,7 @@
   font-size: 10px;
   line-height: 1;
   transition: opacity var(--sbg-transition);
-  /* Never let a long term clip/cover the ✕ — keep it sized and on top. */
+  /* Never let a long term clip/cover the ✕ - keep it sized and on top. */
   flex: 0 0 auto;
   padding: 2px 4px;
   margin: -2px -2px -2px 0;
@@ -436,7 +441,7 @@
   border-color: var(--sbg-accent);
 }
 
-/* Subfolder dropdown — limit height so it doesn't cover the entire screen */
+/* Subfolder dropdown - limit height so it doesn't cover the entire screen */
 .sbg-select--subfolder {
   max-width: 150px;
 }
@@ -839,7 +844,7 @@
   gap: 5px;
 }
 
-/* Virtual scroll spacer — sets the total scrollable height */
+/* Virtual scroll spacer - sets the total scrollable height */
 .sbg-grid__spacer {
   width: 100%;
   pointer-events: none;
@@ -857,7 +862,7 @@
   position: relative;
 }
 
-/* Virtual scroll cards — positioned absolutely by JS */
+/* Virtual scroll cards - positioned absolutely by JS */
 .sbg-card--virtual {
   position: absolute;
   box-sizing: border-box;
@@ -926,7 +931,7 @@
   aspect-ratio: 1/1;
 }
 
-/* AR thumbnails — height set by JS in masonry mode */
+/* AR thumbnails - height set by JS in masonry mode */
 .sbg-card__thumb-wrap--ar {
   aspect-ratio: auto;
   min-height: 60px;
@@ -1506,7 +1511,7 @@
   overflow-y: auto;
   resize: vertical;
   min-height: 1.5em;
-  /* No max-height cap — JS applySize() handles smart shrink/scroll via user-saved preferences */
+  /* No max-height cap - JS applySize() handles smart shrink/scroll via user-saved preferences */
 }
 
 /* Wider gutter than a bare 4px so the resize corner (the ::-webkit-resizer below)
@@ -1613,7 +1618,7 @@
   padding: 30px 14px;
 }
 
-/* ── Metadata Panel — Redesigned Components ──────────────────────── */
+/* ── Metadata Panel - Redesigned Components ──────────────────────── */
 
 /* Group container */
 .sbg-meta-group {
@@ -1897,6 +1902,12 @@
   background: linear-gradient(135deg, color-mix(in srgb, var(--sbg-app-fooocus, #f472b6) 20%, transparent), color-mix(in srgb, var(--sbg-app-fooocus, #f472b6) 12%, transparent));
   color: var(--sbg-app-fooocus, #f472b6);
   border-color: color-mix(in srgb, var(--sbg-app-fooocus, #f472b6) 35%, transparent);
+}
+
+.sbg-badge--source-civitai {
+  background: linear-gradient(135deg, color-mix(in srgb, var(--sbg-app-civitai, #3b82f6) 20%, transparent), color-mix(in srgb, var(--sbg-app-civitai, #3b82f6) 12%, transparent));
+  color: var(--sbg-app-civitai, #3b82f6);
+  border-color: color-mix(in srgb, var(--sbg-app-civitai, #3b82f6) 35%, transparent);
 }
 
 /* Fullscreen lightbox */
@@ -2470,7 +2481,7 @@ textarea.sbg-prompt-text {
    DRAG GHOST (smooth real-time drag-and-drop)
    ══════════════════════════════════════════════════════════════════ */
 
-/* Sortable placeholder — shows where the dragged item will land */
+/* Sortable placeholder - shows where the dragged item will land */
 .sbg-sortable-placeholder {
   border: 2px dashed var(--sbg-accent, #7c6aef);
   border-radius: 6px;
@@ -2531,7 +2542,7 @@ textarea.sbg-prompt-text {
   overflow: hidden;
 }
 
-/* Left image (direct child img/video) — constrain to exactly half minus divider */
+/* Left image (direct child img/video) - constrain to exactly half minus divider */
 .sbg-compare--active > img,
 .sbg-compare--active > video {
   flex: 0 0 calc(50% - 2px);
@@ -2546,7 +2557,7 @@ textarea.sbg-prompt-text {
   border-radius: 0 !important;
 }
 
-/* Right panel — exactly half minus divider to match left */
+/* Right panel - exactly half minus divider to match left */
 .sbg-compare__right {
   flex: 0 0 calc(50% - 2px);
   max-width: calc(50% - 2px);
@@ -2769,9 +2780,8 @@ textarea.sbg-prompt-text {
 .sbg-iconbtn:hover { background: rgba(255,255,255,0.1); }
 .sbg-iconbtn--danger:hover { background: rgba(239,68,68,0.25); }
 
-/* "Hidden" eye toggle: greyed out with a diagonal strike (replaces the old
-   see-no-evil monkey emoji so it matches the pre-rewrite look). */
-/* Tabs editor (any section) — stacked rows mirroring the section-row pattern */
+/* "Hidden" eye toggle: greyed out with a diagonal strike. */
+/* Tabs editor (any section) - stacked rows mirroring the section-row pattern */
 .sbg-ly3-tabsed { margin-top: 6px; padding-top: 6px; border-top: 1px dashed var(--sbg-border, #444); }
 .sbg-ly3-tabsed-head { display: flex; align-items: center; justify-content: space-between; margin-bottom: 4px; }
 .sbg-ly3-tabsed-label { font-size: 11px; color: var(--sbg-text-dim, #aaa); cursor: help; }

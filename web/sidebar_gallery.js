@@ -1,5 +1,5 @@
 /**
- * sidebar_gallery.js — Entry point for the SBG ComfyUI extension
+ * sidebar_gallery.js - Entry point for the SBG ComfyUI extension
  *
  * This module is the thin shell that:
  *   - Registers the ComfyUI sidebar extension
@@ -16,7 +16,7 @@ import { api as comfyApi } from "../../scripts/api.js";
 import {
   EXT_NAME, CSS_URL,
   _dataCache, ensureCss, h, api, showToast,
-  S, getSetting, loadSettings,
+  S, getSetting, loadSettings, APP_REGISTRY,
 } from "./sbg-core.js";
 
 import { openGallerySettings as _openGallerySettings } from "./sbg-settings.js";
@@ -39,16 +39,12 @@ app.registerExtension({
 
     /* ── Apply saved CSS custom properties ────────────────────────── */
 
-    const _appCSSVars = [
-      { key: S.APP_BADGE_COMFYUI, cssVar: "--sbg-app-comfyui" },
-      { key: S.APP_BADGE_A1111, cssVar: "--sbg-app-a1111" },
-      { key: S.APP_BADGE_FORGE, cssVar: "--sbg-app-forge" },
-      { key: S.APP_BADGE_SDNEXT, cssVar: "--sbg-app-sdnext" },
-      { key: S.APP_BADGE_FOOOCUS, cssVar: "--sbg-app-fooocus" },
-    ];
-    for (const { key, cssVar } of _appCSSVars) {
-      const saved = getSetting(key, "");
-      if (saved) document.documentElement.style.setProperty(cssVar, saved);
+    // One pass over the shared app registry: every app's badge colour var is
+    // set (saved value or registry default), so the stylesheet's var()
+    // fallback literals are cosmetic-only and can never drift from here.
+    for (const a of APP_REGISTRY) {
+      const saved = getSetting(a.settingKey, "");
+      document.documentElement.style.setProperty(a.cssVar, saved || a.defaultColor);
     }
 
     // Pill/badge custom colors
@@ -69,11 +65,11 @@ app.registerExtension({
       if (!e.dataTransfer.types.includes("application/x-sbg-workflow")) return;
       e.preventDefault();
       e.dataTransfer.dropEffect = "copy";
-      // ComfyUI doesn't highlight nodes for our custom drag payload, so drive its
-      // native per-node highlight ourselves: set dragOverNode to the node under
+      // ComfyUI doesn't highlight nodes for this custom drag payload, so drive its
+      // native per-node highlight directly: set dragOverNode to the node under
       // the cursor (or null) and redraw. Cleared on drop/dragend.
       try {
-        // Only highlight when the cursor is actually over the graph canvas —
+        // Only highlight when the cursor is actually over the graph canvas,
         // otherwise mapped coords could light up a node while dragging over the
         // sidebar/gallery.
         const t = e.target;
@@ -151,19 +147,19 @@ app.registerExtension({
       if (!sbgData) return;
 
       // The dropzone overlay has pointer-events:none, so e.target is the
-      // element *under* it (the Comfy canvas/litegraph). Load the workflow when
+      // element under it (the Comfy canvas/litegraph). Load the workflow when
       // the drop lands anywhere over the graph area; otherwise let it pass.
       const target = e.target;
       const isOnGraph = target.closest?.(".litegraph, canvas, .comfyui-body-center, .graph-canvas-container, #graph-canvas")
         || target.tagName === "CANVAS";
       if (!isOnGraph) {
-        return; // not over the canvas — don't intercept
+        return; // not over the canvas - don't intercept
       }
 
       e.preventDefault();
       e.stopPropagation();
-      // Because we preventDefault the drop, ComfyUI's own handler won't clear the
-      // blue per-node drag highlight — do it ourselves.
+      // preventDefault on the drop means ComfyUI's own handler won't clear the
+      // blue per-node drag highlight, so clear it here.
       _clearComfyDragHighlight();
       try {
         const { root_id, relpath } = JSON.parse(sbgData);
@@ -220,8 +216,7 @@ app.registerExtension({
             allItems,
             fetchAllItems: fetchAll,
             // Lets the Folders settings live-refresh the gallery's root list when a
-            // folder is added/removed (without it, a new folder only appeared after
-            // a full browser reload).
+            // folder is added/removed, without a full browser reload.
             refreshConfig: galleryApi?.refreshConfig,
           }, defaultTab);
         }
@@ -236,7 +231,7 @@ app.registerExtension({
 
     /* ── Global keyboard shortcuts ────────────────────────────────── */
 
-    // Only the two GLOBAL shortcuts live here — lightbox keys are read inside
+    // Only the two GLOBAL shortcuts live here - lightbox keys are read inside
     // the lightbox itself. (KEY_REFRESH defaults to disabled, matching the
     // settings UI's "leave empty to disable".)
     const _keyDefaults = {

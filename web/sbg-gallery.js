@@ -1,7 +1,7 @@
 /**
- * sbg-gallery.js — Gallery grid, search, virtual scrolling, and data management
+ * sbg-gallery.js - Gallery grid, search, virtual scrolling, and data management
  *
- * Extracted from sidebar_gallery.js. This module owns:
+ * This module owns:
  *   - Gallery grid rendering (virtual scroll with card recycling)
  *   - Search bar, tags, autocomplete, server/client search
  *   - Folder navigation (root picker, subfolder tree)
@@ -21,6 +21,7 @@ import {
   initThumbObserver, getThumbObserver, resetThumbObserver, resetFailedThumbs,
   PLAY_SVG, VIDEO_ICON, IMG_ICON, IMG_FILTER_ICON, SEARCH_SVG, GEAR_SVG,
   S, getSetting, getLayout,
+  progressPoller, formatProgress,
 } from "./sbg-core.js";
 
 import { SectionRegistry } from "./sbg-section-registry.js";
@@ -45,11 +46,11 @@ const SEARCH_PREFIXES = [
    (plus a buffer) exist in the DOM at any time.
 
    Key pieces:
-     _pool[]           — reusable card DOM elements
-     _cardMap           — Map<itemIndex, cardEl>  (currently mounted cards)
-     _visRange          — { first, last } item indices currently mounted
-     _metrics           — { colCount, rowH, colW } computed from container
-     _scrollRafId       — rAF id for throttled scroll handler
+     _pool[]           - reusable card DOM elements
+     _cardMap           - Map<itemIndex, cardEl>  (currently mounted cards)
+     _visRange          - { first, last } item indices currently mounted
+     _metrics           - { colCount, rowH, colW } computed from container
+     _scrollRafId       - rAF id for throttled scroll handler
    ═══════════════════════════════════════════════════════════════════════ */
 
 const DEFAULT_BUFFER_ROWS = 12; // extra rows rendered above/below viewport
@@ -61,8 +62,8 @@ const MAX_POOL = 120;  // max pooled (off-screen) cards before GC
 function _computeMetrics(container, thumbSize, gap, searchActive, perRow = 0) {
   const cw = container.clientWidth;
   if (cw <= 0) return null;
-  // perRow > 0 = the user fixed the number of items per row; thumbnail size
-  // is then derived from the container width instead of the size setting.
+  // perRow > 0 = fixed number of items per row; thumbnail size is then derived
+  // from the container width instead of the size setting.
   const colCount = perRow > 0 ? perRow : Math.max(1, Math.floor((cw + gap) / (thumbSize + gap)));
   const colW = (cw - (colCount - 1) * gap) / colCount;
   // Row height = square thumb area + info area (name + meta line) + gap.
@@ -78,16 +79,15 @@ function _computeMetrics(container, thumbSize, gap, searchActive, perRow = 0) {
  * Each item gets a pre-computed { x, y, w, h } based on its aspect ratio.
  * Items are placed in the shortest column (standard masonry algorithm).
  *
- * @param {Array} items — filtered items array
- * @param {object} metrics — { colCount, colW, gap, infoH }
+ * @param {Array} items - filtered items array
+ * @param {object} metrics - { colCount, colW, gap, infoH }
  * @returns {{ positions: Array<{x,y,w,h}>, totalHeight: number }}
  */
 function _computeMasonryLayout(items, metrics, fixedPerRow = 0) {
   // Justified-rows layout (Google-Photos style): items are placed left-to-right,
-  // top-to-bottom in strict order (so reading order is always preserved), each row
-  // is scaled to fill the container width while every card keeps its true aspect
-  // ratio. This supports mixed portrait/landscape without cropping to squares and
-  // without the shortest-column reordering the old masonry caused.
+  // top-to-bottom in strict reading order, each row scaled to fill the container
+  // width while every card keeps its true aspect ratio. Supports mixed
+  // portrait/landscape without cropping to squares.
   // fixedPerRow > 0: every row holds EXACTLY that many cards (user setting);
   // row height comes purely from the cards' aspect ratios.
   const { colCount, colW, gap, infoH } = metrics;
@@ -123,7 +123,7 @@ function _computeMasonryLayout(items, metrics, fixedPerRow = 0) {
     const totalGap = (row.length - 1) * gap;
     let rowH = (containerW - totalGap) / sumAR;
     if (fixedPerRow > 0) {
-      // Fixed count: height follows the ARs; only stop a sparse LAST row
+      // Fixed count: height follows the ARs; only stop a sparse last row
       // (fewer cards than asked) from blowing up to fill the width.
       if (row.length < fixedPerRow) rowH = Math.min(rowH, (containerW - (fixedPerRow - 1) * gap) / fixedPerRow * 1.4);
     } else {
@@ -186,24 +186,27 @@ function _masonryVisibleRange(positions, topEdge, bottomEdge) {
 /**
  * Initialize the gallery inside the given mount element.
  *
- * @param {HTMLElement} mountEl — the sidebar container element
- * @param {object} config — { openLightbox, openGallerySettings, app }
- * @returns {object} — public API: { state, fetchAllItems, fetchNewItems, refilter }
+ * @param {HTMLElement} mountEl - the sidebar container element
+ * @param {object} config - { openLightbox, openGallerySettings, app }
+ * @returns {object} - public API: { state, fetchAllItems, fetchNewItems, refilter }
  */
 export function initGallery(mountEl, config) {
   const { openLightbox, openGallerySettings } = config;
 
-  // Drop any thumbnail observations from a previous gallery instance so a
-  // remount (e.g. after a thumbnail-size change) can't inject stale thumbnails
-  // into the new cards. A full page refresh already resets this; a remount didn't.
+  // Drop thumbnail observations from a previous gallery instance so a remount
+  // (e.g. after a thumbnail-size change) can't inject stale thumbnails into the
+  // new cards.
   resetThumbObserver();
 
-  // Likewise stop a prior instance's reindex-progress poll and resize observer.
-  // ComfyUI can re-render this sidebar tab; the old closures keep running against
-  // now-detached DOM otherwise — a stacked-interval leak. Tracked on window so a
-  // fresh closure can find and clear the previous one.
-  if (window._sbgReindexTimer) { clearInterval(window._sbgReindexTimer); window._sbgReindexTimer = null; }
+  // Stop a prior instance's progress subscription and resize observer. ComfyUI can
+  // re-render this sidebar tab, leaving old closures running against detached DOM.
+  // Tracked on window so a fresh closure can find and clear the previous one.
+  if (window._sbgProgressUnsub) { try { window._sbgProgressUnsub(); } catch { } window._sbgProgressUnsub = null; }
   if (window._sbgResizeObserver) { try { window._sbgResizeObserver.disconnect(); } catch { } window._sbgResizeObserver = null; }
+  // Clear a prior instance's auto-refresh timer + focus/visibility listeners
+  // before this mount installs fresh ones.
+  if (window._sbgPollTimer) { clearInterval(window._sbgPollTimer); window._sbgPollTimer = null; }
+  if (window._sbgRefreshAbort) { try { window._sbgRefreshAbort.abort(); } catch { } window._sbgRefreshAbort = null; }
 
   // Bound the persistent thumbnail cache (content-addressed entries orphan as
   // files change and IndexedDB has no LRU). Fire-and-forget on mount.
@@ -219,7 +222,7 @@ export function initGallery(mountEl, config) {
     return Number.isFinite(n) && n >= 1 ? Math.min(12, Math.floor(n)) : 0;
   })();
   const thumbShape = getSetting(S.THUMB_SHAPE, "square");
-  // Normalize legacy sort values (pre creation/modified split) to the new keys.
+  // Normalize legacy sort values to the current creation/modified keys.
   const _SORT_ALIAS = { newest: "created_desc", oldest: "created_asc" };
   const _rawSort = getSetting(S.SORT, "created_desc");
   const defaultSort = _SORT_ALIAS[_rawSort] || _rawSort;
@@ -256,9 +259,9 @@ export function initGallery(mountEl, config) {
 
   /* ── Sorting ────────────────────────────────────────────────────── */
 
-  // Created time = ctime (falls back to legacy mtime field); Modified time =
-  // mtime_real (falls back to ctime/mtime). "newest"/"oldest" remain the
-  // default creation-time sort for back-compat with saved settings.
+  // Created time = ctime (falls back to mtime); Modified time = mtime_real
+  // (falls back to ctime/mtime). "newest"/"oldest" are creation-time aliases
+  // kept for saved settings.
   const _ct = (it) => (it.ctime != null ? it.ctime : it.mtime) || 0;
   const _mt = (it) => (it.mtime_real != null ? it.mtime_real : (it.ctime != null ? it.ctime : it.mtime)) || 0;
   const sortFns = {
@@ -440,6 +443,15 @@ export function initGallery(mountEl, config) {
 
   const qInput = h("input", { class: "sbg-input", placeholder: "Search all fields… (name: for filename only)", title: "Search across all metadata fields. Press Enter to add as a tag. Use name: for filename-only, model: lora: prompt: keyword: sampler: controlnet: for specific fields" });
   const searchClear = h("button", { class: "sbg-search-clear", text: "✕", title: "Clear search" });
+  // Refresh button shown in the same slot when the search is empty; swaps to the
+  // clear "✕" once a query/tags are active. Rescans disk without opening Diagnostics.
+  const searchRefresh = h("button", { class: "sbg-search-refresh", text: "⟳", title: "Refresh gallery (rescan disk)" });
+  searchRefresh.addEventListener("click", () => { fetchAllItems({ rescan: true }); });
+  const _syncSearchBtns = () => {
+    const active = state.searchTags.length > 0 || qInput.value.length > 0;
+    searchClear.classList.toggle("sbg-search-clear--visible", active);
+    searchRefresh.classList.toggle("sbg-search-refresh--visible", !active);
+  };
   const searchTagsWrap = h("div", { class: "sbg-search-tags" });
 
   const searchModeSel = h("select", { class: "sbg-search-mode", title: "Toggle whether tags should match ALL requirements (AND) or ANY requirement (OR)", style: "display:none;" }, [
@@ -463,8 +475,7 @@ export function initGallery(mountEl, config) {
     const val = qInput.value.toLowerCase().trim();
     autoCompleteDropdown.innerHTML = "";
     _acSelectedIdx = -1;
-    // Only suggest once the user has typed something — never on empty focus/scroll
-    // (that unexpected full-prefix dropdown was a regression).
+    // Only suggest once the user has typed something, never on empty focus/scroll.
     if (val.length === 0 || val.includes(":")) { autoCompleteDropdown.style.display = "none"; return; }
     const matches = SEARCH_PREFIXES.filter(p => p.startsWith(val));
     if (matches.length === 0 || (matches.length === 1 && matches[0] === val + ":")) {
@@ -518,9 +529,11 @@ export function initGallery(mountEl, config) {
     h("span", { class: "sbg-search-icon", html: SEARCH_SVG }),
     inputFlexBox,
     searchModeSel,
+    searchRefresh,
     searchClear,
     autoCompleteDropdown,
   ]);
+  _syncSearchBtns(); // empty query -> show the refresh button
 
   /* ── Progress bar ───────────────────────────────────────────────── */
 
@@ -562,32 +575,45 @@ export function initGallery(mountEl, config) {
   const statusRight = h("span", { class: "sbg-status__right" });
 
   // Auto-reindex indicator. After a restart that updated the metadata parser,
-  // the server re-reads every file in the background (_check_parser_version);
-  // show its progress here so it's visible without opening Diagnostics.
+  // the server re-reads every file in the background; show its progress here so
+  // it's visible without opening Diagnostics.
   const statusReindex = h("span", {
     class: "sbg-status__reindex",
     style: "color:var(--sbg-accent);display:none;white-space:nowrap",
-    title: "The metadata parser was updated — all files are being re-read in the background. The gallery stays usable; updated metadata appears as files are re-indexed.",
+    title: "The metadata parser was updated - all files are being re-read in the background. The gallery stays usable; updated metadata appears as files are re-indexed.",
   });
-  let _reindexTimer = null;
-  async function watchReindexProgress() {
-    try {
-      const p = await fetch("/sidebar_gallery/reindex_progress").then(r => r.json());
-      if (p.running) {
-        const pct = p.total > 0 ? Math.round((p.done / p.total) * 100) : 0;
-        statusReindex.style.display = "";
-        statusReindex.textContent = `⟳ Updating metadata index… ${pct}% (${(p.done || 0).toLocaleString()} / ${(p.total || 0).toLocaleString()})`;
-        if (!_reindexTimer) { _reindexTimer = setInterval(watchReindexProgress, 3000); window._sbgReindexTimer = _reindexTimer; }
-      } else if (_reindexTimer) {
-        clearInterval(_reindexTimer);
-        _reindexTimer = null;
-        window._sbgReindexTimer = null;
-        statusReindex.textContent = "✓ Metadata index updated";
-        setTimeout(() => { statusReindex.style.display = "none"; }, 8000);
-      } else {
-        statusReindex.style.display = "none";
+  // Status-bar consumer of the shared progress poller (sbg-core.js): shows the
+  // full rebuild if one runs, else any root's first index. Subscribes at mount
+  // and unsubscribes once everything settles.
+  function watchReindexProgress() {
+    let sawRunning = false;
+    const unsub = progressPoller.subscribe((data, meta) => {
+      let e = null;
+      if (data) {
+        if (data.full && data.full.running) e = data.full;
+        else e = Object.values(data.roots || {}).find(x => x && x.running) || null;
       }
-    } catch { /* server briefly unreachable — leave indicator as-is */ }
+      if (e) {
+        sawRunning = true;
+        statusReindex.style.display = "";
+        const f = formatProgress(e);
+        statusReindex.textContent = e.phase === "scanning"
+          ? `⟳ ${f.text}`
+          : `⟳ Updating metadata index… ${f.text}`;
+        return;
+      }
+      if (meta.settled) {
+        if (sawRunning) {
+          statusReindex.textContent = "✓ Metadata index updated";
+          setTimeout(() => { statusReindex.style.display = "none"; }, 8000);
+        } else {
+          statusReindex.style.display = "none";
+        }
+        unsub();
+        if (window._sbgProgressUnsub === unsub) window._sbgProgressUnsub = null;
+      }
+    });
+    window._sbgProgressUnsub = unsub;
   }
 
   const statusBar = h("div", { class: "sbg-status" }, [statusLeft, statusReindex, statusRight]);
@@ -599,10 +625,9 @@ export function initGallery(mountEl, config) {
   grid.appendChild(spacer);
 
   const body = h("div", { class: "sbg-body" }, [grid]);
-  // Wrap the scroll area so a custom OVERLAY scrollbar can float over the content.
-  // Chrome can't do Firefox-style overlay scrollbars (its styled scrollbar always
-  // reserves a gutter and never overlays); _attachOverlayScrollbar adds one in
-  // Chrome/Edge. Firefox keeps its own native overlay scrollbar.
+  // Wrap the scroll area so a custom overlay scrollbar can float over the content.
+  // Chrome/Edge styled scrollbars always reserve a gutter and never overlay, so
+  // _attachOverlayScrollbar adds one there. Firefox keeps its native overlay one.
   const bodyWrap = h("div", { class: "sbg-body-wrap" }, [body]);
 
   grid.style.setProperty("--sbg-thumb-size", `${thumbSize}px`);
@@ -643,7 +668,7 @@ export function initGallery(mountEl, config) {
    * For virtual scrolling, cards are positioned absolutely.
    */
   function _createOrRecycleCard(it, index) {
-    // For now, always create fresh (recycling requires careful src/event cleanup)
+    // Always create fresh for now (recycling requires careful src/event cleanup).
     // TODO: implement proper card recycling for even better perf
     const shapeClass = thumbShape === "ar" ? "sbg-card__thumb-wrap--ar" : "sbg-card__thumb-wrap--square";
     const thumbWrap = h("div", { class: `sbg-card__thumb-wrap ${shapeClass}` });
@@ -653,14 +678,13 @@ export function initGallery(mountEl, config) {
         class: "sbg-card__thumb",
         loading: "lazy",
         // Non-draggable so the blob: thumbnail never leaks into the card's drag
-        // payload — that was what ComfyUI's native drop tried to upload (→ 500).
+        // payload (ComfyUI's native drop would try to upload it → 500).
         draggable: "false",
         onerror: function () {
-          // Show a placeholder icon on ANY thumbnail load failure. We deliberately
-          // do NOT remove the item from the gallery here: a 404 is often transient
-          // (thumb still generating, or the server is busy serving another browser),
-          // and nuking the card on a transient failure was what left "broken"
-          // gaps. Truly-deleted files are pruned by the next incremental scan.
+          // Show a placeholder icon on any thumbnail load failure, but keep the
+          // item: a 404 is often transient (thumb still generating, or the server
+          // busy serving another browser). Truly-deleted files are pruned by the
+          // next incremental scan.
           const img = this;
           img.style.display = "none";
           if (img.parentElement && !img.parentElement.querySelector(".sbg-card__placeholder")) {
@@ -747,11 +771,13 @@ export function initGallery(mountEl, config) {
       e.dataTransfer.setData("application/x-sbg-workflow", JSON.stringify({ root_id: it.root_id, relpath: it.relpath }));
       e.dataTransfer.setData("text/plain", it.filename);
       e.dataTransfer.effectAllowed = "copy";
-      // (No full-canvas overlay — ComfyUI's own per-node drop highlight is enough.)
     });
 
     card.dataset.idx = String(index);
     card.dataset.relpath = it.relpath;  // bind card → item so we can detect stale reuse
+    // Identity includes mtime: a file overwritten in place keeps its relpath but
+    // needs a rebuilt card (fresh ?v= thumb URL), which relpath alone can't detect.
+    card.dataset.key = `${it.relpath} ${it.mtime_real ?? it.mtime ?? 0}`;
     return card;
   }
 
@@ -828,9 +854,10 @@ export function initGallery(mountEl, config) {
         const existing = _cardMap.get(i);
         if (existing) {
           // If the list shifted (e.g. a delta refresh prepended items), index i may
-          // now point to a DIFFERENT item; rebuild when the bound relpath no longer
-          // matches so a card never shows another item thumbnail.
-          if (existing.dataset.relpath === it.relpath) continue;
+          // now point to a different item, or the same item modified in place (new
+          // mtime → new thumb URL). Rebuild when the bound identity no longer matches
+          // so a card never shows another item's or a stale thumbnail.
+          if (existing.dataset.key === `${it.relpath} ${it.mtime_real ?? it.mtime ?? 0}`) continue;
           existing.remove(); _cardMap.delete(i);
         }
         const card = _createOrRecycleCard(it, i);
@@ -867,9 +894,10 @@ export function initGallery(mountEl, config) {
       if (!it) continue;
       const existing = _cardMap.get(i);
       if (existing) {
-        // Rebuild if index i now maps to a different item (list shifted) so a
-        // card never displays a stale/wrong thumbnail (image↔video mismatch).
-        if (existing.dataset.relpath === it.relpath) continue;
+        // Rebuild if index i now maps to a different item (list shifted) or the
+        // same item modified in place (new mtime → new thumb URL), so a card
+        // never displays a stale or wrong thumbnail (image/video mismatch).
+        if (existing.dataset.key === `${it.relpath} ${it.mtime_real ?? it.mtime ?? 0}`) continue;
         existing.remove(); _cardMap.delete(i);
       }
       const card = _createOrRecycleCard(it, i);
@@ -900,10 +928,9 @@ export function initGallery(mountEl, config) {
     // Reserve the extra info row (for match badges) only while a search is active.
     grid.classList.toggle("sbg-grid--search", !!state._searchMatches);
 
-    // Clear all cards. Also purge any stray card zombies: _recycleCard() hides
-    // pooled cards (display:none) without removing them from the grid, and
-    // _createOrRecycleCard always builds fresh, so without this sweep an old
-    // filter's cards could linger in the DOM and show stale/wrong thumbnails.
+    // Clear all cards, and sweep any strays: _recycleCard() hides pooled cards
+    // (display:none) without removing them, so without this an old filter's cards
+    // could linger in the DOM and show stale/wrong thumbnails.
     for (const [, card] of _cardMap) {
       card.remove();
     }
@@ -951,10 +978,9 @@ export function initGallery(mountEl, config) {
 
   body.addEventListener("scroll", () => { _saveScrollPos(); _scheduleVirtualRender(); }, { passive: true });
 
-  // Custom OVERLAY scrollbar for Chrome/Edge (Firefox's native overlay is already
-  // ideal — skip there). Chrome's styled scrollbar reserves a gutter and never
-  // overlays content; this thin thumb floats over the right edge: invisible when
-  // idle, widening when the pointer nears it, draggable, synced to scroll position.
+  // Custom overlay scrollbar for Chrome/Edge (Firefox's native overlay is skipped).
+  // A thin thumb floats over the right edge: invisible when idle, widening when the
+  // pointer nears it, draggable, synced to scroll position.
   function _attachOverlayScrollbar(scrollEl, wrap) {
     if (/firefox/i.test(navigator.userAgent)) return;
     scrollEl.classList.add("sbg-body--ovscroll");
@@ -1014,8 +1040,7 @@ export function initGallery(mountEl, config) {
     // Re-layout when the viewport or content height changes (virtual scroll resizes
     // the spacer, filters change the item count, the window resizes).
     try {
-      // Drop a prior instance's observer so remounts (thumb-size change re-runs
-      // initGallery) don't leak observers/detached nodes.
+      // Drop a prior instance's observer so remounts don't leak observers/nodes.
       if (window._sbgOverlayRO) { try { window._sbgOverlayRO.disconnect(); } catch { } }
       const ro = new ResizeObserver(() => layout());
       ro.observe(scrollEl);
@@ -1030,7 +1055,7 @@ export function initGallery(mountEl, config) {
     const newMetrics = _computeMetrics(grid, thumbSize, GAP, !!state._searchMatches, thumbPerRow);
     if (newMetrics && _metrics &&
         (newMetrics.colCount !== _metrics.colCount || Math.abs(newMetrics.rowH - _metrics.rowH) > 1)) {
-      // Column count or row height changed — full re-layout
+      // Column count or row height changed: full re-layout
       _metrics = newMetrics;
       renderFromScratch();
     } else if (newMetrics && !_metrics) {
@@ -1068,9 +1093,11 @@ export function initGallery(mountEl, config) {
     state.roots = cfg.roots || [];
     if (!state.roots.find(r => r.id === "output")) state.roots.unshift({ id: "output", label: "Output" });
     _dataCache.roots = state.roots;
-    // The active root was just removed (Folders → 🗑) → fall back to output and
-    // reload its view, otherwise the grid keeps showing the deleted folder's
-    // images. switchRoot also redraws the breadcrumb nav.
+    _dataCache._autoRefreshSecs = (typeof cfg.auto_refresh_interval_s === "number") ? cfg.auto_refresh_interval_s : 15;
+    _startAutoRefresh(); // apply a possibly-changed interval immediately
+    // If the active root was removed, fall back to output and reload its view,
+    // otherwise the grid keeps showing the deleted folder's images. switchRoot
+    // also redraws the breadcrumb nav.
     if (!state.roots.find(r => r.id === state.rootId)) {
       switchRoot("output");
     } else {
@@ -1078,13 +1105,12 @@ export function initGallery(mountEl, config) {
     }
   }
 
-  // Switch the active root. A root we've shown before paints instantly from its
-  // cached list, then an awaited rescan reconciles files created while we were on
-  // another root — generations always land in the output root even when an extra
-  // folder is on screen, and that file would otherwise stay hidden until a manual
-  // refresh. A freshly added / never-opened root has nothing cached or indexed
-  // yet, so we show an indexing indicator while the backend finishes its first
-  // scan (list_all awaits that scan when the root's DB is still empty).
+  // Switch the active root. A previously-shown root paints instantly from its
+  // cached list, then a rescan reconciles files created while another root was
+  // active (generations land in the output root even when another folder is on
+  // screen). A never-opened root has nothing cached, so show an indexing indicator
+  // while the backend finishes its first scan (list_all awaits that scan when the
+  // root's DB is still empty).
   function switchRoot(newRootId) {
     if (newRootId === state.rootId) return;
     state.rootId = newRootId;
@@ -1098,61 +1124,96 @@ export function initGallery(mountEl, config) {
       state.allItems = _dataCache.items[newRootId];
       applyFilters();
       renderFromScratch();
-      fetchAllItems({ rescan: false })
-        .then(() => fetchAllItems({ rescan: true }))
-        .catch(() => { });
+      // Paint from the in-memory cache, then version-gated poll.
+      _pollAndReconcile();
     } else {
       state.allItems = [];
       applyFilters();
       renderFromScratch();
       showProgress("Indexing new folder…", -1);
+      // Watch this root's first-index entry via the shared poller so a slow
+      // (network) folder shows progress instead of a static bar. `idxActive`
+      // guards a tick already in flight when we unsubscribe, so a late callback
+      // can't re-show the bar after hideProgress().
+      let idxActive = true;
+      const unsubIdx = progressPoller.subscribe((data) => {
+        if (!idxActive || !data) return;
+        const e = (data.roots || {})[newRootId];
+        if (!e || !e.running) return;
+        const f = formatProgress(e);
+        showProgress(e.phase === "scanning" ? f.text : `Indexing… ${f.text}`, f.pct);
+      });
       fetchAllItems({ rescan: false })
         .then(() => loadSubfolders())
         .catch(() => { })
-        .finally(() => hideProgress());
+        .finally(() => { idxActive = false; unsubIdx(); hideProgress(); });
     }
   }
 
   /* ── Data fetching ──────────────────────────────────────────────── */
 
-  // Debounced snapshot persistence. The delta path (fetchNewItems) used to update
-  // only in-memory state, so freshly generated files were absent from the IDB
-  // snapshot that drives the instant first paint after a reboot/refresh — they
-  // popped in only after a network round-trip. Persisting here (coalesced, since
-  // a burst generation fires several deltas) makes the next cold start paint
-  // complete. fetchAllItems persists inline; this is the delta-path equivalent.
-  let _persistTimer = null;
-  function _schedulePersist() {
-    if (_persistTimer) clearTimeout(_persistTimer);
-    _persistTimer = setTimeout(() => {
-      _persistTimer = null;
-      _persistItems(state.rootId, state.allItems);
-    }, 1500);
+  // Debounced snapshot persistence for the delta path (fetchNewItems), so freshly
+  // generated files are included in the IDB snapshot that drives the instant first
+  // paint after a reboot/refresh. Coalesced, since a burst generation fires several
+  // deltas. fetchAllItems persists inline; this is the delta-path equivalent.
+  const _persistTimers = new Map(); // rootId -> debounce timer
+
+  // Single write path for the IndexedDB snapshot: always the per-root cached
+  // items with the per-root version they reflect, and a record of what was
+  // written so unchanged fetches can skip the multi-MB rewrite entirely.
+  function _persistSnapshot(rid) {
+    const items = _dataCache.items[rid];
+    if (!items) return;
+    const ver = _dataCache.itemsVersion[rid];
+    _persistItems(rid, items, ver);
+    _dataCache._persistedVersion[rid] = ver;
   }
 
-  async function fetchAllItems({ rescan = false } = {}) {
-    if (!rescan) setLoading(true);
-    if (rescan) resetFailedThumbs(); // give previously-404'd thumbnails another chance
-    statusLeft.textContent = rescan ? "Scanning…" : "Loading…";
+  function _schedulePersist(rid = state.rootId) {
+    // Bind the root at schedule time (not when the timer fires) and debounce per
+    // root, so a root switch inside the debounce window can't drop or mis-pair the
+    // previous root's pending snapshot write.
+    const prev = _persistTimers.get(rid);
+    if (prev) clearTimeout(prev);
+    _persistTimers.set(rid, setTimeout(() => {
+      _persistTimers.delete(rid);
+      _persistSnapshot(rid);
+    }, 1500));
+  }
+
+  async function fetchAllItems({ rescan = false, rootId = state.rootId } = {}) {
+    // Capture the root once. Every cache write below is keyed by the captured
+    // value, so a slow response for root A landing after a switch to root B stores
+    // A's items and version under A, not B. View updates additionally require the
+    // root to still be on screen.
+    const rid = rootId;
+    // Status/spinner belong to the on-screen root only: a background refetch for a
+    // root the user already left must not flash "Loading…" on the visible one.
+    const showedLoading = !rescan && rid === state.rootId;
+    if (showedLoading) setLoading(true);
+    if (rescan) resetFailedThumbs(); // give previously-failed thumbnails another chance
+    if (rid === state.rootId) statusLeft.textContent = rescan ? "Scanning…" : "Loading…";
     try {
       const ts = Math.max(512, thumbSize * 2);
       _dataCache._thumbSize = ts;
       const data = await api("/sidebar_gallery/list_all", {
-        root_id: state.rootId,
+        root_id: rid,
         rescan: rescan ? "1" : undefined,
         thumb_size: String(ts),
       });
+      const isCurrent = rid === state.rootId;
 
-      if (data.server_time) _dataCache._lastServerTime = data.server_time;
+      if (data.server_time) _dataCache.serverTime[rid] = data.server_time;
+      if (data.db_version !== undefined) {
+        _dataCache.itemsVersion[rid] = data.db_version;
+      }
 
       // Cache epoch vs DB version.
-      // CACHE_EPOCH is bumped manually when the cached DATA SHAPE changes — that
-      // genuinely requires dropping every cache. A plain db_version change just
-      // means some file was added/changed/removed and must NOT wipe the metadata
-      // + thumbnail caches: doing so made the lightbox re-fetch metadata on every
-      // navigation during generation. Per-item freshness is now guaranteed by the
-      // lightbox's mtime check and by content-addressed thumb/file URLs (?v=mtime),
-      // so changed files refresh on their own without nuking everything.
+      // CACHE_EPOCH is bumped manually when the cached data SHAPE changes, which
+      // requires dropping every cache. A plain db_version change just means a file
+      // was added/changed/removed and must NOT wipe the metadata + thumbnail caches.
+      // Per-item freshness comes from the lightbox's mtime check and content-
+      // addressed thumb/file URLs (?v=mtime), so changed files refresh on their own.
       let cacheReset = false;
       const CACHE_EPOCH = "3";
       if (localStorage.getItem("SBG._cacheEpoch") !== CACHE_EPOCH) {
@@ -1160,14 +1221,13 @@ export function initGallery(mountEl, config) {
         try { _resetIdb(); indexedDB.deleteDatabase("sbg-cache"); } catch (e) { /* ignore */ }
         try { indexedDB.deleteDatabase("sbg-gallery-cache"); } catch (e) { /* ignore */ }
         localStorage.setItem("SBG._cacheEpoch", CACHE_EPOCH);
-        cacheReset = true; // data-shape change — force a fresh repaint below
+        cacheReset = true; // data-shape change: force a fresh repaint below
       }
-      // A full reindex re-extracts metadata WITHOUT changing file mtimes, so the
-      // lightbox's per-item mtime check can't detect it. meta_epoch bumps on
-      // reindex completion → drop cached METADATA only (L1 _metaCache, which also
-      // holds the lightbox's initmeta: entries, + the IndexedDB "meta" store).
-      // Thumbnails are left intact (the images didn't change); generation
-      // (db_version) bumps do NOT trigger this.
+      // A full reindex re-extracts metadata without changing file mtimes, so the
+      // lightbox's per-item mtime check can't detect it. meta_epoch bumps on reindex
+      // completion → drop cached metadata only (L1 _metaCache + the IndexedDB "meta"
+      // store); thumbnails are left intact. Generation (db_version) bumps don't
+      // trigger this.
       if (data.meta_epoch !== undefined && localStorage.getItem("SBG._metaEpoch") !== String(data.meta_epoch)) {
         _metaCache.clear();
         _metaCacheAPI.clear().catch(() => { });
@@ -1176,47 +1236,56 @@ export function initGallery(mountEl, config) {
 
       const newItems = data.items || [];
 
-      if (data.db_empty && newItems.length === 0) {
+      if (isCurrent && data.db_empty && newItems.length === 0) {
         _showFirstTimeModal();
       }
 
-      // Diff update: when the returned set is identical to what's already on
-      // screen there is nothing to persist OR repaint. thumb_size is constant
-      // within a mount (changing it remounts the gallery), so an unchanged relpath
-      // set means identical thumb URLs — skipping the repaint is what stops the
-      // gallery visibly "refreshing" 2-3 times on startup (persisted paint →
-      // rescan:false → rescan:true all return the same list once the snapshot is
-      // complete). A cache reset above still forces a repaint.
-      const oldSet = new Set(state.allItems.map(x => x.relpath));
+      // Diff update: when the returned set is identical to what's already cached
+      // there is nothing to persist or repaint, which stops the gallery visibly
+      // "refreshing" on startup. The diff compares (relpath, mtime) pairs, not just
+      // relpaths, so a file overwritten in place (same relpath, new mtime and thumb
+      // URL) is detected. A cache reset above still forces a repaint.
+      const prevItems = _dataCache.items[rid] || [];
+      const oldMap = new Map(prevItems.map(x => [x.relpath, x.mtime_real ?? x.mtime ?? 0]));
       const newSet = new Set(newItems.map(x => x.relpath));
-      const added = newItems.filter(x => !oldSet.has(x.relpath));
-      const removed = state.allItems.filter(x => !newSet.has(x.relpath));
-      const noChange = state.allItems.length > 0 && added.length === 0 && removed.length === 0;
+      const added = newItems.filter(x => !oldMap.has(x.relpath));
+      const removedCount = prevItems.reduce((n, x) => n + (newSet.has(x.relpath) ? 0 : 1), 0);
+      const changed = newItems.filter(x =>
+        oldMap.has(x.relpath) && oldMap.get(x.relpath) !== (x.mtime_real ?? x.mtime ?? 0));
+      const noChange = prevItems.length > 0 && added.length === 0
+        && removedCount === 0 && changed.length === 0;
 
-      state.allItems = newItems;
-      _dataCache.items[state.rootId] = state.allItems;
-      if (!noChange) _persistItems(state.rootId, state.allItems);
-      statusLeft.textContent = "Ready";
+      _dataCache.items[rid] = newItems;
+      // Persist items + the DB version they reflect (drives the reopen version
+      // gate), but skip the multi-MB IndexedDB rewrite when neither the items nor
+      // the version changed since the last write (the common startup case).
+      if (!noChange || _dataCache._persistedVersion[rid] !== _dataCache.itemsVersion[rid]) {
+        _persistSnapshot(rid);
+      }
 
-      applyFilters();
-      if (!noChange || cacheReset) renderFromScratch();
+      if (isCurrent) {
+        state.allItems = newItems;
+        statusLeft.textContent = "Ready";
+        applyFilters();
+        if (!noChange || cacheReset) renderFromScratch();
+      }
     } catch (e) {
-      statusLeft.textContent = `Error: ${e.message || e}`;
+      if (rid === state.rootId) statusLeft.textContent = `Error: ${e.message || e}`;
     } finally {
-      if (!rescan) setLoading(false);
+      if (showedLoading) setLoading(false);
     }
   }
 
   function _showFirstTimeModal() {
-    // Never stack a second copy — fetchAllItems can fire multiple times while
-    // the DB is still empty (init + background rescans), and a duplicate modal
-    // resetting on top of the first looked like indexing had silently died.
+    // Never stack a second copy: fetchAllItems can fire multiple times while the DB
+    // is still empty (init + background rescans), and a duplicate modal resetting on
+    // top of the first looks like indexing has silently died.
     if (document.querySelector(".sbg-first-time-overlay")) return;
 
     const overlay = h("div", { class: "sbg-first-time-overlay" });
     const modal = h("div", { class: "sbg-first-time-modal" });
     const title = h("h3", { text: "🗂️ Building Index for the First Time" });
-    const desc = h("p", { text: "This will scan all media files and parse their metadata. This may take 2–10 minutes depending on library size." });
+    const desc = h("p", { text: "This will scan all media files and parse their metadata. This may take 2-10 minutes depending on library size." });
     const progressBar = h("div", { class: "sbg-progress__bar" });
     const progressFillM = h("div", { class: "sbg-progress__fill" });
     progressBar.appendChild(progressFillM);
@@ -1240,41 +1309,51 @@ export function initGallery(mountEl, config) {
       progressTextM.textContent = "Starting…";
       try { await fetch("/sidebar_gallery/rebuild_index", { method: "POST" }); } catch { }
       let sawRunning = false; // ignore early polls before the worker spins up
-      const poll = setInterval(async () => {
-        try {
-          const r = await fetch("/sidebar_gallery/reindex_progress");
-          const p = await r.json();
-          if (p.running) sawRunning = true;
-          if (p.total > 0) {
-            const pct = Math.round((p.done / p.total) * 100);
-            progressFillM.style.width = pct + "%";
-            progressTextM.textContent = `${p.done} / ${p.total} files (${pct}%)`;
-          }
-          // Real failure (e.g. "database is locked"): say so and offer a
-          // retry — previously this was misread as success, the modal closed
-          // and immediately reopened blank.
-          if (!p.running && (p.error || p.phase === "error")) {
-            clearInterval(poll);
-            progressTextM.textContent = `Indexing failed: ${p.error || "unknown error"}. Click to try again.`;
+      let modalActive = true;
+      const unsub = progressPoller.subscribe((data, meta) => {
+        if (!modalActive || !data) return;
+        const e = data.full;
+        if (data.running) sawRunning = true;
+        if (e && data.running) {
+          const f = formatProgress(e);
+          if (f.pct >= 0) progressFillM.style.width = f.pct + "%";
+          progressTextM.textContent = f.text;
+        }
+        // Real failure (e.g. "database is locked"): say so and offer a retry.
+        if (e && !data.running && (e.error || e.phase === "error")) {
+          modalActive = false; unsub();
+          progressTextM.textContent = `Indexing failed: ${e.error || "unknown error"}. Click to try again.`;
+          startBtn.disabled = false;
+          startBtn.textContent = "🚀 Start Indexing";
+          skipBtn.style.display = "";
+          return;
+        }
+        // `settled` (2+ idle ticks) rather than a single !running read: a
+        // multi-root rebuild has a gap between roots where a single read would
+        // say "finished" and close the modal mid-rebuild.
+        if (meta.settled) {
+          if (sawRunning || (e && e.phase === "done")) {
+            modalActive = false; unsub();
+            progressFillM.style.width = "100%";
+            progressTextM.textContent = `Done! ${(e && (e.done || e.total)) || ""} files indexed.`;
+            setTimeout(() => { overlay.remove(); fetchAllItems(); }, 1500);
+          } else {
+            // The rebuild never started (refused because another scan holds the
+            // writer, or it died before reporting): recover the buttons instead of
+            // sitting on a disabled "Starting…" forever.
+            modalActive = false; unsub();
+            progressTextM.textContent = "Couldn't start - another scan is still running. Try again in a moment.";
             startBtn.disabled = false;
             startBtn.textContent = "🚀 Start Indexing";
             skipBtn.style.display = "";
-            return;
           }
-          if (!p.running && (sawRunning || p.phase === "done")) {
-            clearInterval(poll);
-            progressFillM.style.width = "100%";
-            progressTextM.textContent = `Done! ${p.done || p.total} files indexed.`;
-            setTimeout(() => { overlay.remove(); fetchAllItems(); }, 1500);
-          }
-        } catch { }
-      }, 1000);
+        }
+      });
     });
   }
 
   // Remembered scroll positions per view (root + folder + kind), so toggling
   // All/Images/Videos or reopening the gallery returns to where you were.
-  // One number per view in the module cache — no perf or memory cost.
   const _scrollKey = () => `${state.rootId}|${state.subfolder}|${state.kind}`;
   function _saveScrollPos() {
     (_dataCache.scrollPos = _dataCache.scrollPos || {})[_scrollKey()] = body.scrollTop;
@@ -1288,32 +1367,102 @@ export function initGallery(mountEl, config) {
     applyFilters();
     // Reset to the top first so the virtual window's indices line up with the
     // freshly filtered list (a stale scrollTop would mount cards for the wrong
-    // index range — the root cause of wrong thumbs when toggling Videos-only),
-    // then restore this view's remembered position (the scroll event re-renders
-    // the virtual window for the right range).
+    // index range), then restore this view's remembered position (the scroll event
+    // re-renders the virtual window for the right range).
     body.scrollTop = 0;
     renderFromScratch();
     _restoreScrollPos();
   }
 
+  // Poll the backend (which runs a guarded scan and returns the current DB version)
+  // and only refetch the full list when that version differs from what this root's
+  // view last reconciled against. A no-change reopen is a single tiny poll; this
+  // also reconciles external deletes/renames that the add-only delta path can't see.
+  let _pollInflight = null;
+  let _pollInflightRid = null;
+  function _pollAndReconcile() {
+    // Single-flight: focus + visibilitychange + the interval tick can all fire in
+    // the same instant (returning to the tab); without this guard each would run its
+    // own full refetch. Root-aware: a poll for the previous root must not swallow the
+    // new root's reconcile (its /poll can block for seconds behind a scan), so chain
+    // it after the in-flight one instead.
+    if (_pollInflight) {
+      if (_pollInflightRid === state.rootId) return _pollInflight;
+      return _pollInflight.then(() => _pollAndReconcile());
+    }
+    _pollInflightRid = state.rootId;
+    _pollInflight = (async () => {
+      try {
+        const rid = state.rootId; // captured: all decisions below are for THIS root
+        const known = _dataCache.itemsVersion[rid];
+        const p = await api("/sidebar_gallery/poll", { root_id: rid });
+        if (p.reindexing) return; // full rebuild churning versions; the timer retries
+        // Refetch when the version moved, or when the version matches but the item
+        // count doesn't (self-healing: a version stamp recorded against a view that
+        // missed an add/delete heals here instead of suppressing refetches forever).
+        const haveCount = (_dataCache.items[rid] || []).length;
+        const countMismatch = typeof p.count === "number" && p.count !== haveCount;
+        if (known == null || p.db_version !== known || countMismatch) {
+          await fetchAllItems({ rescan: false, rootId: rid });
+        }
+      } catch (e) { /* offline or endpoint missing: keep the cached view */ }
+      finally { _pollInflight = null; _pollInflightRid = null; }
+    })();
+    return _pollInflight;
+  }
+
+  // Periodic + focus-driven auto-refresh: while the panel is visible, poll for
+  // external changes (delete/move/rename) and reconcile. Interval comes from config
+  // (auto_refresh_interval_s, default 15s; 0 = off). One AbortController +
+  // window._sbgPollTimer so a sidebar remount tears the listeners + timer down
+  // cleanly (see the teardown block at the top of initGallery).
+  function _startAutoRefresh() {
+    // Clear any existing timer + listeners first, so this can be re-run after a
+    // settings change (or 0 = off) without stacking a second interval.
+    if (window._sbgPollTimer) { clearInterval(window._sbgPollTimer); window._sbgPollTimer = null; }
+    if (window._sbgRefreshAbort) { try { window._sbgRefreshAbort.abort(); } catch { } window._sbgRefreshAbort = null; }
+    const secs = Number(_dataCache._autoRefreshSecs);
+    const interval = Number.isFinite(secs) ? secs : 15;
+    const ac = new AbortController();
+    window._sbgRefreshAbort = ac;
+    const maybePoll = () => {
+      if (document.visibilityState !== "visible") return;      // don't scan while hidden
+      if (!(_dataCache._mountEl && _dataCache._mountEl.isConnected)) return;
+      _pollAndReconcile();
+    };
+    // The return-to-tab listeners are installed even when the interval is 0: "off"
+    // disables the periodic timer, not the one cheap reconcile when the user comes
+    // back to look.
+    window.addEventListener("focus", maybePoll, { signal: ac.signal });
+    document.addEventListener("visibilitychange", () => {
+      if (document.visibilityState === "visible") maybePoll();  // poll immediately on return
+    }, { signal: ac.signal });
+    if (!interval || interval <= 0) return; // 0 = no periodic polling
+    const ms = Math.max(5, interval) * 1000;
+    window._sbgPollTimer = setInterval(maybePoll, ms);
+  }
+
   async function fetchNewItems() {
     const files = _dataCache._pendingFiles;
     _dataCache._pendingFiles = [];
+    // Captured root: every cache write below is keyed by it, view updates
+    // additionally require it to still be on screen (see fetchAllItems).
+    const rid = state.rootId;
 
-    if (!files.length && (!_dataCache._lastServerTime || state.allItems.length === 0)) {
-      return fetchAllItems({ rescan: true });
+    if (!files.length && (!_dataCache.serverTime[rid] || (_dataCache.items[rid] || []).length === 0)) {
+      return fetchAllItems({ rescan: true, rootId: rid });
     }
 
     try {
       const ts = _dataCache._thumbSize || Math.max(512, thumbSize * 2);
       const body_payload = {
-        root_id: state.rootId,
+        root_id: rid,
         thumb_size: ts,
       };
       if (files.length > 0) {
         body_payload.files = files;
       } else {
-        body_payload.since = _dataCache._lastServerTime;
+        body_payload.since = _dataCache.serverTime[rid];
       }
 
       const resp = await fetch("/sidebar_gallery/list_new", {
@@ -1323,11 +1472,19 @@ export function initGallery(mountEl, config) {
       });
       if (!resp.ok) throw new Error(resp.statusText);
       const data = await resp.json();
+      const isCurrent = rid === state.rootId;
 
-      if (data.server_time) _dataCache._lastServerTime = data.server_time;
+      if (data.server_time) _dataCache.serverTime[rid] = data.server_time;
+      // Stamping the post-scan version is sound only because the merge below applies
+      // both directions: adds/replacements from items[] and deletions from removed[].
+      // An add-only merge would stamp a version whose deletions it never applied,
+      // leaving ghost cards of externally deleted files ("already seen this version").
+      if (data.db_version !== undefined) {
+        _dataCache.itemsVersion[rid] = data.db_version;
+      }
 
       const added = data.items || [];
-      if (added.length === 0) return;
+      const removed = data.removed || [];
 
       for (const newItem of added) {
         const ck = `${newItem.root_id}:${newItem.relpath}`;
@@ -1335,13 +1492,57 @@ export function initGallery(mountEl, config) {
         _metaCacheAPI.put(ck, null).catch(() => { });
       }
 
-      added.sort((a, b) => b.mtime - a.mtime);
-      const existingPaths = new Set(state.allItems.map(x => x.relpath));
-      const trulyNew = added.filter(x => !existingPaths.has(x.relpath));
-      if (trulyNew.length === 0) return;
-      state.allItems = [...trulyNew, ...state.allItems];
-      _dataCache.items[state.rootId] = state.allItems;
-      _schedulePersist(); // so the next cold-start first paint includes these
+      let items = _dataCache.items[rid] || [];
+      let changedAny = false;
+
+      if (removed.length > 0) {
+        const rm = new Set(removed);
+        const next = items.filter(x => !rm.has(x.relpath));
+        if (next.length !== items.length) {
+          items = next;
+          changedAny = true;
+        }
+        for (const rp of removed) {
+          const ck = `${rid}:${rp}`;
+          _metaCache.delete(ck);
+          _metaCacheAPI.put(ck, null).catch(() => { });
+        }
+      }
+
+      if (added.length > 0) {
+        added.sort((a, b) => b.mtime - a.mtime);
+        const byPath = new Map(items.map(x => [x.relpath, x]));
+        const trulyNew = [];
+        for (const it of added) {
+          const prev = byPath.get(it.relpath);
+          if (!prev) {
+            trulyNew.push(it);
+          } else if ((prev.mtime_real ?? prev.mtime ?? 0) !== (it.mtime_real ?? it.mtime ?? 0)) {
+            // Same file modified in place: replace the entry so its card rebuilds
+            // with the fresh ?v= thumb URL instead of keeping the stale thumbnail.
+            items = items.map(x => (x.relpath === it.relpath ? it : x));
+            changedAny = true;
+          }
+        }
+        if (trulyNew.length > 0) {
+          items = [...trulyNew, ...items];
+          changedAny = true;
+        }
+      }
+
+      _dataCache.items[rid] = items;
+
+      // Count invariant (files[]-form has no removed[]): if the server's row count
+      // disagrees with what we now hold, schedule a reconcile rather than trusting
+      // the stamp.
+      if (typeof data.count === "number" && data.count !== items.length) {
+        _pollAndReconcile();
+      }
+
+      if (!changedAny) return;
+      if (isCurrent) state.allItems = items;
+      _schedulePersist(rid); // so the next cold-start first paint includes these
+      if (!isCurrent) return;
 
       if (state._searchMatches) {
         // Active search: delta search new items
@@ -1367,7 +1568,7 @@ export function initGallery(mountEl, config) {
             }
             _dataCache.lastSearchMatches = state._searchMatches;
           }
-        } catch { /* delta search failed — non-critical */ }
+        } catch { /* delta search failed: non-critical */ }
         const nameTags = state.searchTags.filter(t => t.field === "name");
         if (nameTags.length > 0) {
           for (const it of added) {
@@ -1392,7 +1593,7 @@ export function initGallery(mountEl, config) {
       statusLeft.textContent = "Ready";
     } catch (e) {
       console.warn("[SBG] Delta refresh failed, falling back to full:", e);
-      return fetchAllItems({ rescan: true });
+      return fetchAllItems({ rescan: true, rootId: rid });
     }
   }
 
@@ -1468,7 +1669,7 @@ export function initGallery(mountEl, config) {
       searchTagsWrap.appendChild(pill);
     }
     searchModeSel.style.display = state.searchTags.length > 1 ? "inline-block" : "none";
-    searchClear.classList.toggle("sbg-search-clear--visible", state.searchTags.length > 0 || qInput.value.length > 0);
+    _syncSearchBtns();
   }
 
   function _computeSearchScopes(tags) {
@@ -1650,9 +1851,8 @@ export function initGallery(mountEl, config) {
           if (canonical) field = SectionRegistry.getSearchField(canonical);
         } else {
           // No colon: if the bare term names a known section (e.g. "adetailer",
-          // "lora", "controlnet"), scope to that section so it lists every item
-          // that has it — matching what users expect from "adetailer" without
-          // the trailing colon. Otherwise fall back to a free-text "any" search.
+          // "lora", "controlnet"), scope to that section so it lists every item that
+          // has it. Otherwise fall back to a free-text "any" search.
           const _layout = getLayout();
           const canonical = SectionRegistry.getCanonicalName(processVal, _layout);
           if (canonical) { field = SectionRegistry.getSearchField(canonical); value = ""; }
@@ -1694,7 +1894,7 @@ export function initGallery(mountEl, config) {
   });
 
   qInput.addEventListener("input", () => {
-    searchClear.classList.toggle("sbg-search-clear--visible", state.searchTags.length > 0 || qInput.value.length > 0);
+    _syncSearchBtns();
   });
 
   // External search submission (from layout editor)
@@ -1758,6 +1958,7 @@ export function initGallery(mountEl, config) {
   _dataCache._fetchAllItems = fetchAllItems;
   _dataCache._fetchNewItems = fetchNewItems;
   _dataCache._refilter = refilter;
+  _startAutoRefresh();
 
   (async () => {
     try {
@@ -1796,33 +1997,34 @@ export function initGallery(mountEl, config) {
         renderFromScratch();
         _restoreScrollPos(); // reopening returns to where you were
 
+        // Warm remount always reconciles once: the in-memory paint can hide external
+        // deletions/renames made while the panel was closed. If a generation finished
+        // while closed, run the targeted delta first (fast path for the new files),
+        // then the cheap version-gated poll.
         if (_dataCache.stale) {
           _dataCache.stale = false;
-          fetchNewItems();
+          fetchNewItems().finally(() => _pollAndReconcile());
+        } else {
+          _pollAndReconcile();
         }
       } else {
         _dataCache.stale = false;
-        const persistedItems = await _loadPersistedItems(state.rootId);
-        if (persistedItems && persistedItems.length > 0) {
-          state.allItems = persistedItems;
-          _dataCache.items[state.rootId] = persistedItems;
+        const persisted = await _loadPersistedItems(state.rootId);
+        if (persisted && persisted.items.length > 0) {
+          state.allItems = persisted.items;
+          _dataCache.items[state.rootId] = persisted.items;
+          _dataCache.itemsVersion[state.rootId] = persisted.dbVersion;
+          _dataCache._persistedVersion[state.rootId] = persisted.dbVersion;
           statusLeft.textContent = "Ready";
           applyFilters();
           await new Promise(r => requestAnimationFrame(r));
           renderFromScratch();
           Promise.all([refreshConfig(), loadSubfolders()]).catch(() => { });
-          // Read the current DB immediately (fast) instead of awaiting a full forced
-          // disk rescan (~1 min). The server still kicks off a background incremental
-          // scan; any files indexed while away are merged here, and brand-new ones
-          // surface on the next delta refresh — matching the intended behaviour:
-          // "show previous images instantly, then background-scan for new ones."
-          // 1) Fast DB read for an immediate refresh of the cached list, then
-          // 2) an awaited rescan so brand-new files (e.g. reference/initial
-          //    images from generations made while away) and deletions reconcile
-          //    without needing a server reboot. (2) re-renders in the background.
-          fetchAllItems({ rescan: false })
-            .then(() => fetchAllItems({ rescan: true }))
-            .catch(() => { });
+          // Paint from the snapshot, then version-gated poll: the backend runs a
+          // guarded scan and returns the root's version + row count; we only
+          // re-download the (gzipped) list when either differs from what this
+          // snapshot reflects. A no-change reopen is one tiny poll.
+          _pollAndReconcile();
         } else {
           await Promise.all([refreshConfig(), loadSubfolders(), fetchAllItems({ rescan: true })]);
         }

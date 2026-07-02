@@ -1,5 +1,5 @@
 /**
- * sbg-core.js — Shared utilities, caches, IndexedDB, settings, icons
+ * sbg-core.js - Shared utilities, caches, IndexedDB, settings, icons
  * 
  * This module contains all shared infrastructure used by the gallery,
  * lightbox, settings, and entry point modules. It has no side effects
@@ -25,7 +25,12 @@ export const _dataCache = {
   lastSubfolder: "",
   lastKind: "",
   lastSort: null,
-  _lastServerTime: 0, // timestamp from last server response (for delta refresh)
+  // Per-response bookkeeping is keyed per root so a response for one root can't
+  // stamp values that another root's logic then trusts (since timestamps,
+  // version-gate decisions).
+  itemsVersion: {},      // rootId -> db_version the cached items reflect
+  serverTime: {},        // rootId -> server timestamp of last response (delta `since`)
+  _persistedVersion: {}, // rootId -> db_version last written to IndexedDB
   _pendingFiles: [],  // files from executed events, waiting to be sent to backend
 };
 
@@ -74,14 +79,16 @@ function _openIDB() {
   });
 }
 
-export async function _persistItems(rootId, items) {
+export async function _persistItems(rootId, items, dbVersion = null) {
   try {
     const db = await _openIDB();
     const tx = db.transaction(_IDB_STORE, "readwrite");
     const store = tx.objectStore(_IDB_STORE);
-    store.put({ items, ts: Date.now() }, rootId);
+    // Store dbVersion with the items in one put so the reopen version-gate can
+    // trust that the saved version matches exactly the saved item set.
+    store.put({ items, ts: Date.now(), dbVersion }, rootId);
     db.close();
-  } catch (e) { /* IndexedDB not available — silently fail */ }
+  } catch (e) { /* IndexedDB not available - silently fail */ }
 }
 
 export async function _loadPersistedItems(rootId) {
@@ -95,7 +102,7 @@ export async function _loadPersistedItems(rootId) {
         db.close();
         const data = req.result;
         if (data && Array.isArray(data.items) && data.items.length > 0) {
-          resolve(data.items);
+          resolve({ items: data.items, dbVersion: data.dbVersion ?? null });
         } else {
           resolve(null);
         }
@@ -173,8 +180,8 @@ export function copyText(text) {
   if (text == null || text === "") { showToast("Nothing to copy"); return; }
   const str = String(text);
   // navigator.clipboard only exists in a secure context (https or localhost).
-  // ComfyUI is frequently served over plain HTTP on a LAN IP, where it is
-  // undefined — fall back to the legacy execCommand path so copy still works.
+  // ComfyUI is often served over plain HTTP on a LAN IP, where it is undefined,
+  // so fall back to the legacy execCommand path.
   if (navigator.clipboard && window.isSecureContext) {
     navigator.clipboard.writeText(str)
       .then(() => showToast("Copied"))
@@ -205,11 +212,11 @@ function _copyFallback(str) {
 }
 
 export function fileUrl(it) {
-  // Append the file's modification time (in MILLISECONDS) so the URL is
-  // content-addressed: an unchanged file keeps a stable URL (browser-cacheable —
-  // /file responds with immutable Cache-Control), while a regenerated file gets a
-  // fresh URL and so bypasses the now-stale cached bytes. Millisecond precision so
-  // a same-second overwrite of a fixed-name file still busts the immutable cache.
+  // Append the file's modification time (in milliseconds) so the URL is
+  // content-addressed: an unchanged file keeps a stable, browser-cacheable URL
+  // (/file responds with immutable Cache-Control), while a regenerated file gets a
+  // fresh URL and bypasses the stale cached bytes. Millisecond precision so a
+  // same-second overwrite of a fixed-name file still busts the immutable cache.
   const v = Math.floor((it.mtime_real ?? it.mtime ?? 0) * 1000);
   return `/sidebar_gallery/file?root_id=${encodeURIComponent(it.root_id)}&relpath=${encodeURIComponent(it.relpath)}&v=${v}`;
 }
@@ -258,9 +265,9 @@ function _thumbMemSet(url, blobUrl) {
     let evicted = 0;
     for (const [key, val] of _thumbMemCache) {
       if (evicted >= evictCount) break;
-      // Never revoke an object URL still shown by a visible card — doing so
-      // turns live thumbnails into broken images. Skip in-use entries; the
-      // viewport holds far fewer than the cache cap so eviction still drains.
+      // Never revoke an object URL still shown by a visible card, or live
+      // thumbnails become broken images. Skip in-use entries; the viewport holds
+      // far fewer than the cache cap so eviction still drains.
       try {
         if (document.querySelector(`img.sbg-card__thumb[src="${val}"]`)) continue;
       } catch { }
@@ -319,7 +326,7 @@ export const _thumbCacheAPI = {
         _thumbMemSet(url, blobUrl);
         return blobUrl;
       }
-    } catch { /* IndexedDB not available — fall through */ }
+    } catch { /* IndexedDB not available - fall through */ }
     return url;
   },
 
@@ -380,9 +387,9 @@ export const _thumbCacheAPI = {
 
   /** Bound the store: entries are content-addressed (&v=mtime), so a changed
    *  file orphans its old thumbnail and IndexedDB has no LRU. When over the cap,
-   *  evict down to 75% in ONE readwrite transaction (count + deletes share the
-   *  transaction, so there's no count-then-clear race) instead of nuking the whole
-   *  warm cache — evicted thumbnails re-fetch from the server's disk cache on
+   *  evict down to 75% in one readwrite transaction (count and deletes share the
+   *  transaction, avoiding a count-then-clear race) rather than nuking the whole
+   *  warm cache; evicted thumbnails re-fetch from the server's disk cache on
    *  demand. Deletes follow store-key order (IndexedDB has no insertion stamp). */
   async pruneIfOver(maxCount) {
     try {
@@ -500,8 +507,7 @@ const _thumbFailedUrls = new Set(); // Track URLs that have already failed
 // Backoff for transient thumbnail misses: the server is still generating the
 // thumb for a just-generated file, or is briefly unreachable right after a
 // ComfyUI reboot. getOrFetch resolves to the raw URL (not a blob:) on a miss, so
-// we retry a few times before giving up — this replaces the old behaviour where a
-// miss was only retried on the next full rescan re-render.
+// retry a few times before giving up.
 const THUMB_RETRY_DELAYS = [1500, 3500, 7000];
 
 export function initThumbObserver() {
@@ -528,9 +534,9 @@ export function initThumbObserver() {
       const tryLoad = (attempt) => {
         _thumbCacheAPI.getOrFetch(item.thumb_url).then(blobUrl => {
           // The wrap may have been removed (filter change) or rebound to another
-          // item by the time the fetch resolves — don't inject a stale thumbnail.
+          // item by the time the fetch resolves; don't inject a stale thumbnail.
           if (!wrap.isConnected || wrap._sbgItem !== item) return;
-          // getOrFetch resolves to the raw URL (not a blob:) on a miss — e.g. a
+          // getOrFetch resolves to the raw URL (not a blob:) on a miss, e.g. a
           // just-generated file whose thumbnail isn't built yet, or the server not
           // yet up right after a reboot. Retry with backoff so it self-heals in
           // place instead of waiting for a manual rescan.
@@ -557,9 +563,9 @@ export function getThumbObserver() {
 /**
  * Disconnect and drop the shared thumbnail IntersectionObserver. Called when the
  * gallery (re)mounts so observations from a previous gallery instance can't leak
- * across — a thumb-size change re-runs initGallery (reusing module-level state),
- * unlike a full page refresh which resets everything. Stale observed wraps were a
- * source of thumbnails being injected into the wrong cards after a remount.
+ * across (a thumb-size change re-runs initGallery reusing module-level state,
+ * unlike a full page refresh which resets everything). Stale observed wraps can
+ * otherwise inject thumbnails into the wrong cards after a remount.
  */
 export function resetThumbObserver() {
   if (_thumbObserver) { try { _thumbObserver.disconnect(); } catch { } _thumbObserver = null; }
@@ -567,7 +573,7 @@ export function resetThumbObserver() {
 
 /**
  * Forget thumbnail URLs that previously failed to load, so a rescan can retry
- * them. Without this, a transient 404 (thumb still generating) blacklisted the
+ * them. Without this, a transient 404 (thumb still generating) would block the
  * URL until a full page reload.
  */
 export function resetFailedThumbs() {
@@ -624,6 +630,7 @@ export const S = {
   APP_BADGE_FORGE: "SBG.AppBadgeForge",
   APP_BADGE_SDNEXT: "SBG.AppBadgeSDNext",
   APP_BADGE_FOOOCUS: "SBG.AppBadgeFooocus",
+  APP_BADGE_CIVITAI: "SBG.AppBadgeCivitAI",
   // Initial image tab
   INITIAL_IMAGE_TAB_COLOR: "SBG.InitialImageTabColor",
   // Pill/badge colors
@@ -637,6 +644,81 @@ export const S = {
   META_TAB_PERSIST: "SBG.MetaTabPersist",
 };
 
+/* ── Source-app registry ──────────────────────────────────────────── */
+// The single table of supported source apps. Everything per-app derives from
+// it: APPS/APP_LABELS (translation layer + layout-editor profiles), the
+// settings rows, the boot-time CSS variable application, and the lightbox
+// badge maps. Adding an app means editing this table only.
+// defaultColor is applied to the cssVar at boot, so the var(--sbg-app-*, #hex)
+// fallbacks in the stylesheet are cosmetic only (pre-boot flash at most).
+export const APP_REGISTRY = [
+  { id: "comfyui", label: "ComfyUI", settingKey: S.APP_BADGE_COMFYUI, cssVar: "--sbg-app-comfyui", defaultColor: "#4ade80" },
+  { id: "a1111",   label: "A1111",   settingKey: S.APP_BADGE_A1111,   cssVar: "--sbg-app-a1111",   defaultColor: "#c084fc" },
+  { id: "forge",   label: "Forge",   settingKey: S.APP_BADGE_FORGE,   cssVar: "--sbg-app-forge",   defaultColor: "#fdba74" },
+  { id: "sdnext",  label: "SD.Next", settingKey: S.APP_BADGE_SDNEXT,  cssVar: "--sbg-app-sdnext",  defaultColor: "#5eead4" },
+  { id: "fooocus", label: "Fooocus", settingKey: S.APP_BADGE_FOOOCUS, cssVar: "--sbg-app-fooocus", defaultColor: "#f472b6" },
+  { id: "civitai", label: "CivitAI", settingKey: S.APP_BADGE_CIVITAI, cssVar: "--sbg-app-civitai", defaultColor: "#3b82f6" },
+];
+
+/* ── Shared scan/reindex progress poller ─────────────────────────── */
+// One timer and one fetch of /sidebar_gallery/reindex_progress, fanned out to
+// every UI that shows indexing progress (status bar, new-folder flow,
+// first-time modal), so the phase copy can never drift between them.
+// Response shape: {running:<full rebuild>, full:{...}|null, roots:{rid:{...}}}
+// each entry: {running, root_id, total, done, phase, error}.
+const _ppSubs = new Set();
+let _ppTimer = null;
+let _ppIdleTicks = 0;
+
+async function _ppTick() {
+  let data = null;
+  try {
+    const r = await fetch("/sidebar_gallery/reindex_progress");
+    if (r.ok) data = await r.json();
+  } catch { /* server briefly unreachable: deliver null, consumers keep state */ }
+  const anyRunning = !!(data && (data.running
+    || (data.full && data.full.running)
+    || Object.values(data.roots || {}).some(e => e && e.running)));
+  _ppIdleTicks = anyRunning ? 0 : _ppIdleTicks + 1;
+  // settled = nothing running for 2+ consecutive ticks. A multi-root rebuild
+  // ends one root's entry moments before beginning the next, so a consumer that
+  // treats a single idle read as "finished" would close its UI in that gap.
+  const settled = !anyRunning && _ppIdleTicks >= 2;
+  for (const cb of [..._ppSubs]) {
+    try { cb(data, { anyRunning, settled }); } catch { /* isolate one bad consumer from the rest */ }
+  }
+  if (_ppSubs.size === 0) { _ppTimer = null; return; }
+  _ppTimer = setTimeout(_ppTick, anyRunning ? 1000 : 3000);
+}
+
+export const progressPoller = {
+  /** Subscribe cb(data, {anyRunning, settled}); returns an unsubscribe fn.
+      The poller runs 1s ticks while anything is indexing, 3s when idle, and
+      stops entirely once the last subscriber leaves. */
+  subscribe(cb) {
+    _ppSubs.add(cb);
+    if (_ppTimer == null) { _ppIdleTicks = 0; _ppTimer = setTimeout(_ppTick, 0); }
+    return () => { _ppSubs.delete(cb); };
+  },
+};
+
+/** The single formatter for a progress entry → {text, pct, error?}; pct -1 =
+    indeterminate. Every progress UI renders from this so phases can never
+    drift between them. */
+export function formatProgress(entry) {
+  if (!entry) return null;
+  if (entry.phase === "error") {
+    return { text: `Indexing failed: ${entry.error || "unknown error"}`, pct: -1, error: true };
+  }
+  if (entry.phase === "scanning") {
+    return { text: `Scanning folder… ${(entry.total || 0).toLocaleString()} found`, pct: -1 };
+  }
+  const total = entry.total || 0;
+  const done = entry.done || 0;
+  const pct = total > 0 ? Math.round((done / total) * 100) : 0;
+  return { text: `${done.toLocaleString()} / ${total.toLocaleString()} (${pct}%)`, pct };
+}
+
 /* ═══════════════════════════════════════════════════════════════════════
    DISK-BACKED SETTINGS API
 
@@ -645,8 +727,8 @@ export const S = {
    reads synchronous (fast). Writes are debounced to avoid hammering
    the server during rapid UI changes.
 
-   On first load (no disk settings file), we auto-migrate from
-   localStorage so existing users don't lose their settings.
+   On first load (no disk settings file), settings auto-migrate from
+   localStorage so existing users don't lose them.
    ═══════════════════════════════════════════════════════════════════════ */
 
 /** In-memory settings cache. Populated by loadSettings(). */
@@ -692,10 +774,10 @@ export async function loadSettings() {
 }
 
 /**
- * Flush pending settings to the server SYNCHRONOUSLY (sendBeacon), used when the
+ * Flush pending settings to the server synchronously (sendBeacon), used when the
  * page is hidden/closing. Debounced saves would otherwise be lost if the tab
- * closes within the 500ms window — which silently dropped layout/tab edits and
- * made browsers diverge (the change never reached the shared server file).
+ * closes within the 500ms window, silently dropping layout/tab edits and making
+ * browsers diverge (the change never reaches the shared server file).
  */
 export function flushSettingsNow() {
   if (_saveDebounceTimer) { clearTimeout(_saveDebounceTimer); _saveDebounceTimer = null; }
@@ -703,9 +785,9 @@ export function flushSettingsNow() {
   const keys = Object.keys(pending);
   if (!keys.length) return;
   _pendingChanges = {};
-  // Send ONE per-key update each (the server merges per key) — never the whole
+  // Send one per-key update each (the server merges per key), never the whole
   // settings object, which would replace the file and clobber keys another tab
-  // or browser wrote since we loaded.
+  // or browser wrote since load.
   for (const key of keys) {
     const payload = JSON.stringify({ key, value: pending[key] });
     let sent = false;
@@ -724,7 +806,7 @@ function _installFlushHooks() {
   if (_flushHooksInstalled || typeof window === "undefined") return;
   _flushHooksInstalled = true;
   // pagehide covers tab close / navigation; visibilitychange covers tab switch /
-  // minimize — both flush any debounced changes so nothing is lost.
+  // minimize - both flush any debounced changes so nothing is lost.
   window.addEventListener("pagehide", flushSettingsNow);
   document.addEventListener("visibilitychange", () => { if (document.visibilityState === "hidden") flushSettingsNow(); });
 }
@@ -750,10 +832,10 @@ async function _flushSettings() {
   const toSave = { ..._pendingChanges };
   _pendingChanges = {};
 
-  // Persist each changed key with a per-key update. The server MERGES per key,
-  // so we never replace the whole settings file — replacing it would clobber
-  // keys another tab/browser saved since we loaded (cross-client data loss).
-  // Sequential awaits avoid a read-modify-write race between our own writes.
+  // Persist each changed key with a per-key update. The server merges per key,
+  // so the whole settings file is never replaced; replacing it would clobber
+  // keys another tab/browser saved since load (cross-client data loss).
+  // Sequential awaits avoid a read-modify-write race between these writes.
   for (const key of Object.keys(toSave)) {
     try {
       await fetch("/sidebar_gallery/settings", {
@@ -796,7 +878,6 @@ export function getLayout() {
 
 /**
  * Build a key-value metadata row.
- * Previously duplicated at lines 469 and 1144 of the monolith.
  * @param {string} label - The label to display
  * @param {*} value - The value to display
  * @param {Object} [layout] - Layout config for label renames. If omitted, reads from getLayout().
@@ -829,7 +910,7 @@ export function kvRow(label, value, layout) {
   const _lbl = label == null ? "" : String(label);
   const displayLabel = _lyRenames[_lbl] || _lyRenames[_lbl.toLowerCase()] || _lbl;
   const row = h("div", { class: "sbg-meta-row" });
-  // A blank label (the user cleared the field name) → show just the value, with no
+  // A blank label (the user cleared the field name) shows just the value, with no
   // empty "Label:" column in front of it.
   if (String(displayLabel).trim() !== "") {
     row.appendChild(h("span", { class: "sbg-meta-label", text: displayLabel }));
@@ -846,8 +927,8 @@ export function kvRow(label, value, layout) {
  * One canonical representation so the pickers, swatches and rendering never
  * disagree. parseColor() understands hex (#rgb/#rgba/#rrggbb/#rrggbbaa), rgb()
  * and rgba(); formatColor() emits plain hex when fully opaque and rgba() when
- * translucent — so existing opaque colours are untouched while transparency is
- * preserved end-to-end. (named colours / var() return null → caller keeps raw.) */
+ * translucent, so opaque colours stay untouched while transparency is preserved
+ * end-to-end. (named colours / var() return null, caller keeps raw.) */
 
 /** Parse any hex / rgb / rgba string to {r,g,b,a} (a in 0..1), or null. */
 export function parseColor(str) {
@@ -888,7 +969,7 @@ export function formatColor(r, g, b, a = 1) {
   return formatRgba(r, g, b, a);
 }
 
-/** Always-rgba string "rgba(r, g, b, a)" — channels clamped to 0..255, alpha
+/** Always-rgba string "rgba(r, g, b, a)": channels clamped to 0..255, alpha
  *  clamped to 0..1 and rounded to 3 decimals. Unlike formatColor() this never
  *  collapses to hex; used where the UI must always read rgba (the colour picker
  *  and the settings colour inputs). */
@@ -937,7 +1018,6 @@ export function saveSavedColors(arr) {
 
 /**
  * Walk all text nodes in container and wrap query matches in <mark>.
- * Previously defined inside openLightbox() closure.
  */
 export function highlightSearchMatches(container, query) {
   if (!query) return;

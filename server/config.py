@@ -23,6 +23,9 @@ class SidebarGalleryConfig:
     # When False (default) the scanner skips folders whose names start with a
     # dot (e.g. ".thumbs"); set True to index hidden folders too.
     index_hidden_dirs: bool = False
+    # Auto-refresh: seconds between background polls for external file changes
+    # (delete/move/rename) while the gallery is open. 0 disables polling.
+    auto_refresh_interval_s: int = 15
     default_limit: int = 120
     max_limit: int = 500
     max_text_chunk_bytes: int = 8 * 1024 * 1024
@@ -45,6 +48,13 @@ def _safe_int(val: Any, fallback: int) -> int:
         return int(val)
     except (ValueError, TypeError):
         return fallback
+
+
+def _norm_refresh_interval(n: int) -> int:
+    """Auto-refresh interval: 0 (timer off) or at least 5 seconds. The
+    frontend enforces the same 5s floor; normalising here keeps the stored
+    config, the settings UI, and the actual polling in agreement."""
+    return 0 if n <= 0 else max(5, n)
 
 
 def _clean_str_list(raw_list: Any, *, lower: bool = False, dedupe: bool = False) -> list[str]:
@@ -89,6 +99,8 @@ def load_config() -> SidebarGalleryConfig:
         extra_roots=extra_roots,
         excluded_dirs=excluded_dirs,
         index_hidden_dirs=bool(data.get("index_hidden_dirs", False)),
+        auto_refresh_interval_s=_norm_refresh_interval(
+            _safe_int(data.get("auto_refresh_interval_s"), cfg.auto_refresh_interval_s)),
         default_limit=_safe_int(data.get("default_limit"), cfg.default_limit),
         max_limit=_safe_int(data.get("max_limit"), cfg.max_limit),
         max_text_chunk_bytes=_safe_int(data.get("max_text_chunk_bytes"), cfg.max_text_chunk_bytes),
@@ -101,7 +113,7 @@ def save_config(data: dict[str, Any]) -> SidebarGalleryConfig:
 
     # extra_roots: only NEW entries must pass the isdir check; keep already-saved
     # roots even when their drive is momentarily offline, and preserve the saved
-    # list when the key is absent or malformed — editing other settings (e.g. the
+    # list when the key is absent or malformed - editing other settings (e.g. the
     # excluded list) must never silently drop a configured folder.
     extra_roots_in = data.get("extra_roots")
     if isinstance(extra_roots_in, list):
@@ -122,7 +134,7 @@ def save_config(data: dict[str, Any]) -> SidebarGalleryConfig:
     else:
         extra_roots = list(cfg.extra_roots)
 
-    # Excluded dirs are plain folder NAMES, not paths — no normalisation or isdir
+    # Excluded dirs are plain folder NAMES, not paths - no normalisation or isdir
     # check. Lowercased + de-duplicated; saved list preserved if absent/malformed.
     excluded_in = data.get("excluded_dirs")
     if isinstance(excluded_in, list):
@@ -134,10 +146,14 @@ def save_config(data: dict[str, Any]) -> SidebarGalleryConfig:
     if not isinstance(index_hidden_dirs, bool):
         index_hidden_dirs = cfg.index_hidden_dirs
 
+    auto_refresh_interval_s = _norm_refresh_interval(
+        _safe_int(data.get("auto_refresh_interval_s"), cfg.auto_refresh_interval_s))
+
     out = SidebarGalleryConfig(
         extra_roots=extra_roots,
         excluded_dirs=excluded_dirs,
         index_hidden_dirs=index_hidden_dirs,
+        auto_refresh_interval_s=auto_refresh_interval_s,
         default_limit=max(1, _safe_int(data.get("default_limit"), cfg.default_limit)),
         max_limit=max(1, _safe_int(data.get("max_limit"), cfg.max_limit)),
         max_text_chunk_bytes=max(1024, _safe_int(data.get("max_text_chunk_bytes"), cfg.max_text_chunk_bytes)),
@@ -153,6 +169,7 @@ def save_config(data: dict[str, Any]) -> SidebarGalleryConfig:
                 "extra_roots": out.extra_roots,
                 "excluded_dirs": out.excluded_dirs,
                 "index_hidden_dirs": out.index_hidden_dirs,
+                "auto_refresh_interval_s": out.auto_refresh_interval_s,
                 "default_limit": out.default_limit,
                 "max_limit": out.max_limit,
                 "max_text_chunk_bytes": out.max_text_chunk_bytes,
