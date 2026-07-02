@@ -1,10 +1,10 @@
 /**
- * sbg-translation-layer.js — Metadata Translation Engine (single source of truth)
+ * sbg-translation-layer.js - Metadata Translation Engine (single source of truth)
  *
  * The user configures, per (app × media), an ordered array of "sections". Each section
  * pulls values out of the raw metadata `summary` via dot-paths and renders them in a
  * chosen style. The SAME `renderSection()` drives BOTH the lightbox metadata panel and
- * the layout-editor live preview — so the two can never disagree.
+ * the layout-editor live preview - so the two can never disagree.
  *
  *   profile = [ section, ... ]
  *   section = { id, title, style, open, source?, params:[param,...] }
@@ -22,29 +22,28 @@
  *   "workflow_nodes.KSampler"       → params object of every KSampler node
  */
 
-import { h, kvRow, breakable, pj, getSetting, saveSetting, S, parseColor, formatColor } from "./sbg-core.js";
+import { h, kvRow, breakable, pj, getSetting, saveSetting, S, parseColor, formatColor, APP_REGISTRY } from "./sbg-core.js";
 import { DEFAULT_IMAGE_LAYOUT, DEFAULT_VIDEO_LAYOUT } from "./sbg-default-layout.js";
 
-export const APPS = ["comfyui", "a1111", "forge", "sdnext", "fooocus"];
-export const APP_LABELS = { comfyui: "ComfyUI", a1111: "A1111", forge: "Forge", sdnext: "SD.Next", fooocus: "Fooocus" };
+// Derived from the single app registry in sbg-core.js - do not hand-extend.
+export const APPS = APP_REGISTRY.map(a => a.id);
+export const APP_LABELS = Object.fromEntries(APP_REGISTRY.map(a => [a.id, a.label]));
 
 const PROFILES_KEY = "SBG.Layouts";
 
-// Profile (app×media) of the CURRENT renderSection pass, so per-field textbox
-// heights can persist per profile. Set synchronously at every renderSection entry;
-// reads (in _attachPromptResize) happen within the same synchronous render, so
-// there's no interleaving race. Empty = fall back to the legacy global key.
+// Profile (app×media) of the current renderSection pass, so per-field textbox
+// heights persist per profile. Set synchronously at each renderSection entry;
+// reads (in _attachPromptResize) happen within the same synchronous render.
+// Empty = fall back to the global key.
 let _activeProfileKey = "";
 
 let _uidCounter = 0;
 function uid(prefix = "s") { return `${prefix}_${Date.now().toString(36)}_${(_uidCounter++).toString(36)}`; }
 
 // ── Default layout ────────────────────────────────────────────────────
-// A fresh install opens with the project's own ComfyUI panel layout, defined
-// in web/sbg-default-layout.js. Each call returns a deep copy so callers can
+// A fresh install opens with the default ComfyUI panel layout defined in
+// web/sbg-default-layout.js. Each call returns a deep copy so callers can
 // mutate the result freely without touching the shared constant.
-// (server/schema.default_layout() still derives the catalog's reference
-// layout; it is used by the tests, not at runtime.)
 const _clone = (x) => JSON.parse(JSON.stringify(x));
 function defaultImageLayout() { return _clone(DEFAULT_IMAGE_LAYOUT); }
 function defaultVideoLayout() { return _clone(DEFAULT_VIDEO_LAYOUT); }
@@ -55,11 +54,11 @@ const MIG_KEY = "SBG.LayoutsMigVersion";
 let _migDone = false;
 
 /**
- * One-time, conservative repair of saved profiles so they pick up fixes shipped
- * in the defaults without losing the user's section order / customizations:
- *   • drop the broken dotted ControlNet paths (controlnet.start_percent/end_percent)
- *   • ensure ControlNet sections carry start_percent / end_percent (ComfyUI names)
- *   • add the optional "Original Prompt (pre-enhance)" section where missing
+ * One-time, conservative repair of saved profiles so they pick up fixes in the
+ * defaults without losing the user's section order or customizations:
+ *   - drop the broken dotted ControlNet paths (controlnet.start_percent/end_percent)
+ *   - ensure ControlNet sections carry start_percent / end_percent (ComfyUI names)
+ *   - add the optional "Original Prompt (pre-enhance)" section where missing
  * Returns true if anything changed.
  */
 function migrateProfiles(profiles) {
@@ -123,12 +122,12 @@ export function saveProfiles(profiles) {
 }
 
 /**
- * Find-and-replace a per-element PILL colour across every saved profile: rewrite
- * pill-style params whose color[channel] matches oldVal → newVal. Used by the
+ * Find-and-replace a per-element pill colour across every saved profile: rewrite
+ * pill-style params whose color[channel] matches oldVal to newVal. Used by the
  * Appearance pill-colour settings so changing the colour retargets only pills that
- * were showing the old value (pills of other colours are left alone). Colours are
- * compared canonically so "#5249a2" and "rgb(82,73,162)" match. Persists + notifies
- * (which re-renders an open lightbox panel) when anything changed. Returns changed.
+ * were showing the old value; pills of other colours are left alone. Colours are
+ * compared canonically so "#5249a2" and "rgb(82,73,162)" match. Persists and
+ * notifies (re-rendering an open lightbox panel) when anything changed.
  */
 export function replaceElementColor(channel, oldVal, newVal) {
   if (!channel || !oldVal || !newVal) return false;
@@ -163,7 +162,7 @@ export function getActiveProfile(app, isVideo) {
   const profiles = getProfiles();
   const key = profileKey(app, isVideo);
   if (Array.isArray(profiles[key]) && profiles[key].length) return profiles[key];
-  // Fallback chain: comfyui_<media> → freshly minted default
+  // Fallback chain: comfyui_<media>, then a freshly minted default.
   const fallback = profiles[`comfyui_${isVideo ? "video" : "image"}`];
   if (Array.isArray(fallback) && fallback.length) return JSON.parse(JSON.stringify(fallback));
   return isVideo ? defaultVideoLayout() : defaultImageLayout();
@@ -175,10 +174,10 @@ export { defaultImageLayout, defaultVideoLayout, uid };
 
 /**
  * Narrow a list of workflow_nodes instances with an optional instance matcher
- * { title?, from?, index? }. Precedence: title → from (upstream context) →
- * index. A specified matcher that matches nothing returns [] — NO fallback —
- * so a field bound to e.g. a titled node simply doesn't render for workflows
- * that lack it. No matcher = all instances (legacy behaviour).
+ * { title?, from?, index? }. Precedence: title, then from (upstream context),
+ * then index. A specified matcher that matches nothing returns [] with no
+ * fallback, so a field bound to e.g. a titled node simply doesn't render for
+ * workflows that lack it. No matcher = all instances.
  */
 export function filterNodesByMatch(nodes, match) {
   if (!match || typeof match !== "object") return nodes;
@@ -193,7 +192,7 @@ export function resolvePath(path, summary, match) {
   if (!path || !summary) return [];
   const parts = path.split(".");
 
-  // workflow_nodes.<class_type>[.param...] — match by class_type, support duplicates
+  // workflow_nodes.<class_type>[.param...] - match by class_type, allow duplicates
   if (parts[0] === "workflow_nodes" && parts.length >= 2) {
     const ct = parts[1];
     const paramPath = parts.length > 2 ? parts.slice(2).join(".") : null;
@@ -204,7 +203,7 @@ export function resolvePath(path, summary, match) {
     if (!paramPath) return nodes.map(n => n.params || {});
     const out = [];
     for (const n of nodes) {
-      // Try the FLAT param key first: many nodes name widgets with dots
+      // Try the flat param key first: many nodes name widgets with dots
       // (e.g. TextGenerate's "sampling_mode.temperature"), so the key lives
       // directly on params, not as a nested object. Fall back to nested
       // navigation for genuine sub-objects (e.g. Power Lora Loader "lora_1.on").
@@ -239,9 +238,9 @@ function _dig(obj, path) {
   if (!obj || typeof obj !== "object") return undefined;
   let cur = obj;
   for (const part of path.split(".")) {
-    // hasOwnProperty (not `in`) so prototype members never resolve — `in` matched
-    // Array.prototype.shift for a path like "samplers.shift", which then rendered
-    // as the literal "function shift() { [native code] }".
+    // hasOwnProperty (not `in`) so prototype members never resolve. With `in`, a
+    // path like "samplers.shift" would match Array.prototype.shift and render as
+    // the literal "function shift() { [native code] }".
     if (cur && typeof cur === "object" && Object.prototype.hasOwnProperty.call(cur, part)) cur = cur[part];
     else return undefined;
   }
@@ -271,9 +270,9 @@ export function resolveSourceElements(source, summary, sourceMatch) {
 }
 
 // Data sections a tab/section can be "anchored" to: when most of a tab's fields
-// read from one of these, the tab only shows if that data exists. Fixes fields
-// that ALSO resolve elsewhere (e.g. "end_at_step" via samplers) making a
-// ControlNet tab appear on images that used no ControlNet.
+// read from one of these, the tab only shows if that data exists. Prevents a
+// field that also resolves elsewhere (e.g. "end_at_step" via samplers) from
+// making a ControlNet tab appear on images that used no ControlNet.
 export const AUTO_ANCHOR_KEYS = ["controlnet", "adetailer", "upscaling", "interpolation", "mmaudio", "loras"];
 
 /** Infer the anchor for a section/tab: the first path segment shared by a strict
@@ -302,48 +301,23 @@ export function anchorSatisfied(section, summary) {
   return resolvePath(req, summary, null).length > 0;
 }
 
-/** True if a section would render anything for this summary. */
+/** True if a section would render anything for this summary. Defined as "the
+ *  shared resolver produces a non-empty tree", the same tree the renderers and
+ *  the compare signature consume, so visibility, rendering, and diffing can
+ *  never disagree. */
 export function sectionHasData(section, summary) {
   if (!summary) return false;
-  if (!anchorSatisfied(section, summary)) return false;
-  // Tabbed sections render via their tabs (each a mini-section), so the section
-  // has data iff any tab does. Without this the lightbox panel (which gates on
-  // sectionHasData) would hide tabbed/cards sections that actually have content.
-  if (Array.isArray(section.tabs) && section.tabs.length) {
-    if (section.tabs.some(t => sectionHasData(tabAsSection(t), summary))) return true;
-    // Section-level fields outside the tabs also count.
-    return sectionHasData({ style: "flat", params: section.params || [] }, summary);
-  }
-  const style = section.style || "flat";
-  if (style === "raw") return true;
-  if (style === "nodes") return Array.isArray(summary.workflow_nodes) && summary.workflow_nodes.length > 0;
-  // Hidden params never render, so they must not count as data — otherwise an
-  // all-hidden tab/section still shows up as an empty pill/body.
-  const visibleParams = (section.params || []).filter(p => (p.style || "kv") !== "hidden");
-  if (style === "cards") {
-    const els = resolveSourceElements(section.source, summary, section.sourceMatch);
-    if (!els.length) return false;
-    // at least one element yields a value for some param
-    return els.some(el => visibleParams.some(p => resolveParamValue(p.path, el, summary, section.source, p.match) != null));
-  }
-  // flat / text
-  return visibleParams.some(p => {
-    if (p.path && p.path.endsWith(".*")) {
-      const obj = _dig(summary, p.path.slice(0, -2));
-      return obj && typeof obj === "object" && Object.keys(obj).length > 0;
-    }
-    return resolvePath(p.path, summary, p.match).length > 0;
-  });
+  return resolveSectionValues(section, summary) !== null;
 }
 
 /**
  * Resolve a param's value within a (cards) section, tolerant of how the path was
- * authored. The field tray offers ABSOLUTE paths from the summary root (e.g.
+ * authored. The field tray offers absolute paths from the summary root (e.g.
  * "mmaudio.prompt", "positive_prompt", "duration"), but a cards section resolves
- * paths RELATIVE to its source element — so a dragged-in absolute path would
+ * paths relative to its source element, so a dragged-in absolute path would
  * otherwise read as empty. Try, in order:
  *   1. relative to the element            (e.g. "prompt" inside the mmaudio object)
- *   2. with the section's source prefix stripped ("mmaudio.prompt" → "prompt")
+ *   2. with the section's source prefix stripped ("mmaudio.prompt" -> "prompt")
  *   3. absolute from the summary root     ("positive_prompt", "duration", …)
  * Returns the first non-empty value, else null.
  */
@@ -360,16 +334,171 @@ function resolveParamValue(path, element, summary, source, match) {
     v = _dig(summary, path);
     if (ok(v)) return v;
   }
-  // Dotted summary paths (workflow_nodes.<type>.<param>, samplers.x, loras.name…)
-  // can't be reached by a plain dig — resolve them the way flat sections do (search
-  // the array by class_type / iterate). This is what makes a "cards" section with an
-  // EMPTY source (one card from the whole image) show workflow-node / array-derived
+  // Dotted summary paths (workflow_nodes.<type>.<param>, samplers.x, loras.name)
+  // can't be reached by a plain dig; resolve them the way flat sections do (search
+  // the array by class_type or iterate). This lets a "cards" section with an empty
+  // source (one card from the whole image) show workflow-node and array-derived
   // fields, not just top-level keys.
   if (path.includes(".") && summary) {
     const arr = resolvePath(path, summary, match);
     if (arr && arr.length && ok(arr[0])) return arr[0];
   }
   return null;
+}
+
+/* ── Shared section resolution ─────────────────────────────────────────
+ * resolveSectionValues() is the single place that decides what a section shows:
+ * which tabs are usable, the auto Enhanced/Original prompt toggle, hidden-param
+ * and null/"" filtering, wildcard expansion, and the >400-char node-param drop.
+ * The renderers consume its tree for those decisions and add only DOM/styling;
+ * sectionSignature() hashes the same tree; sectionHasData() is simply
+ * "tree !== null". Keeping all three off one resolver ensures compare mode
+ * never hides a real difference or flags an identical section.
+ *
+ * Tree shapes (null = section renders nothing):
+ *   {kind:"raw"}
+ *   {kind:"nodes", nodes:[{label, entries:[[key, displayString], …]}, …]}
+ *   {kind:"cards", cards:[{el, fields:[{key?|param, value}, …]}, …]}
+ *   {kind:"tabs",  tabs:[{id, tab, sub, tree}, …], own:tree|null}
+ *   {kind:"flat"|"text", rows:[{param, value, key?} | {param, tabs:tree}, …]}
+ *
+ * ctx.preview (layout editor) skips the anchor gate so authors always see their
+ * sections; preview placeholders are added by the renderers, never here, so
+ * signatures can never contain them.
+ */
+export function resolveSectionValues(section, summary, ctx = {}) {
+  if (!section || !summary) return null;
+  const inTab = !!ctx.inTab;
+  if (!ctx.preview && !anchorSatisfied(section, summary)) return null;
+
+  // User-defined tabs take priority over the section's style (never nested).
+  if (Array.isArray(section.tabs) && section.tabs.length && !inTab) {
+    return _resolveTabs(section.tabs, section.params || [], summary);
+  }
+  const style = section.style || "flat";
+  if (style === "raw") return { kind: "raw" };
+  if (style === "nodes") return _resolveNodes(summary);
+  // Hidden params never render, never carry data, never drive the diff.
+  const params = (section.params || []).filter(p => p && (p.style || "kv") !== "hidden");
+  if (style === "cards") return _resolveCards(section, params, summary);
+  if (style === "text") return _resolveText(params, summary, inTab);
+  return _resolveFlat(params, summary);
+}
+
+function _resolveTabs(tabs, sectionParams, summary) {
+  const out = [];
+  for (const t of tabs || []) {
+    if (!t) continue;
+    const sub = tabAsSection(t);
+    const tree = resolveSectionValues(sub, summary, { inTab: true });
+    if (tree) out.push({ id: (t.id || t.label || ""), tab: t, sub, tree });
+  }
+  const visible = (sectionParams || []).filter(p => p && (p.style || "kv") !== "hidden");
+  const own = visible.length ? _resolveFlat(visible, summary) : null;
+  if (!out.length && !own) return null;
+  return { kind: "tabs", tabs: out, own };
+}
+
+function _resolveFlat(params, summary) {
+  const rows = [];
+  for (const p of params) {
+    // wildcard: every non-empty key of an object (e.g. extra.*). null/"" values
+    // are skipped, matching the renderer.
+    if (p.path && p.path.endsWith(".*")) {
+      const obj = _dig(summary, p.path.slice(0, -2));
+      if (obj && typeof obj === "object") {
+        for (const [k, v] of Object.entries(obj)) {
+          if (v === undefined || v === null || v === "") continue;
+          rows.push({ param: p, key: k, value: v });
+        }
+      }
+      continue;
+    }
+    for (const v of resolvePath(p.path, summary, p.match)) rows.push({ param: p, value: v });
+  }
+  return rows.length ? { kind: "flat", rows } : null;
+}
+
+function _resolveText(params, summary, inTab) {
+  const rows = [];
+  for (const p of params) {
+    // Positive prompt plus an available pre-enhancement original becomes the
+    // auto Enhanced/Original toggle (unless already inside a tab). This synthesis
+    // must live here: the renderer shows the extra Original tab, so the signature
+    // has to hash it too, or two files differing only in initial_prompt read
+    // "same".
+    if (p.path === "positive_prompt" && _hasInitialPrompt(summary) && !inTab) {
+      const tabs = _resolveTabs([
+        { label: "Enhanced", path: "positive_prompt" },
+        { label: "Original", path: "initial_prompt" },
+      ], [], summary);
+      if (tabs) { rows.push({ param: p, tabs }); continue; }
+    }
+    const vals = resolvePath(p.path, summary, p.match);
+    // A text block renders only the first resolved value.
+    if (vals.length) rows.push({ param: p, value: vals[0] });
+  }
+  return rows.length ? { kind: "text", rows } : null;
+}
+
+function _resolveCards(section, params, summary) {
+  const els = resolveSourceElements(section.source, summary, section.sourceMatch);
+  if (!els.length) return null;
+  const cards = [];
+  for (const el of els) {
+    const fields = [];
+    if (el && el.__title__) fields.push({ key: "__title__", value: String(el.__title__) });
+    for (const p of params) {
+      const v = resolveParamValue(p.path, el, summary, section.source, p.match);
+      if (v === undefined || v === null || v === "") continue; // mirrors _renderOneCard's skip
+      fields.push({ param: p, value: v });
+    }
+    if (fields.length) cards.push({ el, fields });
+  }
+  return cards.length ? { kind: "cards", cards } : null;
+}
+
+function _resolveNodes(summary) {
+  const nodes = [];
+  for (const wn of (summary.workflow_nodes || [])) {
+    if (!wn || typeof wn !== "object") continue;
+    const label = wn.title || (wn._from ? `${wn.class_type} (from ${wn._from})` : (wn.class_type || "Unknown"));
+    const params = wn.params && typeof wn.params === "object" ? wn.params : {};
+    const entries = [];
+    for (const [pk, pv] of Object.entries(params)) {
+      const dv = typeof pv === "object" ? JSON.stringify(pv) : String(pv);
+      if (dv.length > 400) continue; // over-length params are never displayed
+      entries.push([pk, dv]);
+    }
+    if (entries.length) nodes.push({ label, entries });
+  }
+  return nodes.length ? { kind: "nodes", nodes } : null;
+}
+
+/** Reduce a resolved tree to plain JSON-stable data (drop param/el/tab object
+ *  references, keep stable identifiers + values). */
+function _stripTree(t) {
+  if (!t) return null;
+  switch (t.kind) {
+    case "raw": return "raw";
+    case "nodes": return ["nodes", t.nodes.map(n => [n.label, n.entries])];
+    case "cards": return ["cards", t.cards.map(c =>
+      c.fields.map(f => [f.key || (f.param && f.param.path) || "", f.value]))];
+    case "tabs": return ["tabs", t.tabs.map(x => [x.id, _stripTree(x.tree)]), _stripTree(t.own)];
+    default: return [t.kind, t.rows.map(r => r.tabs
+      ? ["@tabs", _stripTree(r.tabs)]
+      : [(r.key !== undefined ? r.key : (r.param && r.param.path)) || "", r.value])];
+  }
+}
+
+/**
+ * Canonical signature of the resolved values a section would show, used by
+ * compare mode to tell "changed" from "same". It hashes the same tree the
+ * renderers consume, so an equal string means identically rendered content.
+ */
+export function sectionSignature(section, summary) {
+  if (!section) return "";
+  return JSON.stringify(_stripTree(resolveSectionValues(section, summary)));
 }
 
 // ── Formatting / styling helpers ──────────────────────────────────────
@@ -405,8 +534,7 @@ function makePill(text, param) {
 /**
  * Apply a param's custom colour to a non-pill element (kv row, detail line,
  * prompt text). Pills get their colour via CSS vars in makePill(); everything
- * else uses plain inline styles so colour customisation works for every style
- * (regression: previously only pills were colourable).
+ * else uses plain inline styles so colour customisation works for every style.
  */
 function applyParamColor(el, param) {
   applyColor(el, param && param.color);
@@ -454,11 +582,11 @@ function labelFor(param) {
 }
 
 /**
- * The label to show as a row/detail PREFIX (e.g. "Seed: 12345"). The field's name
- * is the prefix: a non-blank custom label is used as-is; an EXPLICITLY blank name
- * (the user cleared it) means "show just the value, no prefix" and returns "".
- * Only a truly-absent label (undefined) falls back to the auto-name — so default
- * fields keep their names while a cleared name drops the "Label: " prefix.
+ * The label to show as a row/detail prefix (e.g. "Seed: 12345"). The field's
+ * name is the prefix: a non-blank custom label is used as-is; an explicitly
+ * blank name (the user cleared it) means "show just the value, no prefix" and
+ * returns "". A truly absent label (undefined) falls back to the auto-name, so
+ * default fields keep their names while a cleared name drops the prefix.
  */
 function prefixLabel(param) {
   if (typeof param.label === "string") return param.label.trim() ? param.label.trim() : "";
@@ -473,9 +601,9 @@ function prefixLabel(param) {
  */
 export function renderSection(section, summary, ctx = {}) {
   _activeProfileKey = (ctx && ctx.profileKey) || ""; // scopes per-profile textbox heights
-  // User-defined tabs work on ANY section: clickable pills that switch which
+  // User-defined tabs work on any section: clickable pills that switch which
   // field's value the section shows. Takes priority over the section's style.
-  // (Not when already inside a tab — tabs don't nest, and this prevents recursion.)
+  // Skipped when already inside a tab, since tabs don't nest (prevents recursion).
   if (Array.isArray(section.tabs) && section.tabs.length && !(ctx && ctx.inTab)) {
     return _renderTabbedSection(section, section.tabs, summary, ctx);
   }
@@ -491,25 +619,31 @@ export function renderSection(section, summary, ctx = {}) {
 
 function _renderFlat(section, summary, ctx) {
   const preview = !!(ctx && ctx.preview);
+  // Values and show/hide decisions come from the shared resolver (the same tree
+  // the compare signature hashes); only DOM/styling lives here. Preview
+  // placeholders are renderer-side so signatures never contain them.
+  const tree = resolveSectionValues(section, summary, { inTab: !!(ctx && ctx.inTab), preview });
+  const byParam = new Map();
+  for (const r of ((tree && tree.kind === "flat") ? tree.rows : [])) {
+    const arr = byParam.get(r.param) || [];
+    arr.push(r);
+    byParam.set(r.param, arr);
+  }
   const wrap = h("div", { class: "sbg-meta-group" });
   let pills = null;
   for (const p of (section.params || [])) {
-    // wildcard: dump every key of an object (e.g. extra.*)
+    const pstyle = p.style || "kv";
+    if (pstyle === "hidden") continue;
+    // wildcard: every resolved key of an object (e.g. extra.*)
     if (p.path && p.path.endsWith(".*")) {
-      const obj = _dig(summary, p.path.slice(0, -2));
-      if (obj && typeof obj === "object") {
-        for (const [k, v] of Object.entries(obj)) {
-          if (v === undefined || v === null || v === "") continue;
-          const row = kvRow(k.replace(/_/g, " ").replace(/\b\w/g, c => c.toUpperCase()),
-                            typeof v === "object" ? pj(v) : String(v));
-          if (row) wrap.appendChild(row);
-        }
+      for (const r of (byParam.get(p) || [])) {
+        const row = kvRow(r.key.replace(/_/g, " ").replace(/\b\w/g, c => c.toUpperCase()),
+                          typeof r.value === "object" ? pj(r.value) : String(r.value));
+        if (row) wrap.appendChild(row);
       }
       continue;
     }
-    const pstyle = p.style || "kv";
-    if (pstyle === "hidden") continue;
-    let vals = resolvePath(p.path, summary, p.match);
+    let vals = (byParam.get(p) || []).map(r => r.value);
     // Preview mode: show every configured field even with no sample value.
     if (!vals.length) {
       if (!preview) continue;
@@ -535,7 +669,7 @@ function _renderFlat(section, summary, ctx) {
         const isNeg = p.variant === "neg" || /negative/i.test(p.path);
         const d = h("div", { class: `sbg-prompt-text sbg-prompt-text--sm${isNeg ? " sbg-prompt-text--neg" : ""}`, text: String(val) });
         applyParamColor(d, p);
-        // Remember the user's dragged height, like the main prompt boxes do.
+        // Remember the dragged height, like the main prompt boxes do.
         _attachPromptResize(d, _promptResizeKey(p));
         wrap.appendChild(d);
       } else {
@@ -548,31 +682,30 @@ function _renderFlat(section, summary, ctx) {
 }
 
 function _renderText(section, summary, ctx) {
+  const preview = !!(ctx && ctx.preview);
+  // Values, the auto Enhanced/Original toggle, and show/hide all come from the
+  // shared resolver (same tree the compare signature hashes); DOM only here.
+  const tree = resolveSectionValues(section, summary, { inTab: !!(ctx && ctx.inTab), preview });
+  const byParam = new Map();
+  for (const r of ((tree && tree.kind === "text") ? tree.rows : [])) byParam.set(r.param, r);
   const wrap = h("div", { class: "sbg-meta-group" });
   for (const p of (section.params || [])) {
-    // Positive prompt + an available pre-enhancement original → auto Enhanced/
-    // Original toggle (when the user hasn't defined explicit tabs). Driven by the
-    // "Default Prompt View" setting (SBG.PromptView: enhanced|initial|remember).
-    // Skip when already rendering INSIDE a tab — otherwise an auto "Enhanced" tab
-    // (path positive_prompt) would re-trigger this and recurse infinitely.
-    if (p.path === "positive_prompt" && _hasInitialPrompt(summary) && !(ctx && ctx.inTab)) {
-      const auto = [
-        { label: "Enhanced", path: "positive_prompt" },
-        { label: "Original", path: "initial_prompt" },
-      ];
-      const el = _renderTabbedSection(section, auto, summary, ctx);
+    if ((p.style || "kv") === "hidden") continue;
+    const r = byParam.get(p);
+    if (r && r.tabs) {
+      // The resolver synthesized the Enhanced/Original toggle for this param;
+      // render its usable tabs (the same set the signature hashed).
+      const el = _renderTabbedUsable(section, r.tabs.tabs, summary, ctx);
       if (el) wrap.appendChild(el);
       continue;
     }
-    const vals = resolvePath(p.path, summary, p.match);
-    const placeholder = ctx && ctx.preview;
-    if (!vals.length && !placeholder) continue;
-    const text = vals.length ? (typeof vals[0] === "string" ? vals[0] : pj(vals[0])) : "—";
+    if (!r && !preview) continue;
+    const text = r ? (typeof r.value === "string" ? r.value : pj(r.value)) : "—";
     const variant = p.variant || (/negative/i.test(p.path) ? "neg" : "");
     const d = h("div", { class: `sbg-prompt-text${_promptVariantClass(variant)}`, text });
     applyParamColor(d, p);
-    // Restore resize behaviour: the element auto-shrinks to its content, the height the
-    // user drags becomes the remembered max, and longer text scrolls. Persisted per key.
+    // Resize behaviour: the element auto-shrinks to its content, the dragged
+    // height becomes the remembered max, and longer text scrolls. Persisted per key.
     _attachPromptResize(d, variant === "neg" ? "neg" : "pos");
     wrap.appendChild(d);
   }
@@ -591,9 +724,9 @@ function _hasInitialPrompt(summary) {
 }
 
 /**
- * A tab is a mini-section: { id, label, style, source?, color?, params:[…] }.
- * (Legacy tabs were { label, path } — treated as a single text field.) Convert a
- * tab to a section object so the normal renderers handle it — this gives each tab
+ * A tab is a mini-section: { id, label, style, source?, color?, params:[…] }, or
+ * the shorthand form { label, path } treated as a single text field. Convert a
+ * tab to a section object so the normal renderers handle it, giving each tab
  * real multi-field support, its own style/colour, and correct textbox wrapping.
  */
 function tabAsSection(t) {
@@ -611,16 +744,23 @@ function tabAsSection(t) {
  */
 function _renderTabbedSection(section, tabs, summary, ctx) {
   const preview = !!(ctx && ctx.preview);
-  const usable = [];
-  for (const t of tabs) {
-    if (!t) continue;
-    const sub = tabAsSection(t);
-    if (preview || sectionHasData(sub, summary)) usable.push({ tab: t, sub });
+  // Which tabs are usable is the shared resolver's call (the same filter the
+  // compare signature hashes). Preview shows every configured tab.
+  let usable;
+  if (preview) {
+    usable = (tabs || []).filter(Boolean).map(t => ({ tab: t, sub: tabAsSection(t) }));
+  } else {
+    const tree = _resolveTabs(tabs, [], summary);
+    usable = tree ? tree.tabs : [];
   }
+  return _renderTabbedUsable(section, usable, summary, ctx);
+}
 
-  // Section-level fields (OUTSIDE the tabs) render as a flat block, either above or
-  // below the tab block (section.fieldsAbove). Lets the user keep e.g. one shared
-  // "show output" field outside the tabs instead of duplicating it into every tab.
+/** Tab-pill UI over a prebuilt usable list ({tab, sub} entries). */
+function _renderTabbedUsable(section, usable, summary, ctx) {
+  // Section-level fields (outside the tabs) render as a flat block, above or below
+  // the tab block (section.fieldsAbove). Lets one shared field (e.g. "show output")
+  // stay outside the tabs instead of being duplicated into every tab.
   const secParams = Array.isArray(section.params) ? section.params : [];
   const fieldsEl = secParams.length
     ? renderSection({ id: section.id, title: section.title, style: "flat", params: secParams }, summary, { ...ctx, inTab: true })
@@ -681,7 +821,7 @@ function _renderTabbedSection(section, tabs, summary, ctx) {
 /**
  * Storage key for a "text"-style field's remembered height. The pos/neg prompts
  * stay shared ("pos"/"neg"); any other text field remembers its own size per path
- * so e.g. an LLM-caption tab keeps the height you drag it to.
+ * so e.g. an LLM-caption tab keeps its dragged height.
  */
 function _promptResizeKey(p) {
   const path = (p && p.path) || "";
@@ -694,8 +834,7 @@ function _promptResizeKey(p) {
 /** Auto-shrink-to-content + user-draggable max height (persisted) + scroll past max. */
 function _attachPromptResize(el, storageKey) {
   // Per-profile key so e.g. ComfyUI-image and A1111-video keep independent heights.
-  // Reads fall back to the pre-per-profile global key (then a default) so heights
-  // saved before this change aren't lost.
+  // Reads fall back to the global key, then a default.
   const lsKey = `SBG.GS.PromptHeight.${_activeProfileKey ? _activeProfileKey + "." : ""}${storageKey}`;
   const legacyKey = `SBG.GS.PromptHeight.${storageKey}`;
   let sectionEl = null;
@@ -726,9 +865,9 @@ function _attachPromptResize(el, storageKey) {
   el.addEventListener("mousedown", () => { dragH = el.getBoundingClientRect().height; });
   el.addEventListener("mouseup", () => {
     const newH = el.getBoundingClientRect().height;
-    // Only re-apply sizing after an ACTUAL resize drag (the height changed). A
-    // plain click must NOT call applySize() — it resets the box's internal
-    // scrollTop, snapping a scrolled-down long prompt back to the top on click.
+    // Only re-apply sizing after an actual resize drag (the height changed). A
+    // plain click must not call applySize(): it resets the box's internal
+    // scrollTop, snapping a scrolled-down long prompt back to the top.
     if (Math.abs(newH - dragH) > 2 && newH > 20) {
       localStorage.setItem(lsKey, String(Math.round(newH)));
       applySize();
@@ -772,7 +911,7 @@ function _renderCards(section, summary, ctx) {
   const doHighLow = section.highlow === true || (section.highlow == null && _AUTO_HIGHLOW.has(section.source));
 
   // MoE Models case: a sourceless cards section (e.g. "Models") whose param value
-  // is itself an array — summary.model = ["…HIGH.gguf", "…LOW.gguf"]. Expand that
+  // is itself an array - summary.model = ["…HIGH.gguf", "…LOW.gguf"]. Expand that
   // array into one pseudo-element per entry so high/low can pair them.
   if (doHighLow && !section.source && elements.length === 1) {
     const expanded = _expandArrayParam(section, elements[0]);
@@ -813,9 +952,8 @@ function _renderOneCard(section, el, summary, preview) {
       v = "—"; // preview placeholder so the field is visible while editing
     }
     if (pstyle === "title") {
-      // EVERY title param renders (a second title used to be silently dropped).
-      // Titles group at the top of the card, in param order, after the implicit
-      // node title if there is one.
+      // Every title param renders. Titles group at the top of the card, in param
+      // order, after the implicit node title if there is one.
       const t = h("div", { class: "sbg-meta-card__title", text: String(v) });
       applyParamColor(t, p);
       card.insertBefore(t, lastTitle ? lastTitle.nextSibling : card.firstChild);
@@ -843,16 +981,16 @@ function _renderOneCard(section, el, summary, preview) {
 }
 
 // ── High/Low (MoE) pairing ────────────────────────────────────────────
-// Wan2.2-style MoE workflows run two near-identical models/LoRAs/samplers — a
-// "high-noise" and "low-noise" pass. We pair them side-by-side with HIGH/LOW
+// Wan2.2-style MoE workflows run two near-identical models/LoRAs/samplers: a
+// "high-noise" and a "low-noise" pass. Pair them side-by-side with HIGH/LOW
 // labels. Detection is name-based and tolerant of "_HIGH"/"-low"/"(High)" etc.
 const _AUTO_HIGHLOW = new Set(["loras", "samplers"]);
 
 /**
  * Split a filename into lowercase words, breaking on separators, camelCase
- * boundaries and letter/digit transitions — so "…_i2vHigh-Q6_K.gguf" yields a
+ * boundaries and letter/digit transitions, so "…_i2vHigh-Q6_K.gguf" yields a
  * "high" word and "HighNoise"/"high_noise"/"highnoise" all yield high+noise.
- * classifyHighLow and highLowBase share this, so any name that CLASSIFIES as
+ * classifyHighLow and highLowBase share this, so any name that classifies as
  * high/low also strips to the same base as its counterpart.
  */
 function _hlWords(name) {
@@ -918,12 +1056,12 @@ function _renderHighLowPairs(section, elements, wrap, summary) {
   // Resolve the classification name the same prefix-tolerant way values render:
   // a dotted source-relative path like "loras.name" must strip the "loras." prefix
   // to read the element's own "name". A bare _dig(el,"loras.name") returns
-  // undefined (the element has no "loras" key) → classifyHighLow(null) → all
-  // pairing breaks (the bug after renaming "name" → "loras.name").
+  // undefined (the element has no "loras" key), so classifyHighLow(null) would
+  // break all pairing.
   const nameOf = (el) => resolveParamValue(keyPath, el, summary, section.source, null);
   // Prefer the server's topology role (the parser tags each LoRA/model with which
-  // sampler pass — high-noise vs low-noise — its loader feeds). It is reliable
-  // even when the filename carries no high/low token. Fall back to the filename
+  // sampler pass, high-noise vs low-noise, its loader feeds). It is reliable even
+  // when the filename carries no high/low token. Fall back to the filename
   // heuristic for un-reindexed or non-MoE data.
   const roleOf = (el) => {
     const r = el && typeof el === "object" ? el.role : null;
@@ -934,7 +1072,7 @@ function _renderHighLowPairs(section, elements, wrap, summary) {
   // ── 1) Loader-group pairing (most reliable for MoE) ──
   // If the server tagged elements with which loader node they came from, and
   // there are exactly two distinct loaders, pair the high-noise loader against
-  // the low-noise one — independent of how different the filenames look.
+  // the low-noise one, independent of how different the filenames look.
   const groupIds = [...new Set(elements.map(_loaderGroupOf).filter(g => g != null))];
   if (groupIds.length === 2 && elements.every(e => _loaderGroupOf(e) != null)) {
     const byGroup = { [groupIds[0]]: [], [groupIds[1]]: [] };
@@ -958,9 +1096,9 @@ function _renderHighLowPairs(section, elements, wrap, summary) {
   }
 
   // ── 2) Base-name grouping (a HIGH and its near-identical LOW) ──
-  // Within each base, pair HIGHs with LOWs — opposite roles ONLY. Two same-class
+  // Within each base, pair HIGHs with LOWs, opposite roles only. Two same-class
   // entries (e.g. the same LoRA loaded by two parallel high loaders) must never
-  // be forced into a HIGH/LOW pair (that was the "1030_HIGH shown as LOW" bug).
+  // be forced into a HIGH/LOW pair.
   const groups = new Map();
   const order = [];
   for (const el of elements) {
@@ -996,22 +1134,18 @@ function _renderHighLowPairs(section, elements, wrap, summary) {
 }
 
 function _renderNodes(section, summary, ctx) {
-  const nodes = summary && summary.workflow_nodes;
-  if (!Array.isArray(nodes) || !nodes.length) return null;
+  // Node labels and visible entries (incl. the >400-char drop) come from the
+  // shared resolver, so the compare signature can never hash a value this
+  // renderer would not display.
+  const tree = resolveSectionValues(section, summary,
+    { inTab: !!(ctx && ctx.inTab), preview: !!(ctx && ctx.preview) });
+  if (!tree || tree.kind !== "nodes") return null;
   const wrap = h("div", { class: "sbg-meta-group" });
-  const q = (ctx.searchQuery || "").toLowerCase();
-
-  for (const wn of nodes) {
-    if (!wn || typeof wn !== "object") continue;
-    // Untitled instances disambiguate by upstream context, like the cards view.
-    const label = wn.title || (wn._from ? `${wn.class_type} (from ${wn._from})` : (wn.class_type || "Unknown"));
+  for (const n of tree.nodes) {
     const card = h("div", { class: "sbg-meta-card" });
-    card.appendChild(h("div", { class: "sbg-meta-card__title", text: label }));
-    const params = wn.params && typeof wn.params === "object" ? wn.params : {};
+    card.appendChild(h("div", { class: "sbg-meta-card__title", text: n.label }));
     const tbl = h("div", { class: "sbg-meta-kv" });
-    for (const [pk, pv] of Object.entries(params)) {
-      const dv = typeof pv === "object" ? JSON.stringify(pv) : String(pv);
-      if (dv.length > 400) continue;
+    for (const [pk, dv] of n.entries) {
       const row = h("div", { class: "sbg-meta-kv__row" });
       row.appendChild(h("span", { class: "sbg-meta-kv__key", text: pk }));
       const kvVal = h("span", { class: "sbg-meta-kv__val" });
@@ -1019,8 +1153,8 @@ function _renderNodes(section, summary, ctx) {
       row.appendChild(kvVal);
       tbl.appendChild(row);
     }
-    if (tbl.children.length) card.appendChild(tbl);
-    if (card.children.length > 1) wrap.appendChild(card);
+    card.appendChild(tbl);
+    wrap.appendChild(card);
   }
   return wrap.children.length ? wrap : null;
 }

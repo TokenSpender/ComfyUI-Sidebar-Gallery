@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import asyncio
+import gzip
 import hashlib
 import json
 import logging
@@ -9,6 +10,7 @@ import shutil
 import subprocess
 import threading
 import time
+from concurrent.futures import ThreadPoolExecutor
 from pathlib import Path
 from typing import Any
 from urllib.parse import quote
@@ -24,6 +26,20 @@ from . import db as media_db
 from .metadata import PARSER_VERSION, read_metadata_for_file, guess_mime, sanitize_for_json
 from .search import match_summary
 from .security import AllowedRoot, make_root_id, safe_join
+
+# Two dedicated worker pools, split by latency class, isolate gallery work from
+# ComfyUI's shared default executor and from each other (so a long scan or ffmpeg
+# job can't head-of-line-block interactive work).
+#
+# _SCAN_EXECUTOR: minutes-long whole-library work (incremental scans, meta-key
+#   aggregation, removed-root purges). 2 workers keeps disk/SQLite contention bounded.
+# _IO_EXECUTOR: interactive per-item work (image/video thumbnails, search,
+#   new-file processing). 4 workers; ffmpeg is still capped at 2 by _FFMPEG_SEM,
+#   so video jobs can never occupy the whole pool.
+# The list_all payload build stays on the DEFAULT executor so gallery opens
+# never queue behind either pool.
+_SCAN_EXECUTOR = ThreadPoolExecutor(max_workers=2, thread_name_prefix="sbg-scan")
+_IO_EXECUTOR = ThreadPoolExecutor(max_workers=4, thread_name_prefix="sbg-io")
 
 
 routes = server.PromptServer.instance.routes
@@ -52,8 +68,8 @@ for _stale_tmp in _THUMB_DIR.glob("tmp_*.jpg"):
         pass
 
 # Thumbnails are content-addressed by path+mtime+size, so a changed or deleted
-# file orphans its old thumbnail with no way to map it back. Rather than leak
-# forever, cap the cache's total size and evict the oldest thumbnails over the cap.
+# file orphans its old thumbnail with no way to map it back. Cap the cache's
+# total size and evict the oldest thumbnails over the cap.
 _THUMB_CACHE_MAX_BYTES = 3 * 1024 ** 3  # 3 GB
 
 
@@ -110,10 +126,9 @@ def _image_thumb_path(full_path: str, size: int = 512) -> Path:
 
 def _thumb_url(rid_q: str, rp_q: str, size: int, kind: str, mtime) -> str | None:
     """Content-addressed thumbnail URL. The &v=<mtime> token makes a regenerated
-    file (new mtime) resolve to a FRESH url, so its immutable-cached thumbnail
-    refreshes on its own — no wholesale client-cache wipe on every db_version bump.
-    Millisecond precision so a same-second overwrite of a fixed-name file (the
-    on-disk thumb hash already keys on full-precision mtime) still busts the
+    file (new mtime) resolve to a fresh url, so its immutable-cached thumbnail
+    refreshes on its own, with no wholesale client-cache wipe on every db_version
+    bump. Millisecond precision so a same-second overwrite still busts the
     browser's immutable cache."""
     v = int((mtime or 0) * 1000)
     if kind == "image":
@@ -124,8 +139,8 @@ def _thumb_url(rid_q: str, rp_q: str, size: int, kind: str, mtime) -> str | None
 
 
 # Cap concurrent ffmpeg thumbnail jobs. During a full reindex the CPU is
-# saturated; unbounded parallel ffmpeg spawns then time out en masse, which
-# is what produced waves of "broken" video thumbnails after a rebuild.
+# saturated; unbounded parallel ffmpeg spawns then time out en masse, producing
+# waves of broken video thumbnails.
 _FFMPEG_SEM = threading.Semaphore(2)
 
 # Resolved ffmpeg path, cached after the first lookup.
@@ -252,13 +267,22 @@ def _output_root() -> AllowedRoot:
     return AllowedRoot(root_id="output", label="Output", path=out)
 
 
+def _extra_root_id(raw: str) -> tuple[str, str]:
+    """Normalize a configured extra-root path and derive its root_id.
+
+    The single derivation for extra-root ids: rows are indexed under these ids
+    and the removed-root purge deletes by them, so this normalization must not
+    be duplicated (a divergent copy would make the purge silently stop matching)."""
+    p = os.path.normpath(os.path.expandvars(os.path.expanduser(raw.strip())))
+    return make_root_id("extra", p), p
+
+
 def _all_roots() -> list[AllowedRoot]:
     cfg = load_config()
     roots = [_output_root()]
     for raw in cfg.extra_roots:
-        p = os.path.normpath(os.path.expandvars(os.path.expanduser(raw.strip())))
+        rid, p = _extra_root_id(raw)
         if os.path.isdir(p):
-            rid = make_root_id("extra", p)
             roots.append(AllowedRoot(root_id=rid, label=os.path.basename(p) or p, path=p))
     return roots
 
@@ -273,9 +297,9 @@ def _find_root(root_id: str) -> AllowedRoot | None:
 # ── DB-backed metadata reader helper ──────────────────────────────────
 
 def _read_metadata_for_db(full_path: str) -> dict | None:
-    """Read metadata from a file and return ONLY the compact summary dict.
-    
-    Stores only the parsed summary (~1-5 KB) — NOT the full prompt, workflow,
+    """Read metadata from a file and return only the compact summary dict.
+
+    Stores only the parsed summary (~1-5 KB), not the full prompt, workflow,
     parsed, or raw_text blobs which can be 50-200 KB each.
     Returns None if parsing fails entirely."""
     cfg = load_config()
@@ -344,9 +368,9 @@ async def post_settings(request: web.Request):
     """Update user settings.
 
     Body can be:
-      {"key": "dotted.path", "value": <any>}  — set a single key
-      {"settings": {full object}}              — replace entire settings
-      {full object without "key"}              — replace entire settings
+      {"key": "dotted.path", "value": <any>}   set a single key
+      {"settings": {full object}}              replace entire settings
+      {full object without "key"}              replace entire settings
     """
     try:
         body = await request.json()
@@ -354,8 +378,8 @@ async def post_settings(request: web.Request):
         return web.json_response({"error": "Invalid JSON"}, status=400)
 
     if "key" in body and "value" in body:
-        # Per-key update. Store the key LITERALLY (flat) — do not split on dots,
-        # so "SBG.Layouts" is a top-level key the client reads back verbatim.
+        # Per-key update. Store the key literally (flat), not split on dots, so
+        # "SBG.Layouts" is a top-level key the client reads back verbatim.
         settings = _read_settings()
         settings[body["key"]] = body["value"]
         _write_settings(settings)
@@ -387,8 +411,10 @@ def _start_full_reindex(roots: list[AllowedRoot]) -> bool:
     written only after EVERY root reindexed successfully, so an interrupted
     run is retried on the next startup.
     """
-    progress = media_db.get_reindex_progress()
-    if progress.get("running"):
+    # Refuse while any scan runs (full rebuild or a root's first index):
+    # full_reindex walks every root, so starting it during a first index of one
+    # of them means two concurrent whole-library writers on the same root.
+    if media_db.any_scan_running():
         return False
 
     def _bg_reindex():
@@ -421,14 +447,16 @@ async def rebuild_index(request: web.Request):
     roots = _all_roots()
     if not _start_full_reindex(roots):
         return web.json_response({"status": "already_running",
-                                  "progress": media_db.get_reindex_progress()})
+                                  "progress": media_db.get_progress()})
     return web.json_response({"status": "started", "roots": [r.root_id for r in roots]})
 
 
 @routes.get("/sidebar_gallery/reindex_progress")
 async def reindex_progress(request: web.Request):
-    """Return background reindex progress."""
-    return web.json_response(media_db.get_reindex_progress())
+    """Return scan/reindex progress, keyed per operation, for the frontend
+    progress poller (sbg-core.js):
+    {"running": <full rebuild running>, "full": {...}|null, "roots": {rid: {...}}}"""
+    return web.json_response(media_db.get_progress())
 
 
 @routes.get("/sidebar_gallery/config")
@@ -440,21 +468,65 @@ async def get_config(request: web.Request):
             "extra_roots": cfg.extra_roots,
             "excluded_dirs": cfg.excluded_dirs,
             "index_hidden_dirs": cfg.index_hidden_dirs,
+            "auto_refresh_interval_s": cfg.auto_refresh_interval_s,
             "roots": [{"id": r.root_id, "label": r.label, "path": r.path if r.root_id != "output" else None} for r in roots],
         }
     )
 
 
+# Strong references to fire-and-forget background tasks (asyncio keeps tasks
+# only weakly; unreferenced ones can be garbage-collected before finishing).
+_BG_TASKS: set = set()
+
+
+async def _purge_removed_roots(root_ids: set[str]) -> None:
+    """Background purge of roots removed from config: cancel + drain the root's
+    in-flight scan first, then delete its rows off-loop. Failures are logged."""
+    log = logging.getLogger("sbg")
+    loop = asyncio.get_running_loop()
+    for rid in root_ids:
+        handle = _inflight_scans.get(rid)
+        if handle is not None and not handle.future.done():
+            handle.cancel_event.set()
+            await _await_scan(handle.future)
+        try:
+            n = await loop.run_in_executor(_SCAN_EXECUTOR, media_db.delete_root_rows, rid)
+            if n:
+                log.info("SBG: purged %d indexed row(s) for removed root %s", n, rid)
+        except Exception:
+            log.warning("SBG: failed to purge rows for removed root %s", rid, exc_info=True)
+
+
 @routes.post("/sidebar_gallery/config")
 async def post_config(request: web.Request):
     data = await request.json()
+    old_cfg = load_config()
     cfg = save_config(data if isinstance(data, dict) else {})
+
+    # Purge index rows for extra roots removed from config, so a removed folder
+    # does not linger in the index (or re-appear instantly when re-added).
+    # Diffing old vs new config (not _all_roots) keeps a temporarily-offline
+    # network root's rows intact; only genuinely removed roots are purged.
+    # The purge runs as a background task: it first cancels + drains any in-flight
+    # scan of the removed root (whose later batches would otherwise re-insert rows
+    # after the purge, orphaning them forever), then deletes on a worker thread
+    # rather than blocking the event loop on the SQLite DELETE.
+    removed_ids = ({_extra_root_id(p)[0] for p in old_cfg.extra_roots}
+                   - {_extra_root_id(p)[0] for p in cfg.extra_roots})
+    if removed_ids:
+        # Keep a strong reference: the event loop holds tasks only weakly, so
+        # a bare create_task could be garbage-collected mid-purge.
+        task = asyncio.create_task(_purge_removed_roots(removed_ids))
+        _BG_TASKS.add(task)
+        task.add_done_callback(_BG_TASKS.discard)
+
     roots = _all_roots()
     return web.json_response(
         {
             "extra_roots": cfg.extra_roots,
             "excluded_dirs": cfg.excluded_dirs,
             "index_hidden_dirs": cfg.index_hidden_dirs,
+            "auto_refresh_interval_s": cfg.auto_refresh_interval_s,
             "roots": [{"id": r.root_id, "label": r.label, "path": r.path if r.root_id != "output" else None} for r in roots],
         }
     )
@@ -491,25 +563,91 @@ _SCAN_COOLDOWN_S = 5.0
 
 # In-flight incremental scans, keyed by root_id. The gallery's cold start does a
 # fast read (rescan=false) immediately followed by a forced reconcile
-# (rescan=true). Without this, the first call kicks off a background scan and the
-# second starts a *second* concurrent whole-library walk — doubling disk/SQLite
-# contention and starving on-demand thumbnail generation for the newest files. A
-# forced caller now awaits the running scan instead of launching another.
-_inflight_scans: dict[str, asyncio.Future] = {}
+# (rescan=true); tracking the in-flight scan lets a forced caller await the
+# running scan instead of launching a second concurrent whole-library walk.
+# Each entry carries the scan future plus a cancel event, so removing a root from
+# config can stop its in-flight scan instead of racing it (which would let the
+# scan's later batches re-insert orphan rows).
+class _ScanHandle:
+    __slots__ = ("future", "cancel_event")
+
+    def __init__(self, future: asyncio.Future, cancel_event: threading.Event):
+        self.future = future
+        self.cancel_event = cancel_event
+
+
+_inflight_scans: dict[str, _ScanHandle] = {}
 
 
 def _clear_inflight_scan(fut: asyncio.Future, root_id: str) -> None:
-    """Done-callback: drop the tracked future once it finishes — but only if it's
-    still the current one for this root, so a newer scan isn't cleared by mistake."""
-    if _inflight_scans.get(root_id) is fut:
+    """Done-callback: drop the tracked handle once its scan finishes, but only if
+    it's still the current one for this root, so a newer scan isn't cleared by mistake."""
+    handle = _inflight_scans.get(root_id)
+    if handle is not None and handle.future is fut:
         _inflight_scans.pop(root_id, None)
+
+
+async def _await_scan(fut):
+    """Await a scan future, swallowing failures (best-effort: callers fall
+    through to whatever the DB has). Returns the ScanResult or None."""
+    if fut is None:
+        return None
+    try:
+        return await fut
+    except Exception:
+        return None
+
+
+def _maybe_scan(root, force: bool):
+    """Schedule (or reuse) a cooldown- and inflight-guarded incremental scan for a
+    root and return its asyncio future so callers can await it. Returns None when no
+    scan runs (a full reindex is in progress, or the root was scanned within the
+    cooldown and this isn't a forced call). Shared by list_all, /poll and /list_new
+    so no two callers start concurrent whole-library walks of the same root
+    (which fight over the single SQLite writer and cause "database is locked")."""
+    root_id = root.root_id
+    if media_db.is_full_reindex_running():
+        return None
+    inflight = _inflight_scans.get(root_id)
+    if inflight is not None and not inflight.future.done():
+        return inflight.future  # a scan is already running for this root; reuse it
+    now = time.time()
+    recently_scanned = (now - _last_scan_times.get(root_id, 0)) < _SCAN_COOLDOWN_S
+    if not force and recently_scanned:
+        return None
+    _last_scan_times[root_id] = now
+    cancel_event = threading.Event()
+    loop = asyncio.get_running_loop()
+
+    def _run():
+        # Runs in the worker so the config open+parse stays off the event loop.
+        _scan_cfg = load_config()
+        # A root that never completed an index reports live progress (its first
+        # index is long and user-visible); routine re-scans stay silent so the
+        # auto-refresh poll never flashes the indicator.
+        report_progress = media_db.get_meta_value(f"indexed:{root_id}") is None
+        return media_db.incremental_scan(
+            root,
+            read_metadata_fn=_read_metadata_for_db,
+            excluded_dirs=set(_scan_cfg.excluded_dirs),
+            index_hidden_dirs=_scan_cfg.index_hidden_dirs,
+            report_progress=report_progress,
+            cancel_event=cancel_event,
+        )
+
+    scan_future = loop.run_in_executor(_SCAN_EXECUTOR, _run)
+    _inflight_scans[root_id] = _ScanHandle(scan_future, cancel_event)
+    scan_future.add_done_callback(lambda f, _rid=root_id: _clear_inflight_scan(f, _rid))
+    return scan_future
 
 
 def _build_list_all(root, thumb_size):
     """Read rows for a root and build the list_all payload. Runs in a worker
     thread so the DB read + ~29k-item build never block the event loop."""
     root_id = root.root_id
-    db_items = media_db.get_all(root_id)
+    # Version + rows from one SQLite snapshot: the stamp matches the row set even
+    # while a background scan is committing (see get_all_with_version).
+    db_version, db_items = media_db.get_all_with_version(root_id)
     rid_q = quote(root_id)
     out_items = []
     for row in db_items:
@@ -546,8 +684,60 @@ def _build_list_all(root, thumb_size):
         "server_time": time.time(),
         "meta_epoch": media_db.get_meta_epoch(),
         "db_empty": first_time,
-        "db_version": media_db.get_db_version(),
+        # Per-root version from the same snapshot as the rows above.
+        "db_version": db_version,
+        "count": len(out_items),
     }
+
+
+def _json_gz(payload):
+    """web.json_response that gzip-compresses large bodies (aiohttp only compresses
+    when the client advertises gzip). Applied to the medium endpoints (metadata,
+    search, meta_keys); the multi-MB list payloads use the worker-side _encode_json
+    path instead, since enable_compression() deflates synchronously on the event
+    loop. Not applied to FileResponse (images/video), which is already compressed.
+    zlib_executor offloads the deflate for bodies past 16 KB where supported."""
+    try:
+        # json_response() doesn't forward the zlib kwargs; Response does.
+        resp = web.Response(text=json.dumps(payload), content_type="application/json",
+                            zlib_executor_size=16 * 1024, zlib_executor=_IO_EXECUTOR)
+    except TypeError:  # older aiohttp without the zlib executor kwargs
+        resp = web.json_response(payload)
+    try:
+        if resp.body is not None and len(resp.body) > 1400:
+            resp.enable_compression()
+    except Exception:
+        pass
+    return resp
+
+
+def _encode_json(payload, accept_gzip: bool) -> tuple[bytes, bool]:
+    """json.dumps + gzip, meant to run off the event loop (in a worker).
+    For the ~13MB list_all payload, serializing and deflating on the loop
+    stalls every websocket update and HTTP request ComfyUI serves."""
+    body = json.dumps(payload).encode("utf-8")
+    if accept_gzip and len(body) > 1400:
+        return gzip.compress(body, 6), True
+    return body, False
+
+
+def _encoded_response(body: bytes, gz: bool) -> web.Response:
+    headers = {"Vary": "Accept-Encoding"}
+    if gz:
+        headers["Content-Encoding"] = "gzip"
+    return web.Response(body=body, content_type="application/json", headers=headers)
+
+
+def _accepts_gzip(request: web.Request) -> bool:
+    return "gzip" in (request.headers.get("Accept-Encoding") or "").lower()
+
+
+def _build_list_all_encoded(root, thumb_size, accept_gzip):
+    """Worker-side build + encode for /list_all in one executor hop.
+    Returns (total_items, body_bytes, is_gzip)."""
+    payload = _build_list_all(root, thumb_size)
+    body, gz = _encode_json(payload, accept_gzip)
+    return payload["total"], body, gz
 
 
 @routes.get("/sidebar_gallery/list_all")
@@ -565,57 +755,179 @@ async def list_all_media(request: web.Request):
     force = request.rel_url.query.get("rescan") in {"1", "true", "yes"}
     thumb_size = _clamped_int(request.rel_url.query.get("thumb_size"), 512)
 
-    # Read DB immediately for instant gallery display.
-    # If rescan requested, wait for scan to complete first to ensure fresh data.
-    # A short cooldown skips redundant background walks when several tabs /
-    # remounts hit list_all in quick succession (forced rescans always run).
-    # While a full reindex runs, skip scans entirely — two whole-library
-    # writers fight over the SQLite write lock ("database is locked").
-    reindexing = media_db.get_reindex_progress().get("running")
-    now = time.time()
-    recently_scanned = (now - _last_scan_times.get(root_id, 0)) < _SCAN_COOLDOWN_S
-    inflight = _inflight_scans.get(root_id)
-    inflight_running = inflight is not None and not inflight.done()
-    if not reindexing:
-        if inflight_running:
-            # A scan for this root is already running — don't start a second walk.
-            # A forced caller still needs fresh data, so wait for the running one.
-            if force:
-                try:
-                    await inflight
-                except Exception:
-                    pass  # best-effort; fall through to whatever the DB has
-        elif force or not recently_scanned:
-            _last_scan_times[root_id] = now
-            loop = asyncio.get_running_loop()
-            _scan_cfg = load_config()
-            _scan_excluded = set(_scan_cfg.excluded_dirs)
-            _scan_hidden = _scan_cfg.index_hidden_dirs
-            scan_future = loop.run_in_executor(None, lambda: media_db.incremental_scan(root, read_metadata_fn=_read_metadata_for_db, excluded_dirs=_scan_excluded, index_hidden_dirs=_scan_hidden))
-            _inflight_scans[root_id] = scan_future
-            scan_future.add_done_callback(lambda f, _rid=root_id: _clear_inflight_scan(f, _rid))
-            if force:
-                await scan_future  # Wait for scan to finish before reading DB
+    # Read DB immediately for instant gallery display; a forced rescan waits for
+    # the scan to finish, a normal call lets it complete in the background. A short
+    # cooldown skips redundant background walks when several tabs/remounts hit
+    # list_all in quick succession. Scheduling is centralised in _maybe_scan (shared
+    # with /poll) so two callers can never launch two concurrent whole-library walks.
+    reindexing = media_db.is_full_reindex_running()
+    scan_future = _maybe_scan(root, force)
+    if force:
+        await _await_scan(scan_future)  # wait so the response reflects the rescan
 
     loop = asyncio.get_running_loop()
-    payload = await loop.run_in_executor(None, _build_list_all, root, thumb_size)
+    accept_gzip = _accepts_gzip(request)
+    total, body, gz = await loop.run_in_executor(
+        None, _build_list_all_encoded, root, thumb_size, accept_gzip)
 
-    # First-ever open of a freshly added root: the background scan we kicked off
-    # may not have finished, so a non-forced caller would get an empty list. Wait
-    # for that in-flight scan once and rebuild, so opening a new folder fills in.
-    if not force and not reindexing and not payload["items"]:
+    # First-ever open of a freshly added root: the background scan may not have
+    # finished, so a non-forced caller would get an empty list. Wait for that
+    # in-flight scan once and rebuild, so opening a new folder fills in.
+    if not force and not reindexing and total == 0:
         pending = _inflight_scans.get(root_id)
-        if pending is not None and not pending.done():
-            try:
-                await pending
-            except Exception:
-                pass
-            payload = await loop.run_in_executor(None, _build_list_all, root, thumb_size)
+        if pending is not None and not pending.future.done():
+            await _await_scan(pending.future)
+            total, body, gz = await loop.run_in_executor(
+                None, _build_list_all_encoded, root, thumb_size, accept_gzip)
 
-    return web.json_response(payload)
+    return _encoded_response(body, gz)
+
+
+@routes.get("/sidebar_gallery/poll")
+async def poll_changes(request: web.Request) -> web.Response:
+    """Cheap change-check for a root. Runs the same cooldown/inflight-guarded
+    incremental scan as list_all (so external adds/deletes/renames get written to the
+    DB, bumping db_version), then returns the post-scan version. The frontend polls
+    this and only refetches the full list when db_version differs from its snapshot."""
+    root_id = request.rel_url.query.get("root_id", "output")
+    root = _find_root(root_id)
+    if root is None:
+        return web.Response(status=404)
+    await _await_scan(_maybe_scan(root, force=False))  # returned version reflects this scan
+    return web.json_response({
+        # Per-root version + row count. The count is a cheap (indexed COUNT(*))
+        # invariant: the client refetches when versions match but its item count
+        # differs, self-healing any version stamp recorded against a view that
+        # missed an add/delete.
+        "db_version": media_db.get_root_version(root_id),
+        "count": media_db.get_count(root_id),
+        "reindexing": media_db.is_full_reindex_running(),
+        "server_time": time.time(),
+    })
 
 
 # ── Delta list (new files only) ───────────────────────────────────────
+
+
+def _process_new_files(root, root_id: str, files: list, thumb_size: int) -> list[dict]:
+    """files[]-form worker: stat each reported file, parse its metadata,
+    upsert it, and build its response item. Runs on _IO_EXECUTOR - the
+    metadata parse alone can take tens of ms per file."""
+    out_items: list[dict] = []
+    conn = media_db._get_conn()
+    try:
+        for f in files:
+            fname = f.get("filename", "")
+            subfolder = (f.get("subfolder") or "").replace("\\", "/")
+            ftype = f.get("type", "output")
+            if ftype != "output" and root_id == "output":
+                continue
+
+            relpath = f"{subfolder}/{fname}" if subfolder else fname
+            try:
+                full = safe_join(root.path, relpath)
+            except ValueError:
+                continue
+            if not os.path.isfile(full):
+                continue
+
+            ext = os.path.splitext(fname)[1].lower()
+            kind = "video" if ext in VIDEO_EXTS else "image"
+            try:
+                st = os.stat(full)
+            except OSError:
+                continue
+
+            # Normalize to a path relative to the root. Some save nodes report an
+            # absolute subfolder in the `executed` event, which would otherwise be
+            # stored as an absolute relpath (breaking filename display and making
+            # the next rescan treat it as a stale/duplicate entry).
+            relpath = os.path.relpath(full, root.path).replace("\\", "/")
+            size = int(st.st_size)
+            mtime = float(st.st_mtime)
+            ctime = float(st.st_ctime)
+
+            # Read metadata and insert into DB
+            meta_dict = _read_metadata_for_db(full)
+            meta_json = json.dumps(meta_dict) if meta_dict else None
+            media_db.upsert_file(conn, root_id, relpath, ext, kind, size, mtime, meta_json, ctime=ctime)
+
+            rid_q = quote(root.root_id)
+            rp_q = quote(relpath)
+            thumb_url = _thumb_url(rid_q, rp_q, thumb_size, kind, mtime)
+            has_thumb = False
+
+            try:
+                tp = (_image_thumb_path(full, thumb_size) if kind == "image"
+                      else _video_thumb_path(full, thumb_size))
+                has_thumb = tp.exists()
+            except Exception:
+                pass
+
+            item = {
+                "root_id": root_id,
+                "relpath": relpath,
+                "filename": os.path.basename(relpath),
+                "subfolder": os.path.dirname(relpath).replace("\\", "/"),
+                "ext": ext,
+                "kind": kind,
+                "size": size,
+                "mtime": ctime,  # Back-compat: default sort field (creation time)
+                "ctime": ctime,
+                "mtime_real": mtime,
+                "thumb_url": thumb_url,
+                "has_thumb": has_thumb,
+            }
+            # Include dimensions for aspect-ratio thumbnail layout so newly
+            # generated items don't render as zoomed squares.
+            try:
+                _w = meta_dict.get("width") if isinstance(meta_dict, dict) else None
+                _h = meta_dict.get("height") if isinstance(meta_dict, dict) else None
+                if _w and _h:
+                    item["w"] = _w
+                    item["h"] = _h
+            except Exception:
+                pass
+            out_items.append(item)
+
+        conn.commit()
+    finally:
+        conn.close()
+    return out_items
+
+
+def _build_since_items(root, thumb_size: int, since: float) -> list[dict]:
+    """since-form worker: build response items for every DB row newer than
+    `since`. Runs on _IO_EXECUTOR - after a long absence this can be
+    thousands of items."""
+    out_items: list[dict] = []
+    rid_q = quote(root.root_id)
+    for row in media_db.get_all(root.root_id):
+        if row["mtime"] <= since:
+            continue
+        relpath = row["relpath"]
+        kind = row["kind"]
+        rp_q = quote(relpath)
+        item = {
+            "root_id": row["root_id"],
+            "relpath": relpath,
+            "filename": row["filename"],
+            "subfolder": row["subfolder"],
+            "ext": row["ext"],
+            "kind": kind,
+            "size": row["size"],
+            "mtime": row["ctime"] or row["mtime"],  # Back-compat: default sort field (creation time)
+            "ctime": row["ctime"] or row["mtime"],
+            "mtime_real": row["mtime"] or row["ctime"],
+            "thumb_url": _thumb_url(rid_q, rp_q, thumb_size, kind, row["mtime"] or row["ctime"]),
+            "has_thumb": False,
+        }
+        _w, _h = row.get("w"), row.get("h")
+        if _w and _h:
+            item["w"] = _w
+            item["h"] = _h
+        out_items.append(item)
+    return out_items
 
 
 @routes.post("/sidebar_gallery/list_new")
@@ -630,138 +942,48 @@ async def list_new_media(request: web.Request):
     thumb_size = _clamped_int(body.get("thumb_size"), 512)
 
     files = body.get("files")  # [{filename, subfolder, type}, ...]
-    out_items = []
+    removed_relpaths: list[str] = []  # filled by the since-form's scan
+    loop = asyncio.get_running_loop()
 
     if files and isinstance(files, list):
-        conn = media_db._get_conn()
-        try:
-            for f in files:
-                fname = f.get("filename", "")
-                subfolder = (f.get("subfolder") or "").replace("\\", "/")
-                ftype = f.get("type", "output")
-                if ftype != "output" and root_id == "output":
-                    continue
-
-                relpath = f"{subfolder}/{fname}" if subfolder else fname
-                try:
-                    full = safe_join(root.path, relpath)
-                except ValueError:
-                    continue
-                if not os.path.isfile(full):
-                    continue
-
-                ext = os.path.splitext(fname)[1].lower()
-                kind = "video" if ext in VIDEO_EXTS else "image"
-                try:
-                    st = os.stat(full)
-                except OSError:
-                    continue
-
-                # Normalize to a path RELATIVE to the root. Some save nodes report an
-                # absolute subfolder in the `executed` event, which would otherwise be
-                # stored as an absolute relpath (breaks relpath filename display and
-                # makes the next rescan treat it as a stale/duplicate entry).
-                relpath = os.path.relpath(full, root.path).replace("\\", "/")
-                size = int(st.st_size)
-                mtime = float(st.st_mtime)
-                ctime = float(st.st_ctime)
-
-                # Read metadata and insert into DB
-                meta_dict = _read_metadata_for_db(full)
-                meta_json = json.dumps(meta_dict) if meta_dict else None
-                media_db.upsert_file(conn, root_id, relpath, ext, kind, size, mtime, meta_json, ctime=ctime)
-
-                rid_q = quote(root.root_id)
-                rp_q = quote(relpath)
-                thumb_url = _thumb_url(rid_q, rp_q, thumb_size, kind, mtime)
-                has_thumb = False
-
-                if kind == "image":
-                    try:
-                        tp = _image_thumb_path(full, thumb_size)
-                        has_thumb = tp.exists()
-                    except Exception:
-                        pass
-                elif kind == "video":
-                    try:
-                        tp = _video_thumb_path(full, thumb_size)
-                        has_thumb = tp.exists()
-                    except Exception:
-                        pass
-
-                item = {
-                    "root_id": root_id,
-                    "relpath": relpath,
-                    "filename": os.path.basename(relpath),
-                    "subfolder": os.path.dirname(relpath).replace("\\", "/"),
-                    "ext": ext,
-                    "kind": kind,
-                    "size": size,
-                    "mtime": ctime,  # Back-compat: default sort field (creation time)
-                    "ctime": ctime,
-                    "mtime_real": mtime,
-                    "thumb_url": thumb_url,
-                    "has_thumb": has_thumb,
-                }
-                # Include dimensions for aspect-ratio thumbnail layout so newly
-                # generated items don't render as zoomed squares.
-                try:
-                    _w = meta_dict.get("width") if isinstance(meta_dict, dict) else None
-                    _h = meta_dict.get("height") if isinstance(meta_dict, dict) else None
-                    if _w and _h:
-                        item["w"] = _w
-                        item["h"] = _h
-                except Exception:
-                    pass
-                out_items.append(item)
-
-            conn.commit()
-        finally:
-            conn.close()
+        # Per-file stat + full metadata parse + upsert is real disk/CPU work, so
+        # run it off the event loop.
+        out_items = await loop.run_in_executor(
+            _IO_EXECUTOR, _process_new_files, root, root_id, files, thumb_size)
     else:
-        # Fallback: incremental scan
+        # Fallback: incremental scan through _maybe_scan (force), so it inherits
+        # the inflight-dedupe and full-reindex gating rather than starting an
+        # unguarded whole-library walk.
         since = float(body.get("since", 0))
-        loop = asyncio.get_running_loop()
-        _scan_cfg = load_config()
-        await loop.run_in_executor(None, lambda: media_db.incremental_scan(root, read_metadata_fn=_read_metadata_for_db, excluded_dirs=set(_scan_cfg.excluded_dirs), index_hidden_dirs=_scan_cfg.index_hidden_dirs))
-        # Return all items from DB (frontend will diff)
-        db_items = media_db.get_all(root_id)
-        for row in db_items:
-            if row["mtime"] > since:
-                relpath = row["relpath"]
-                kind = row["kind"]
-                rid_q = quote(root.root_id)
-                rp_q = quote(relpath)
-                thumb_url = _thumb_url(rid_q, rp_q, thumb_size, kind, row["mtime"] or row["ctime"])
-                has_thumb = False
-                item = {
-                    "root_id": row["root_id"],
-                    "relpath": relpath,
-                    "filename": row["filename"],
-                    "subfolder": row["subfolder"],
-                    "ext": row["ext"],
-                    "kind": kind,
-                    "size": row["size"],
-                    "mtime": row["ctime"] or row["mtime"],  # Back-compat: default sort field (creation time)
-                    "ctime": row["ctime"] or row["mtime"],
-                    "mtime_real": row["mtime"] or row["ctime"],
-                    "thumb_url": thumb_url,
-                    "has_thumb": has_thumb,
-                }
-                _w, _h = row.get("w"), row.get("h")
-                if _w and _h:
-                    item["w"] = _w
-                    item["h"] = _h
-                out_items.append(item)
+        scan_result = await _await_scan(_maybe_scan(root, force=True))
+        if scan_result is not None and scan_result.removed:
+            # Deletions this scan reconciled: hand them to the client so the delta
+            # path removes them instead of absorbing them into the version stamp
+            # (which would leave ghost cards in the grid).
+            removed_relpaths = list(scan_result.removed)
+        # Return all items newer than `since` from DB (frontend will diff)
+        out_items = await loop.run_in_executor(
+            _IO_EXECUTOR, _build_since_items, root, thumb_size, since)
 
-    return web.json_response(
-        {
-            "root": {"id": root.root_id, "label": root.label},
-            "new_count": len(out_items),
-            "items": out_items,
-            "server_time": time.time(),
-        }
-    )
+    payload = {
+        "root": {"id": root.root_id, "label": root.label},
+        "new_count": len(out_items),
+        "items": out_items,
+        # Relpaths the backing scan deleted (since-form; the files[] form
+        # never deletes). Lets the client reconcile removals through the
+        # delta path instead of absorbing them into the version stamp.
+        "removed": removed_relpaths,
+        "server_time": time.time(),
+        "db_version": media_db.get_root_version(root_id),
+        "count": media_db.get_count(root_id),
+    }
+    if len(out_items) > 200:
+        # A big delta (long absence) serializes + compresses off-loop like
+        # list_all; the typical few-item delta stays on the cheap inline path.
+        body_bytes, gz = await loop.run_in_executor(
+            _IO_EXECUTOR, _encode_json, payload, _accepts_gzip(request))
+        return _encoded_response(body_bytes, gz)
+    return _json_gz(payload)
 
 
 # ── Metadata ──────────────────────────────────────────────────────────
@@ -836,9 +1058,15 @@ async def get_metadata(request: web.Request):
         "raw_text": md.raw_text,
     }
 
-    # Store parsed metadata back to DB for new/unindexed files (future fast path)
-    if not db_row or not db_row.get("metadata_json"):
-        try:
+    # Store parsed metadata back to DB for new/unindexed files (future fast path).
+    # Three cases:
+    #  - row missing entirely: index it (a real change, bumps the version);
+    #  - row exists, parse found metadata: backfill it (real change);
+    #  - row exists, parse found nothing: only stamp meta_mtime ("tried, file has
+    #    none") without a version bump, and only once, so repeated lightbox views
+    #    don't bump the version and trigger a full re-download while browsing.
+    try:
+        if not db_row:
             _ext = os.path.splitext(relpath_clean)[1].lower()
             _kind = "video" if _ext in VIDEO_EXTS else "image"
             with media_db._get_conn() as _conn:
@@ -846,10 +1074,21 @@ async def get_metadata(request: web.Request):
                                      int(st.st_size), float(st.st_mtime),
                                      json.dumps(summary) if summary else None,
                                      ctime=float(st.st_ctime))
-        except Exception:
-            pass
+        elif not db_row.get("metadata_json"):
+            if summary:
+                _ext = os.path.splitext(relpath_clean)[1].lower()
+                _kind = "video" if _ext in VIDEO_EXTS else "image"
+                with media_db._get_conn() as _conn:
+                    media_db.upsert_file(_conn, root_id, relpath_clean, _ext, _kind,
+                                         int(st.st_size), float(st.st_mtime),
+                                         json.dumps(summary),
+                                         ctime=float(st.st_ctime))
+            elif not db_row.get("meta_mtime"):
+                media_db.mark_meta_attempted(root_id, relpath_clean)
+    except Exception:
+        pass
 
-    return web.json_response(sanitize_for_json(result))
+    return _json_gz(sanitize_for_json(result))
 
 
 @routes.get("/sidebar_gallery/metadata_ondemand")
@@ -905,7 +1144,7 @@ async def get_metadata_ondemand(request: web.Request):
             },
             "summary": md.summary or {},
         }
-        return web.json_response(sanitize_for_json(result))
+        return _json_gz(sanitize_for_json(result))
     except Exception as e:
         return web.json_response({"error": str(e)}, status=500)
 
@@ -939,19 +1178,14 @@ async def get_file(request: web.Request):
         headers={
             "Content-Disposition": f"filename=\"{filename}\"",
             "Content-Type": content_type,
-            # Do NOT send "Cache-Control: ...immutable" for these originals.
-            # immutable tells the browser to reuse the cached response forever
-            # without ever revalidating. Media loads get aborted mid-download all
-            # the time here (the lightbox cancels a <video> when you cross-fade,
-            # navigate, or it retries; longer clips are likeliest to be cut off),
-            # and Firefox then caches that TRUNCATED body and — because it is
-            # immutable — keeps serving the undecodable copy forever, even in a
-            # fresh tab. Only a cache-bypassing reload recovered it. ComfyUI's own
-            # /view sends no Cache-Control and never hit this, so we match it:
-            # "no-cache" still lets the browser store the file but forces a cheap
-            # ETag/Last-Modified revalidation before reuse, so a bad/partial entry
-            # can never get pinned. The client still appends &v=<mtime> so a
-            # regenerated file is fetched fresh.
+            # Do not send "immutable" for these originals. Media loads get aborted
+            # mid-download often (the lightbox cancels a <video> on cross-fade,
+            # navigation, or retry), and an immutable-cached truncated body would
+            # be served forever, even in a fresh tab. "no-cache" still lets the
+            # browser store the file but forces a cheap ETag/Last-Modified
+            # revalidation before reuse, so a bad/partial entry can never get
+            # pinned. The client still appends &v=<mtime> so a regenerated file is
+            # fetched fresh.
             "Cache-Control": "no-cache",
         },
     )
@@ -988,7 +1222,7 @@ async def get_preview(request: web.Request):
         # Generate on a worker thread so PIL decode/encode never blocks the
         # ComfyUI event loop (matches the list_all_media scan pattern).
         loop = asyncio.get_running_loop()
-        await loop.run_in_executor(None, lambda: _generate_image_thumbnail(full, cached, target))
+        await loop.run_in_executor(_IO_EXECUTOR, lambda: _generate_image_thumbnail(full, cached, target))
 
     if cached.exists():
         return web.FileResponse(
@@ -1032,7 +1266,7 @@ async def get_video_thumb(request: web.Request):
         # timeout) and is throttled by _FFMPEG_SEM, so run it on a worker
         # thread to keep the event loop responsive while it works/queues.
         loop = asyncio.get_running_loop()
-        ok = await loop.run_in_executor(None, lambda: _generate_video_thumbnail(full, tp, size))
+        ok = await loop.run_in_executor(_IO_EXECUTOR, lambda: _generate_video_thumbnail(full, tp, size))
         if not ok:
             return web.Response(status=404)
 
@@ -1068,15 +1302,15 @@ async def generate_thumb(request: web.Request) -> web.Response:
     if not os.path.isfile(full):
         return web.Response(status=404)
 
-    # Generate off the event loop — ffmpeg/PIL are blocking and the video
+    # Generate off the event loop - ffmpeg/PIL are blocking and the video
     # path can take seconds (see the GET handlers above).
     loop = asyncio.get_running_loop()
     if kind == "video":
         tp = _video_thumb_path(full, size)
-        ok = await loop.run_in_executor(None, lambda: _generate_video_thumbnail(full, tp, size))
+        ok = await loop.run_in_executor(_IO_EXECUTOR, lambda: _generate_video_thumbnail(full, tp, size))
     else:
         tp = _image_thumb_path(full, size)
-        ok = await loop.run_in_executor(None, lambda: _generate_image_thumbnail(full, tp, size))
+        ok = await loop.run_in_executor(_IO_EXECUTOR, lambda: _generate_image_thumbnail(full, tp, size))
 
     if ok and tp.exists():
         return web.FileResponse(
@@ -1090,20 +1324,23 @@ async def generate_thumb(request: web.Request) -> web.Response:
 
 
 
-# ── Metadata search (reads from DB — no in-memory cache needed) ──────
+# ── Metadata search (reads from DB - no in-memory cache needed) ──────
 
 
 
 
-# Search matching now lives in server/search.py as match_summary() — a pure,
-# unit-tested module (tests/test_search.py) decoupled from this ComfyUI-coupled
-# route handler. Imported above. (An AST comparison guarded the verbatim move.)
+# Search matching lives in server/search.py as match_summary(), a pure,
+# unit-tested module decoupled from this ComfyUI-coupled route handler.
 
 
 
 @routes.get("/sidebar_gallery/db_version")
 async def get_db_version(request: web.Request) -> web.Response:
-    """Return the current DB version counter (lightweight, no DB I/O)."""
+    """Return a DB version counter: per-root when ?root_id= is given (matches
+    the /poll and /list_all stamps), otherwise the global aggregate."""
+    root_id = request.rel_url.query.get("root_id")
+    if root_id:
+        return web.json_response({"version": media_db.get_root_version(root_id)})
     return web.json_response({"version": media_db.get_db_version()})
 
 
@@ -1149,13 +1386,16 @@ async def get_status(request: web.Request) -> web.Response:
             "size_mb": round(float(thumb_bytes) / (1024 * 1024), 1),
             "path": str(_THUMB_DIR),
         },
+        # Surfaces the "no ffmpeg -> no video thumbnails" case so the UI can warn
+        # instead of serving broken video thumbnails.
+        "ffmpeg_available": _find_ffmpeg() is not None,
     })
 
 
 def _run_search(root_id, tags, mode, relpaths_filter):
     """CPU-bound metadata scan. Runs in a worker thread (run_in_executor)
     so a full-library search never blocks the ComfyUI event loop."""
-    # Read from DB — all metadata is already stored as JSON
+    # Read from DB - all metadata is already stored as JSON
     if relpaths_filter and isinstance(relpaths_filter, list):
         # Delta search: only check specific items (near-instant)
         db_rows = media_db.get_items_with_metadata(root_id, relpaths_filter)
@@ -1253,8 +1493,8 @@ async def search_metadata(request: web.Request) -> web.Response:
     # Optional: filter to specific relpaths (for delta search during active search)
     relpaths_filter = body.get("relpaths")  # list of relpaths to check, or None for full search
     loop = asyncio.get_running_loop()
-    result = await loop.run_in_executor(None, _run_search, root_id, tags, mode, relpaths_filter)
-    return web.json_response(result)
+    result = await loop.run_in_executor(_IO_EXECUTOR, _run_search, root_id, tags, mode, relpaths_filter)
+    return _json_gz(result)
 
 
 # ── Theme Presets ──────────────────────────────────────────────────────
@@ -1338,16 +1578,16 @@ async def get_meta_keys(request: web.Request):
     # Full-library aggregate (cached by db_version in get_all_meta_keys); run off
     # the event loop since the first call after a change re-scans every row.
     loop = asyncio.get_running_loop()
-    keys = await loop.run_in_executor(None, media_db.get_all_meta_keys)
-    return web.json_response(keys)
+    keys = await loop.run_in_executor(_SCAN_EXECUTOR, media_db.get_all_meta_keys)
+    return _json_gz(keys)
 
 
 # ── Parser-version reindex ────────────────────────────────────────────
-# Summaries are cached per-file in the DB, so a parser upgrade does nothing
-# for already-indexed files until they are re-extracted. On startup, if the
-# stored parser version doesn't match, kick off a background re-extraction
-# (the gallery stays usable; _start_full_reindex writes the new version only
-# after a fully successful run, so an interrupted reindex retries next boot).
+# Summaries are cached per-file in the DB, so a parser upgrade does nothing for
+# already-indexed files until they are re-extracted. On startup, if the stored
+# parser version doesn't match, kick off a background re-extraction (the gallery
+# stays usable; _start_full_reindex writes the new version only after a fully
+# successful run, so an interrupted reindex retries next boot).
 def _check_parser_version():
     try:
         stored = media_db.get_meta_value("parser_version")

@@ -3,7 +3,6 @@
  *
  * Full-screen image/video viewer with metadata panel, compare mode,
  * keyboard navigation, section ordering, and search highlighting.
- * Extracted from the monolith as a standalone module.
  */
 
 import { app } from "../../scripts/app.js";
@@ -14,20 +13,18 @@ import {
   _metaCache, _metaCacheAPI, _mediaState,
   _thumbCacheAPI,
   searchState, highlightSearchMatches,
-  S, getSetting, getLayout,
+  S, getSetting, getLayout, APP_REGISTRY,
 } from "./sbg-core.js";
 
 import * as TL from "./sbg-translation-layer.js";
 
-// Fully release a <video>'s decoder. Removing the element from the DOM is NOT
+// Fully release a <video>'s decoder. Removing the element from the DOM is not
 // enough: the browser keeps the (hardware) decoder alive until garbage
 // collection, and Firefox-on-Windows has a tiny H.265/HEVC decoder pool. A few
 // un-released video elements exhaust it, after which every subsequent H.265 clip
 // fails with "could not be decoded" / NS_ERROR_DOM_MEDIA_NOT_SUPPORTED_ERR
 // (H.264 has a software fallback, so it keeps playing; a page refresh frees them
-// all). Clearing src + load() drops the decoder immediately. This is the same
-// release the nav swap does; the close/compare paths previously only paused,
-// which leaked a decoder on every lightbox close.
+// all). Clearing src + load() drops the decoder immediately.
 function releaseVideo(el) {
   if (!el || el.tagName !== "VIDEO") return;
   try { el.pause(); el.removeAttribute("src"); el.load(); } catch { }
@@ -82,7 +79,7 @@ export function openLightbox(_initialItems, startItemOrIndex) {
   let idx = typeof startItemOrIndex === "number" ? startItemOrIndex : items.indexOf(startItemOrIndex);
   // The gallery card closes over the item object from when it was rendered; a
   // background refresh (e.g. after a reindex) can replace the items array with
-  // NEW objects for the same files, so indexOf() fails. Match by the stable
+  // new objects for the same files, so indexOf() fails. Match by the stable
   // identity key so a click still opens the clicked item, not item #0.
   if (idx < 0 && startItemOrIndex && typeof startItemOrIndex === "object") {
     idx = items.findIndex(it => it && it.root_id === startItemOrIndex.root_id
@@ -94,7 +91,7 @@ export function openLightbox(_initialItems, startItemOrIndex) {
   let currentMediaEl = null;
 
   // Defaults must match what the Keybindings settings tab displays
-  // ("ArrowLeft,a" / "ArrowRight,d" — A/D navigate out of the box).
+  // ("ArrowLeft,a" / "ArrowRight,d", so A/D navigate out of the box).
   const keyPrev = getSetting(S.KEY_PREV, "ArrowLeft,a");
   const keyNext = getSetting(S.KEY_NEXT, "ArrowRight,d");
   const keyClose = getSetting(S.KEY_CLOSE, "Escape");
@@ -134,7 +131,7 @@ export function openLightbox(_initialItems, startItemOrIndex) {
   if (_lbcCp) copyPromptBtn.style.background = _lbcCp;
   if (_lbcWf) copyWfBtn.style.background = _lbcWf;
   if (_lbcLw) loadWfBtn.style.background = _lbcLw;
-  // Feature 6: Compare button
+  // Compare button
   const compareBtn = h("button", { class: "sbg-btn sbg-btn--sm", text: "⚖ Compare", title: "Compare with another image (C)" });
 
   const bottomBar = h("div", { class: "sbg-lb__bottom" }, [
@@ -153,8 +150,8 @@ export function openLightbox(_initialItems, startItemOrIndex) {
   const savedMetaWidth = localStorage.getItem("SBG.MetaPanelWidth");
   const _metaHeaderBadge = h("span", { class: "sbg-source-app" }); // placeholder, filled by renderMeta
 
-  // Feature 4: Tab bar for Generated / Initial Image
-  // Tabs are hidden by default and only shown when initial_image data exists
+  // Tab bar for Generated / Initial Image.
+  // Tabs are hidden by default and only shown when initial_image data exists.
   const _tabGenerated = h("button", { class: "sbg-lb__meta-tab sbg-lb__meta-tab--active", text: "Generated" });
   const _tabInitialImage = h("button", { class: "sbg-lb__meta-tab", text: "Initial Image" });
   const initTabColor = getSetting(S.INITIAL_IMAGE_TAB_COLOR, "");
@@ -227,7 +224,7 @@ export function openLightbox(_initialItems, startItemOrIndex) {
   const overlay = h("div", { class: "sbg-lightbox" }, [mediaArea, metaPanel]);
   document.body.appendChild(overlay);
 
-  // Re-render metadata when layout changes (B008: live preview of style changes)
+  // Re-render metadata when layout changes (live preview of style changes)
   const _onLayoutChanged = () => { if (meta && !destroyed) renderMeta(meta); };
   document.addEventListener("sbg-layout-changed", _onLayoutChanged);
 
@@ -281,7 +278,7 @@ export function openLightbox(_initialItems, startItemOrIndex) {
     });
   }
 
-  /** Sort metaBody children by saved order — uses layout config if available */
+  /** Sort metaBody children by saved order - uses layout config if available */
   /* ── Render metadata ────────────────────────────────────────── */
 
   let _metaObservers = []; // Track MutationObservers for cleanup on re-render
@@ -296,7 +293,7 @@ export function openLightbox(_initialItems, startItemOrIndex) {
     copyPromptBtn.disabled = true;
     copyWfBtn.disabled = true;
 
-    // Reset tab state — preserve active tab if user enabled tab persistence
+    // Reset tab state - preserve active tab if user enabled tab persistence
     _generatedMetaContent = null;
     _initialImageContent = null;
     const tabPersist = getSetting(S.META_TAB_PERSIST, false);
@@ -332,15 +329,10 @@ export function openLightbox(_initialItems, startItemOrIndex) {
     }
 
     // ── Source App Badge (in METADATA header) ─────────────────
-    const _appLabels = { comfyui: "ComfyUI", a1111: "A1111", forge: "Forge", sdnext: "SD.Next", fooocus: "Fooocus" };
-    // App badge color settings map
-    const _appColorKeys = {
-      comfyui: S.APP_BADGE_COMFYUI,
-      a1111: S.APP_BADGE_A1111,
-      forge: S.APP_BADGE_FORGE,
-      sdnext: S.APP_BADGE_SDNEXT,
-      fooocus: S.APP_BADGE_FOOOCUS,
-    };
+    // Derived from the shared app registry, so a newly supported app gets its
+    // lightbox badge automatically.
+    const _appLabels = TL.APP_LABELS;
+    const _appColorKeys = Object.fromEntries(APP_REGISTRY.map(a => [a.id, a.settingKey]));
     _metaHeaderBadge.innerHTML = "";
     if (s.source_app && _appLabels[s.source_app]) {
       const badge = h("span", { class: `sbg-badge sbg-badge--source sbg-badge--source-${s.source_app}`, text: _appLabels[s.source_app] });
@@ -378,12 +370,10 @@ export function openLightbox(_initialItems, startItemOrIndex) {
     if (s.positive_prompt) copyPromptBtn.disabled = false;
 
     // ── Search highlighting in metadata panel ──────────────────────
-    // Highlight each searched VALUE wherever it appears in the panel. searchState.query
+    // Highlight each searched value wherever it appears in the panel. searchState.query
     // holds values only (field prefixes like "adetailer:" never reach here), so a
-    // field-scoped search like "adetailer:denoising" highlights "denoising". An earlier
-    // attempt to scope highlights to a section via [data-section-id] matched nothing —
-    // the renderer never stamps that attribute — so field-scoped searches highlighted
-    // nothing at all. Panel-wide highlighting is correct and only trivially over-broad.
+    // field-scoped search like "adetailer:denoising" highlights "denoising".
+    // Panel-wide highlighting is correct and only trivially over-broad.
     if (searchState.query) {
       const queries = searchState.query.split("\x00").filter(Boolean);
       for (const q of queries) highlightSearchMatches(metaBody, q);
@@ -400,7 +390,7 @@ export function openLightbox(_initialItems, startItemOrIndex) {
     while (metaBody.firstChild) _generatedMetaContent.appendChild(metaBody.firstChild);
     metaBody.appendChild(_generatedMetaContent);
 
-    // ── Feature 4: Initial Image tab ─────────────────────────────
+    // ── Initial Image tab ─────────────────────────────
     if (s.initial_image) {
       _metaTabs.style.display = ""; // show tab bar when initial_image exists
       // Build initial image tab content
@@ -422,8 +412,8 @@ export function openLightbox(_initialItems, startItemOrIndex) {
           ? `/view?filename=${encodeURIComponent(basename)}&subfolder=${encodeURIComponent(subfolder)}&type=${type}`
           : `/view?filename=${encodeURIComponent(basename)}&type=${type}`;
         const img = h("img", { class: "sbg-initial-image-preview" });
-        // The reference/initial image can live in input, output, or temp — not
-        // just input. Try each in turn before giving up (fixes reference images
+        // The reference/initial image can live in input, output, or temp, not
+        // just input. Try each in turn before giving up (covers reference images
         // that were themselves previous generations in the output folder).
         const _viewTypes = ["input", "output", "temp"];
         let _vt = 0;
@@ -478,9 +468,6 @@ export function openLightbox(_initialItems, startItemOrIndex) {
   }
 
 
-  // (Search highlighting uses highlightSearchMatches from sbg-core.js — the
-  // identical local copy that used to live here was removed.)
-
   /* ── Navigate ───────────────────────────────────────────────── */
 
   let _navGen = 0; // generation counter: prevents stale metadata overwrites
@@ -494,19 +481,15 @@ export function openLightbox(_initialItems, startItemOrIndex) {
     const it = items[idx];
 
     // ── Cross-fade media swap (images only) ───────────────────────
-    // Keep the previous frame visible until the NEW media can paint, so there's
-    // no blank flash — but ONLY for images. A <video> kept alive as a backdrop
+    // Keep the previous frame visible until the new media can paint, so there's
+    // no blank flash, but only for images. A <video> kept alive as a backdrop
     // holds its decoder, and Firefox-on-Windows has a tiny H.265/HEVC decoder
-    // pool that is also shared with ComfyUI's own canvas video previews. The old
-    // cross-fade paused the outgoing video and released it only AFTER the new clip
-    // loaded, so two HEVC decoders were live at once during every swap. Combined
-    // with the canvas previews (e.g. after a workflow switch), that intermittently
-    // exhausted the pool and the next clip failed with "could not be decoded"
-    // (H.264 has a software fallback, so it kept working; a refresh frees them).
-    // So release any outgoing VIDEO's decoder UP FRONT; images cost no decoder and
-    // still stay as a no-flash backdrop. This also drops any still-pending
-    // (un-revealed) media from a previous fast nav (the "freeze on fast browsing"
-    // bug) so half-loaded <video>s don't pile up.
+    // pool also shared with ComfyUI's own canvas video previews; two live HEVC
+    // decoders at once can exhaust it and make the next clip fail with "could not
+    // be decoded". So release any outgoing video's decoder up front; images cost
+    // no decoder and still stay as a no-flash backdrop. This also drops any
+    // still-pending (un-revealed) media from a previous fast nav so half-loaded
+    // <video>s don't pile up.
     for (const child of [...mediaContainer.children]) {
       if (child.tagName === "VIDEO" || (child.dataset && child.dataset.sbgPending === "1")) {
         releaseVideo(child);
@@ -534,7 +517,7 @@ export function openLightbox(_initialItems, startItemOrIndex) {
     if (isVideo(it)) {
       // preload="metadata" (not "auto"): "auto" eagerly buffers/decodes the whole
       // clip the moment its src is set, keeping the HEVC decoder engaged longer
-      // than needed. autoplay still plays it; this just trims decoder/IO pressure.
+      // than needed. autoplay still plays it; this trims decoder/IO pressure.
       const video = h("video", { class: "sbg-lb__video", controls: "true", autoplay: "true", preload: "metadata" });
       video.dataset.sbgPending = "1";
       video.style.position = "absolute";
@@ -546,17 +529,14 @@ export function openLightbox(_initialItems, startItemOrIndex) {
       // Reveal once the first frame is decoded (loadeddata); canplay is a fallback.
       video.onloadeddata = () => _swapIn(video);
       video.oncanplay = () => _swapIn(video);
-      // Retry a few times (file may still be flushing to disk right after
-      // generation) but give up after that — an unbounded retry loop would
-      // hammer the server forever on a permanently broken file. On final give-up,
-      // still swap in so the stale backdrop doesn't linger over a broken file.
       // Recover from a failed load. A decode / "format not supported" error on
-      // these files is almost always TRANSIENT: the browser briefly couldn't get
-      // one of the few HEVC hardware decoders (which are shared with ComfyUI's own
-      // canvas video previews). So fully reset the element and re-request a decoder
-      // a handful of times with backoff before giving up and revealing the broken
-      // box. The bytes are already cached (immutable /file URL), so retrying only
-      // re-acquires a decoder — it does not re-download.
+      // these files is almost always transient: the browser briefly couldn't get
+      // one of the few HEVC hardware decoders (shared with ComfyUI's own canvas
+      // video previews), or the file is still flushing to disk right after
+      // generation. Reset the element and re-request a decoder a handful of times
+      // with backoff before giving up and revealing the broken box. The bytes are
+      // already cached (immutable /file URL), so retrying only re-acquires a
+      // decoder; it does not re-download.
       let _vidRetries = 0;
       const _maxVidRetries = 6;
       video.onerror = () => {
@@ -598,14 +578,14 @@ export function openLightbox(_initialItems, startItemOrIndex) {
     // ── Metadata: use cache or fetch summary from DB ────────────
     const cacheKey = `${it.root_id}:${it.relpath}`;
     const cached = metaCache.get(cacheKey);
-    // Validate against the file's real MODIFICATION time. it.mtime is the gallery
-    // sort key (creation time), so comparing the cached mtime against it marked
+    // Validate against the file's real modification time. it.mtime is the gallery
+    // sort key (creation time); comparing the cached mtime against it would mark
     // every file whose ctime != mtime (copied/imported/re-saved files) permanently
-    // stale, re-fetching metadata on every visit. it.mtime_real is the true mtime,
-    // matching cached.file.mtime returned by /metadata.
+    // stale. it.mtime_real is the true mtime, matching cached.file.mtime returned
+    // by /metadata.
     const _itMtime = it.mtime_real ?? it.mtime;
     const l1Stale = cached && _itMtime && cached.file?.mtime && cached.file.mtime < _itMtime;
-    // B044: Save scroll position before any metadata content change
+    // Save scroll position before any metadata content change
     const savedScroll = metaPanel.scrollTop;
     if (cached && !l1Stale) {
       renderMeta(cached);
@@ -658,9 +638,9 @@ export function openLightbox(_initialItems, startItemOrIndex) {
             .catch(() => { });
         }
 
-        // Only prefetch IMAGES. Prefetching a video would download the whole file
-        // (preload=auto) for a neighbour the user may never open; revisits of an
-        // already-viewed video are covered by /file's immutable caching instead.
+        // Only prefetch images. Prefetching a video would download the whole file
+        // for a neighbour the user may never open; revisits of an already-viewed
+        // video are covered by /file's immutable caching instead.
         if (!isVideo(adj)) {
           const pre = new Image();
           pre.src = fileUrl(adj);
@@ -671,7 +651,7 @@ export function openLightbox(_initialItems, startItemOrIndex) {
 
   /* ── Events ─────────────────────────────────────────────────── */
 
-  // Feature 8: Listen for new items so lightbox can navigate to newly generated images
+  // Listen for new items so the lightbox can navigate to newly generated images
   function _onItemsUpdated(e) {
     if (destroyed) return;
     const newItems = e.detail?.items;
@@ -696,7 +676,7 @@ export function openLightbox(_initialItems, startItemOrIndex) {
     destroyed = true;
     clearTimeout(_prefetchTimer);
     if (_compareActive) closeCompareMode();
-    // Release the decoder, not just pause it — a bare pause() here leaked an
+    // Release the decoder, not just pause it: a bare pause() here would leak an
     // HEVC decoder on every lightbox close (see releaseVideo()).
     releaseVideo(currentMediaEl);
     overlay.remove();
@@ -795,9 +775,9 @@ export function openLightbox(_initialItems, startItemOrIndex) {
     }
   }
 
-  // Wrap the handler so a key the lightbox ACTS ON is also blocked from reaching
+  // Wrap the handler so a key the lightbox acts on is also blocked from reaching
   // ComfyUI's global shortcuts underneath (e.g. "c" also opening the ComfyUI
-  // console). Capture phase = we run before ComfyUI's bubble-phase handlers, and
+  // console). Capture phase runs before ComfyUI's bubble-phase handlers, and
   // stopImmediatePropagation keeps the event from bubbling to them.
   function onKey(e) {
     if (e.target.tagName === "INPUT" || e.target.tagName === "TEXTAREA") return;
@@ -870,7 +850,7 @@ export function openLightbox(_initialItems, startItemOrIndex) {
     }
   });
 
-  // ── Feature 6: In-lightbox comparison mode ─────────────────────
+  // ── In-lightbox comparison mode ─────────────────────
   let _compareActive = false;
   let _compareIdx = -1;
   let _compareElements = null;
@@ -901,7 +881,7 @@ export function openLightbox(_initialItems, startItemOrIndex) {
     rightWrapper.appendChild(rightNextBtn);
     rightWrapper.appendChild(rightCounter);
     rightWrapper.appendChild(rightFilename);
-    // "COMPARED" label — mirrors the "CURRENT" label on the left
+    // "COMPARED" label - mirrors the "CURRENT" label on the left
     const rightLabel = h("div", {
       class: "sbg-compare__left-label",
       text: "COMPARED",
@@ -957,8 +937,8 @@ export function openLightbox(_initialItems, startItemOrIndex) {
     if (!_compareActive || !_compareElements) return;
     const compItem = items[_compareIdx];
     if (!compItem) return;
-    // The compared item can be a video too — swap the element type so a video URL
-    // isn't stuffed into an <img> (which rendered a broken-thumbnail icon).
+    // The compared item can be a video too, so swap the element type rather than
+    // stuffing a video URL into an <img> (which renders a broken-thumbnail icon).
     const wantVideo = isVideo(compItem);
     let mediaEl = _compareElements.rightMedia;
     if (wantVideo !== (mediaEl.tagName === "VIDEO")) {
@@ -1001,18 +981,18 @@ export function openLightbox(_initialItems, startItemOrIndex) {
     const _curMerged = _mergeFileInfo(currentSummary, meta && meta.file);
     const _cmpMerged = _mergeFileInfo(compareSummary, compItem);
 
-    // Signature of a section's resolved values — used to detect per-section diffs.
+    // Signature of a section's resolved values, used to detect per-section diffs.
+    // Delegates to the shared engine so the diff can never drift from what
+    // renderSection actually shows, including tabbed sections (prompts) and
+    // source-prefixed card fields (samplers/loras).
     const _sig = (section, summary) => {
-      try {
-        if (section.style === "nodes") return JSON.stringify(summary.workflow_nodes || []);
-        if (section.style === "cards") {
-          const els = TL.resolveSourceElements(section.source, summary);
-          return JSON.stringify(els.map(el => (section.params || []).map(p => el && el[p.path])));
-        }
-        return JSON.stringify((section.params || []).map(p =>
-          p.path && p.path.endsWith(".*") ? summary[p.path.slice(0, -2)] : TL.resolvePath(p.path, summary)
-        ));
-      } catch { return Math.random().toString(); }
+      try { return TL.sectionSignature(section, summary); }
+      catch (e) {
+        // Fail visible (unique string means the section reads DIFF) but never
+        // silent, so a resolver bug is diagnosable rather than randomizing badges.
+        console.warn("[SBG] sectionSignature failed for", section && section.id, e);
+        return Math.random().toString();
+      }
     };
 
     metaBody.innerHTML = "";
@@ -1067,7 +1047,7 @@ export function openLightbox(_initialItems, startItemOrIndex) {
         stack.appendChild(bottomBlock);
         sectionWrap.appendChild(stack);
       } else if (hasCurrent && hasCompare) {
-        // Identical section — single column, collapsed by default
+        // Identical section - single column, collapsed by default
         const wrapper = h("div", { style: "padding:6px 8px;display:none;" });
         const sc = TL.renderSection(section, _curMerged, {}); if (sc) wrapper.appendChild(sc);
         sectionWrap.appendChild(wrapper);

@@ -3,7 +3,6 @@
  *
  * Contains the full settings panel: Layout Editor, Appearance,
  * Keybindings, Settings, Presets, and Diagnostics tabs.
- * Extracted from the monolith to keep files focused and manageable.
  */
 
 import {
@@ -12,7 +11,8 @@ import {
   parseColor, formatColor, formatRgba, checkerBg,
   _metaCache, _metaCacheAPI, _resetIdb,
   _thumbCacheAPI, _thumbMemCache, resetFailedThumbs,
-  _sectionOrderKey, S,
+  _sectionOrderKey, S, APP_REGISTRY,
+  progressPoller, formatProgress,
 } from "./sbg-core.js";
 
 import { renderLayout, clearSwatchCache } from "./sbg-layout-editor.js";
@@ -59,9 +59,9 @@ if (sbgRoot) {
   document.body.appendChild(gsOverlay);
 }
 
-// Cleanup callbacks run when the settings panel closes (however it closes).
-// Color-input popovers append panels + global listeners to the document; without
-// this they leaked a little more DOM each time settings was opened.
+// Cleanup callbacks run when the settings panel closes. Color-input popovers
+// append panels and global listeners to the document; these must be removed to
+// avoid leaking DOM each time settings is opened.
 const _gsCleanups = [];
 function closeGS() {
   for (const fn of _gsCleanups.splice(0)) { try { fn(); } catch { } }
@@ -78,7 +78,7 @@ function _readSetting(id, fallback) {
   return getSetting(id, fallback);
 }
 
-// Cache sizes: show "—" when empty, otherwise the shared byte formatter.
+// Cache sizes: placeholder when empty, otherwise the shared byte formatter.
 function _fmtCacheSize(bytes) {
   return !bytes || bytes <= 0 ? "—" : fmtBytes(bytes);
 }
@@ -116,17 +116,22 @@ async function refreshDiagStats(diagStatsContainer) {
     }
 
     try {
+      // Keyed shape: {running:<full>, full:{...}|null, roots:{rid:{...}}}.
+      // Show the full rebuild if one runs, else any root's first index.
       const prog = await fetch("/sidebar_gallery/reindex_progress").then(r => r.json());
-      if (prog.running) {
-        const pct = prog.total > 0 ? Math.round((prog.done / prog.total) * 100) : 0;
+      const entry = (prog.full && prog.full.running)
+        ? prog.full
+        : Object.values(prog.roots || {}).find(e => e && e.running) || null;
+      if (entry) {
+        const f = formatProgress(entry);
         diagStatsContainer.appendChild(h("div", { class: "sbg-diag-stat", style: "margin-top:6px;color:var(--sbg-accent)" }, [
-          h("span", { class: "sbg-diag-stat__label", text: `${prog.phase || "Indexing"}…` }),
-          h("span", { class: "sbg-diag-stat__value", text: `${prog.done.toLocaleString()} / ${prog.total.toLocaleString()} (${pct}%)` }),
+          h("span", { class: "sbg-diag-stat__label", text: `${entry.phase || "Indexing"}…` }),
+          h("span", { class: "sbg-diag-stat__value", text: f.text }),
         ]));
       }
     } catch { }
 
-    diagStatsContainer.appendChild(h("div", { class: "sbg-diag-section__title", text: "Server Thumbnails", title: "JPEG thumbnails generated and stored on the server in the .thumbs folder. Shared across all browsers/clients. No in-memory cache — served directly from disk on each request.", style: "margin-top:10px" }));
+    diagStatsContainer.appendChild(h("div", { class: "sbg-diag-section__title", text: "Server Thumbnails", title: "JPEG thumbnails generated and stored on the server in the .thumbs folder. Shared across all browsers/clients. No in-memory cache - served directly from disk on each request.", style: "margin-top:10px" }));
     diagStatsContainer.appendChild(h("div", { class: "sbg-diag-stat" }, [h("span", { class: "sbg-diag-stat__label", text: "Count" }), h("span", { class: "sbg-diag-stat__value", text: (st.thumbnails?.count || 0).toLocaleString() })]));
     diagStatsContainer.appendChild(h("div", { class: "sbg-diag-stat" }, [h("span", { class: "sbg-diag-stat__label", text: "Size" }), h("span", { class: "sbg-diag-stat__value", text: `${st.thumbnails?.size_mb || 0} MB` })]));
 
@@ -156,7 +161,6 @@ async function refreshDiagStats(diagStatsContainer) {
 }
 
 function _writeSetting(id, value) {
-  // Write to the disk-backed settings (single source of truth).
   saveSetting(id, value);
 }
 
@@ -188,15 +192,15 @@ function _colorInput(id, fallback, label, tooltip, callback, replaceChannel) {
   const wrap = h("div", { class: "sbg-gs-color-wrap", style: "position:relative" });
 
   // displayColor: the canonical CSS colour (hex when opaque, rgba when translucent).
-  // Raw values we can't parse (e.g. "var(--sbg-accent)") are stored verbatim.
+  // Unparseable values (e.g. "var(--sbg-accent)") are stored verbatim.
   let displayColor = val || fallback || "#7c6aef";
-  // The text field always READS as rgba(...) (matching the colour picker), even
+  // The text field always reads as rgba(...), matching the colour picker, even
   // at full opacity. The stored/applied value (displayColor) stays canonical.
   const _toRgba = (c) => { const pc = parseColor(c); return pc ? formatRgba(pc.r, pc.g, pc.b, pc.a) : c; };
 
-  // Pill colour rows only: debounced find-&-replace of matching per-element pill
-  // colours. The baseline is the colour BEFORE the current edit burst, so dragging
-  // the picker (which fires applyColor continuously) commits ONE old→new replace at
+  // Pill colour rows only: debounced find-and-replace of matching per-element pill
+  // colours. The baseline is the colour before the current edit burst, so dragging
+  // the picker (which fires applyColor continuously) commits one old->new replace at
   // the end rather than chasing every intermediate value.
   let _replBaseline = displayColor, _replTimer = null;
 
@@ -207,9 +211,8 @@ function _colorInput(id, fallback, label, tooltip, callback, replaceChannel) {
     text.value = _toRgba(color);
     _writeSetting(id, color);
     if (callback) callback(color);
-    // A global colour changed → drop the layout editor's cached swatch defaults
-    // so its param/tab/section colour pickers re-read the new value (otherwise
-    // the picker shows the colour from when it was first opened).
+    // A global colour changed, so drop the layout editor's cached swatch defaults
+    // so its param/tab/section colour pickers re-read the new value.
     clearSwatchCache();
     if (replaceChannel) {
       if (_replTimer === null) _replBaseline = prev; // first change of a burst
@@ -275,8 +278,8 @@ function _colorInput(id, fallback, label, tooltip, callback, replaceChannel) {
   wrap.appendChild(swatch);
   wrap.appendChild(text);
   document.body.appendChild(panel);
-  // Remove the body-level panel + global listener when settings closes,
-  // otherwise every settings open leaked another panel into the page.
+  // Remove the body-level panel and global listener when settings closes,
+  // otherwise every settings open leaks another panel into the page.
   _gsCleanups.push(() => {
     document.removeEventListener("click", _docClick);
     if (picker) { try { picker.destroy(); } catch { } }
@@ -450,21 +453,18 @@ function renderAppearance() {
   if (lwLabel) { lwLabel.innerHTML = ""; lwLabel.appendChild(lwBtn); }
   wrap.appendChild(lwRow);
 
-  // Feature 3: App Badge Colors
+  // App Badge Colors
   wrap.appendChild(h("div", { class: "sbg-gs-section-title", text: "App Badge Colors", style: "margin-top:16px" }));
   wrap.appendChild(h("div", { class: "sbg-gs-desc", text: "Customize the color of each source application badge. Leave blank for defaults." }));
 
-  const _appBadges = [
-    { key: S.APP_BADGE_COMFYUI, label: "ComfyUI", default: "#4ade80", cssVar: "--sbg-app-comfyui" },
-    { key: S.APP_BADGE_A1111, label: "A1111", default: "#c084fc", cssVar: "--sbg-app-a1111" },
-    { key: S.APP_BADGE_FORGE, label: "Forge", default: "#fdba74", cssVar: "--sbg-app-forge" },
-    { key: S.APP_BADGE_SDNEXT, label: "SD.Next", default: "#5eead4", cssVar: "--sbg-app-sdnext" },
-    { key: S.APP_BADGE_FOOOCUS, label: "Fooocus", default: "#f472b6", cssVar: "--sbg-app-fooocus" },
-  ];
+  // Rows derive from the single app registry in sbg-core.js, so the preview here,
+  // the boot-time CSS vars, and the lightbox badge all read the same defaults.
+  const _appBadges = APP_REGISTRY.map(a => (
+    { key: a.settingKey, label: a.label, default: a.defaultColor, cssVar: a.cssVar }));
 
   for (const ab of _appBadges) {
     const badgeEl = _badgePreview(ab.label, _readSetting(ab.key, "") || ab.default);
-    const row = _colorInput(ab.key, "", "", `Color for ${ab.label} source badge`, (c) => {
+    const row = _colorInput(ab.key, ab.default, "", `Color for ${ab.label} source badge`, (c) => {
       const color = c || ab.default;
       badgeEl.style.background = color;
       document.documentElement.style.setProperty(ab.cssVar, color);
@@ -477,7 +477,7 @@ function renderAppearance() {
     wrap.appendChild(row);
   }
 
-  // Feature 4: Initial Image Tab Color
+  // Initial Image Tab Color
   wrap.appendChild(h("div", { class: "sbg-gs-section-title", text: "Initial Image Tab", style: "margin-top:16px" }));
   const initTabBadge = _badgePreview("Initial Image", _readSetting(S.INITIAL_IMAGE_TAB_COLOR, "") || "#94a3b8");
   const initTabRow = _colorInput(S.INITIAL_IMAGE_TAB_COLOR, "#94a3b8", "", "Color for the Initial Image tab button in the lightbox metadata panel", (c) => {
@@ -546,11 +546,10 @@ function renderSettings() {
   const wrap = h("div", { class: "sbg-gs-form" });
 
   wrap.appendChild(h("div", { class: "sbg-gs-section-title", text: "Gallery" }));
-  wrap.appendChild(_numberInput(S.THUMB_SIZE, 110, "Thumbnail Size (px)", "Size of thumbnail grid cells (64-256). Only used when Items Per Row is 'auto' — it decides how many columns fit."));
+  wrap.appendChild(_numberInput(S.THUMB_SIZE, 110, "Thumbnail Size (px)", "Size of thumbnail grid cells (64-256). Only used when Items Per Row is 'auto' - it decides how many columns fit."));
   wrap.appendChild(_comboInput(S.THUMB_PER_ROW, "auto", ["auto", "1", "2", "3", "4", "5", "6", "8", "10"], "Items Per Row", "auto = fit as many as the Thumbnail Size allows. A number = ALWAYS that many per row; thumbnails are sized to fill the row based on their aspect ratios. Reopen the gallery to apply."));
   wrap.appendChild(_comboInput(S.THUMB_SHAPE, "square", ["square", "ar"], "Thumbnail Shape", "Square crops; AR preserves aspect ratio"));
-  // Normalize a legacy stored sort value so the combo shows the right selection
-  // (the gallery itself aliases these too).
+  // Normalize a legacy stored sort value so the combo shows the right selection.
   {
     const _sortAlias = { newest: "created_desc", oldest: "created_asc" };
     const _cur = _readSetting(S.SORT, "created_desc");
@@ -560,6 +559,52 @@ function renderSettings() {
     ["created_desc", "created_asc", "modified_desc", "modified_asc", "name_asc", "name_desc", "size_desc", "size_asc"],
     "Default Sort", "Default sort order for gallery items (matches the gallery's sort menu)"));
   wrap.appendChild(_numberInput(S.VSCROLL_BUFFER, 8, "Scroll Buffer (rows)", "Extra rows pre-rendered above/below viewport (2-30). Higher = less blank space on fast scroll, but more DOM nodes."));
+
+  // Shared config helpers, defined before the first server-backed row so it can
+  // call them directly. _postConfig checks the response, so a failed save
+  // surfaces as an error toast instead of a false "saved" message.
+  async function _postConfig(patch) {
+    const r = await fetch("/sidebar_gallery/config", {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify(patch),
+    });
+    if (!r.ok) throw new Error("Save failed (HTTP " + r.status + ")");
+    return r.json();
+  }
+  const _loadCfg = () => fetch("/sidebar_gallery/config").then(r => r.json());
+
+  // Auto-refresh interval is server config (auto_refresh_interval_s), not a
+  // localStorage setting, so it POSTs to /config instead of using _numberInput.
+  // The server clamps to 0 or >=5s; the input and toast echo the effective
+  // value from the response.
+  {
+    let arBusy = false;
+    const arInput = h("input", { type: "number", class: "sbg-gs-input sbg-gs-input--sm", min: "0", step: "5", value: "15" });
+    _loadCfg().then((cfg) => {
+      if (cfg && typeof cfg.auto_refresh_interval_s === "number") arInput.value = String(cfg.auto_refresh_interval_s);
+    }).catch(() => { });
+    arInput.addEventListener("change", async () => {
+      if (arBusy) return;
+      arBusy = true;
+      const n = Math.max(0, Math.floor(Number(arInput.value) || 0));
+      try {
+        const cfg = await _postConfig({ auto_refresh_interval_s: n });
+        const eff = (cfg && typeof cfg.auto_refresh_interval_s === "number") ? cfg.auto_refresh_interval_s : n;
+        arInput.value = String(eff);
+        if (eff <= 0) showToast("Auto-refresh timer off (still checks when you return)");
+        else if (eff !== n) showToast(`Auto-refresh every ${eff}s (5s minimum)`);
+        else showToast(`Auto-refresh every ${eff}s`);
+        if (galleryCtx.refreshConfig) await galleryCtx.refreshConfig();
+      } catch (e) {
+        arInput.value = String(n);
+        showToast("Failed to update: " + (e?.message || e));
+      }
+      finally { arBusy = false; }
+    });
+    wrap.appendChild(_settingRow("Auto-refresh interval", arInput,
+      "How often the open gallery checks for files added, removed, or renamed on disk (minimum 5s). 0 turns off the background timer; the gallery still checks once when you come back to it. Applies right away."));
+  }
 
   wrap.appendChild(h("div", { class: "sbg-gs-section-title", text: "Tooltips", style: "margin-top:16px" }));
   wrap.appendChild(_toggle(S.TOOLTIP_NAME, true, "Show Filename", "Show filename in card tooltip"));
@@ -581,21 +626,6 @@ function renderSettings() {
   wrap.appendChild(_comboInput(S.FILENAME_STYLE, "basename", ["basename", "relpath"], "Filename Display", "Show just the filename or the full relative path in File Info."));
   wrap.appendChild(_comboInput(S.MODEL_NAME_STYLE, "basename", ["basename", "relpath"], "Model Display", "Show model and LoRA names as just the filename (basename) or the full relative path."));
   wrap.appendChild(_toggle(S.META_TAB_PERSIST, false, "Remember Metadata Tab", "Keep the active metadata tab (Generated/Initial Image) when navigating between images."));
-
-  // Shared config POST: one place that checks the response, so a failed save
-  // surfaces as an error toast instead of a false "saved" message.
-  async function _postConfig(patch) {
-    const r = await fetch("/sidebar_gallery/config", {
-      method: "POST",
-      headers: { "Content-Type": "application/json" },
-      body: JSON.stringify(patch),
-    });
-    if (!r.ok) throw new Error("Save failed (HTTP " + r.status + ")");
-    return r.json();
-  }
-  // Fetch the whole config once on open; both sections below reuse it (each
-  // re-fetches on its own only after the user edits that section).
-  const _loadCfg = () => fetch("/sidebar_gallery/config").then(r => r.json());
 
   // ── Folders: extra media roots shown in the folder picker and indexed ──
   wrap.appendChild(h("div", { class: "sbg-gs-section-title", text: "Folders", style: "margin-top:16px" }));
@@ -640,8 +670,8 @@ function renderSettings() {
       try {
         const res = await _postRoots([...(cfg.extra_roots || []), p]);
         const added = (res.extra_roots || []).length > (cfg.extra_roots || []).length;
-        if (!added) { showToast("Folder not added — check the path exists on the ComfyUI machine"); return; }
-        showToast("Folder added — it will be indexed when you open it");
+        if (!added) { showToast("Folder not added - check the path exists on the ComfyUI machine"); return; }
+        showToast("Folder added - it will be indexed when you open it");
         inp.value = "";
         if (galleryCtx.refreshConfig) await galleryCtx.refreshConfig();
         _renderFolders();
@@ -671,7 +701,7 @@ function renderSettings() {
     if (!cfg) { try { cfg = await _loadCfg(); } catch { cfg = { excluded_dirs: [] }; } }
     const current = cfg.excluded_dirs || [];
 
-    // Toggle: include hidden (dot-prefixed) folders. Off by default = hidden folders skipped.
+    // Toggle: include hidden (dot-prefixed) folders. Off by default, so hidden folders are skipped.
     const hiddenChk = h("input", { type: "checkbox" });
     hiddenChk.checked = !!cfg.index_hidden_dirs;
     hiddenChk.addEventListener("change", async () => {
@@ -689,7 +719,7 @@ function renderSettings() {
       } finally { excludedBusy = false; }
     });
     excludedList.appendChild(_settingRow("Include hidden folders", hiddenChk,
-      "Also scan folders whose names start with a dot (e.g. .thumbs). Off by default — hidden folders are skipped."));
+      "Also scan folders whose names start with a dot (e.g. .thumbs). Off by default - hidden folders are skipped."));
 
     const row = (name) => {
       const el = h("div", { class: "sbg-gs-row", style: "align-items:center" });
@@ -700,7 +730,7 @@ function renderSettings() {
         excludedBusy = true;
         try {
           await _postExcluded(current.filter(d => d !== name));
-          showToast("Folder no longer excluded — it will be re-indexed on the next scan");
+          showToast("Folder no longer excluded - it will be re-indexed on the next scan");
           if (galleryCtx.refreshConfig) await galleryCtx.refreshConfig();
           _renderExcluded();
         } catch (e) { showToast("Failed to update: " + (e?.message || e)); }
@@ -727,7 +757,7 @@ function renderSettings() {
       excludedBusy = true;
       try {
         await _postExcluded([...current, name]);
-        showToast("Folder excluded — it will be skipped on the next scan");
+        showToast("Folder excluded - it will be skipped on the next scan");
         inp.value = "";
         if (galleryCtx.refreshConfig) await galleryCtx.refreshConfig();
         _renderExcluded();
@@ -783,11 +813,10 @@ function renderPresets() {
     if (!name) { showToast("Enter a preset name"); return; }
     const preset = { name, created: Date.now() };
     if (incLayout.checked) {
-      // CURRENT layout system: the per-app × per-media section profiles
-      // ("SBG.Layouts", translation layer). Without this, presets silently
-      // saved only legacy keys the panel no longer reads.
+      // Active layout system: the per-app x per-media section profiles
+      // ("SBG.Layouts", translation layer).
       preset.layouts = getSetting("SBG.Layouts", null);
-      // Legacy keys still captured for back-compat with old installs.
+      // Legacy keys captured for back-compat with old installs.
       try { preset.layout = JSON.parse(localStorage.getItem("SBG.Layout")); } catch { }
       try { preset.layoutRenames = JSON.parse(localStorage.getItem("SBG.LayoutRenames")); } catch { }
     }
@@ -802,7 +831,7 @@ function renderPresets() {
     if (incSettings.checked) {
       preset.settings = {};
       for (const [k, id] of Object.entries(S)) {
-        if (k.startsWith("KEY_")) continue; // keybindings separate
+        if (k.startsWith("KEY_")) continue; // keybindings saved separately
         preset.settings[id] = _readSetting(id, null);
       }
     }
@@ -816,7 +845,7 @@ function renderPresets() {
     presets.unshift(preset);
     localStorage.setItem(PRESETS_KEY, JSON.stringify(presets));
     showToast(`Preset "${name}" saved`);
-    renderPresets(); // refresh list
+    renderPresets();
   });
   const saveRow = h("div", { class: "sbg-gs-preset-save" }, [nameInput, saveBtn]);
   wrap.appendChild(saveRow);
@@ -837,7 +866,7 @@ function renderPresets() {
           setTimeout(() => { loadConfirm = false; loadBtn.textContent = "Load"; loadBtn.style.background = ""; }, 2000);
           return;
         }
-        // Current layout system (per-app/per-media profiles)
+        // Active layout system (per-app/per-media profiles)
         if (p.layouts) {
           saveSetting("SBG.Layouts", p.layouts);
           document.dispatchEvent(new CustomEvent("sbg-layout-changed"));
@@ -913,7 +942,7 @@ function renderPresets() {
   });
   wrap.appendChild(importBtn);
 
-  // D4: Server-side themes (from themes/ subfolder)
+  // Server-side themes (from the themes/ subfolder)
   wrap.appendChild(h("div", { class: "sbg-gs-section-title", text: "Server Themes", style: "margin-top:16px" }));
   wrap.appendChild(h("div", { class: "sbg-gs-desc", text: "Presets stored in the extension's themes/ folder. Persist across reinstalls." }));
   const serverList = h("div", { class: "sbg-gs-preset-list" });
@@ -944,7 +973,7 @@ function renderPresets() {
           const resp = await fetch(`/sidebar_gallery/preset?filename=${encodeURIComponent(sp.filename)}`);
           if (!resp.ok) throw new Error(`HTTP ${resp.status}`);
           const p = await resp.json();
-          // Apply preset (same logic as local presets)
+          // Apply preset (same logic as local presets).
           if (p.layouts) {
             saveSetting("SBG.Layouts", p.layouts);
             document.dispatchEvent(new CustomEvent("sbg-layout-changed"));
@@ -999,11 +1028,10 @@ function renderPresets() {
     if (!name) { showToast("Enter a preset name first"); return; }
     const preset = { name, created: Date.now() };
     if (incLayout.checked) {
-      // CURRENT layout system: the per-app × per-media section profiles
-      // ("SBG.Layouts", translation layer). Without this, presets silently
-      // saved only legacy keys the panel no longer reads.
+      // Active layout system: the per-app x per-media section profiles
+      // ("SBG.Layouts", translation layer).
       preset.layouts = getSetting("SBG.Layouts", null);
-      // Legacy keys still captured for back-compat with old installs.
+      // Legacy keys captured for back-compat with old installs.
       try { preset.layout = JSON.parse(localStorage.getItem("SBG.Layout")); } catch { }
       try { preset.layoutRenames = JSON.parse(localStorage.getItem("SBG.LayoutRenames")); } catch { }
     }
@@ -1050,7 +1078,7 @@ function renderDiagnosticsTab() {
 
   const actionRow = h("div", { style: "display:flex;gap:8px;margin-bottom:16px;flex-wrap:wrap" });
 
-  // Feature 7: Refresh Gallery button
+  // Refresh Gallery button
   const diagGalleryRefreshBtn = h("button", { class: "sbg-btn sbg-btn--accent", text: "🔃 Refresh", title: "Re-fetch all items from the server and refresh the gallery view" });
   diagGalleryRefreshBtn.addEventListener("click", async () => {
     diagGalleryRefreshBtn.disabled = true;
@@ -1067,7 +1095,7 @@ function renderDiagnosticsTab() {
     }
   });
 
-  // Feature 7: Rebuild DB Index with two-click confirmation
+  // Rebuild DB Index with two-click confirmation
   const diagRefreshBtn = h("button", { class: "sbg-btn sbg-btn--accent", text: "🔄 Rebuild DB Index", title: "Rescan all roots and rebuild metadata/tag index on server" });
   let _rebuildConfirm = false;
   diagRefreshBtn.addEventListener("click", async () => {
@@ -1085,28 +1113,39 @@ function renderDiagnosticsTab() {
       await fetch("/sidebar_gallery/rebuild_index", { method: "POST" });
     } catch { }
 
-    const poll = setInterval(async () => {
-      try {
-        const r = await fetch("/sidebar_gallery/reindex_progress");
-        const p = await r.json();
-        if (p.total > 0) {
-          const pct = Math.round((p.done / p.total) * 100);
-          diagRefreshBtn.textContent = `🔄 Rebuilding DB... (${pct}%)`;
-        }
-        if (!p.running) {
-          clearInterval(poll);
-          diagRefreshBtn.textContent = "🔄 DB Indexed Successfully!";
-          setTimeout(() => {
-            diagRefreshBtn.disabled = false;
-            diagRefreshBtn.textContent = "🔄 Rebuild DB Index";
-          }, 3000);
-          // (A stray loadSubfolders() call here used to throw — it only exists
-          // inside the gallery — silently skipping both refreshes below.)
+    // Shared progress poller (same formatter as the status bar / modal).
+    // Wait for `settled` (2+ idle ticks) rather than a single !running read, so
+    // the between-roots gap of a multi-root rebuild can't end this early. A
+    // refused start (another scan already running) recovers the button instead
+    // of sitting at 0% forever.
+    let sawRunning = false;
+    let active = true;
+    const unsub = progressPoller.subscribe((data, meta) => {
+      if (!active || !data) return;
+      const e = data.full;
+      if (data.running) sawRunning = true;
+      if (e && data.running) {
+        const f = formatProgress(e);
+        diagRefreshBtn.textContent = f.pct >= 0
+          ? `🔄 Rebuilding DB... (${f.pct}%)`
+          : `🔄 Rebuilding DB... (${f.text})`;
+      }
+      if (meta.settled) {
+        active = false;
+        unsub();
+        diagRefreshBtn.textContent = sawRunning
+          ? "🔄 DB Indexed Successfully!"
+          : "Couldn't start - another scan is running";
+        setTimeout(() => {
+          diagRefreshBtn.disabled = false;
+          diagRefreshBtn.textContent = "🔄 Rebuild DB Index";
+        }, 3000);
+        if (sawRunning) {
           galleryCtx.fetchAllItems({ rescan: true });
           refreshDiagStats(diagStatsContainer);
         }
-      } catch { }
-    }, 1000);
+      }
+    });
   });
 
   const diagCacheMetaBtn = h("button", { class: "sbg-btn", text: "📦 Cache All Metadata", title: "Fetch and cache metadata summaries for all files to IndexedDB" });
@@ -1203,9 +1242,9 @@ function renderDiagnosticsTab() {
     }
     try {
       await _thumbCacheAPI.clear();
-      // Also drop the in-memory blob cache and the failed-URL blacklist —
-      // without this, "broken" thumbnails (e.g. requests that timed out
-      // during a DB rebuild) stayed broken even after clearing the cache.
+      // Also drop the in-memory blob cache and the failed-URL blacklist, so
+      // thumbnails that failed to load (e.g. requests that timed out during a
+      // DB rebuild) can be retried after the cache is cleared.
       for (const [url, blobUrl] of [..._thumbMemCache]) {
         // Don't revoke blobs still shown by a visible card.
         try {

@@ -42,9 +42,14 @@ Transcripts And ChatLogs/
 .claude/
 tests/fixtures/
 
+# Developer-only performance benchmark (local; writes JSON snapshots).
+# Already kept out of the Comfy Registry package via .comfyignore (tools/).
+tools/bench/
+
 
 # Local copies of README media (served from the media branch, not committed)
 /assets/
 
 # comfy node publish artifact
 node.zip
+.pytest_cache/
