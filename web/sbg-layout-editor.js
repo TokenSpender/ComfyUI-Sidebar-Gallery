@@ -15,7 +15,7 @@
  * server-side via the translation layer.
  */
 
-import { h, showToast, parseColor, formatColor, checkerBg } from "./sbg-core.js";
+import { h, showToast, parseColor, formatColor, checkerBg, t } from "./sbg-core.js";
 import * as TL from "./sbg-translation-layer.js";
 import { initSortable } from "./sbg-sortable.js";
 import { createColorPicker } from "./sbg-color-picker.js";
@@ -204,7 +204,7 @@ function _attachOptionsPopup(inp, getOptions) {
 function _buildCardSourceUI(obj, body, onChange, extraEl) {
   const help = "What each card represents. Choose a list → one card per entry (e.g. loras = one card per LoRA), and the fields below are read from each entry. Leave EMPTY for a single card built from the whole image. You can also type workflow_nodes.<NodeType> (e.g. workflow_nodes.KSampler).";
   const wrap = h("div", { class: "sbg-ly3-src" });
-  wrap.appendChild(h("span", { text: "Cards from:", title: help }));
+  wrap.appendChild(h("span", { text: t("le.cards_from"), title: help }));
   const inp = h("input", { type: "text", class: "sbg-gs-input sbg-gs-input--sm", placeholder: "(empty = whole image) · loras · samplers …", value: obj.source || "", title: help });
   inp.addEventListener("change", () => { obj.source = inp.value.trim() || undefined; onChange(); });
   _attachOptionsPopup(inp, () => [
@@ -224,7 +224,7 @@ function _buildCardSourceUI(obj, body, onChange, extraEl) {
 function _buildShowWhenUI(obj, body, onChange) {
   const help = "When should this tab appear? Auto = only when the data its fields mostly read from exists. Always = whenever any field has a value (old behaviour). Or type a data source (controlnet, upscaling, mmaudio, … or workflow_nodes.<NodeType>) to show it only when that exists.";
   const wrap = h("div", { class: "sbg-ly3-src" });
-  wrap.appendChild(h("span", { text: "Show when:", title: help }));
+  wrap.appendChild(h("span", { text: t("le.show_when"), title: help }));
   const auto = TL.autoAnchorFor(obj && Array.isArray(obj.params) ? obj : { params: [] });
   const inp = h("input", {
     type: "text", class: "sbg-gs-input sbg-gs-input--sm",
@@ -348,7 +348,7 @@ export function renderLayout(content, galleryCtx, closeGS) {
     topBar.appendChild(h("span", { class: "sbg-ly3-sep" }));
     const medWrap = h("div", { class: "sbg-ly3-tabs" });
     for (const med of MEDIA) {
-      const b = h("button", { class: `sbg-btn sbg-btn--sm${activeMedia === med ? " sbg-btn--primary" : ""}`, text: med === "image" ? "Images" : "Videos" });
+      const b = h("button", { class: `sbg-btn sbg-btn--sm${activeMedia === med ? " sbg-btn--primary" : ""}`, text: med === "image" ? t("le.images") : t("le.videos") });
       b.addEventListener("click", () => { activeMedia = med; _viewMemory.media = med; ensureMock(); render(); });
       medWrap.appendChild(b);
     }
@@ -356,19 +356,19 @@ export function renderLayout(content, galleryCtx, closeGS) {
 
     const actions = h("div", { class: "sbg-ly3-actions" });
     if (activeMedia === "video") {
-      const clone = h("button", { class: "sbg-btn sbg-btn--sm", text: "⇐ Clone Images" });
+      const clone = h("button", { class: "sbg-btn sbg-btn--sm", text: t("le.clone_images") });
       clone.addEventListener("click", () => {
         const src = profiles[TL.profileKey(activeApp, false)] || TL.getActiveProfile(activeApp, false);
         profiles[activeKey()] = JSON.parse(JSON.stringify(src));
-        persist(); render(); showToast("Cloned image layout to video");
+        persist(); render(); showToast(t("le.cloned"));
       });
       actions.appendChild(clone);
     }
-    const reset = h("button", { class: "sbg-btn sbg-btn--sm", text: "↺ Reset" });
+    const reset = h("button", { class: "sbg-btn sbg-btn--sm", text: t("le.reset") });
     let rc = false;
     reset.addEventListener("click", () => {
-      if (!rc) { rc = true; reset.textContent = "Sure?"; reset.classList.add("sbg-btn--danger"); setTimeout(() => { rc = false; reset.textContent = "↺ Reset"; reset.classList.remove("sbg-btn--danger"); }, 2000); return; }
-      delete profiles[activeKey()]; persist(); render(); showToast("Profile reset to default");
+      if (!rc) { rc = true; reset.textContent = t("gs.sure"); reset.classList.add("sbg-btn--danger"); setTimeout(() => { rc = false; reset.textContent = t("le.reset"); reset.classList.remove("sbg-btn--danger"); }, 2000); return; }
+      delete profiles[activeKey()]; persist(); render(); showToast(t("le.profile_reset"));
     });
     actions.appendChild(reset);
     topBar.appendChild(actions);
@@ -384,15 +384,15 @@ export function renderLayout(content, galleryCtx, closeGS) {
   // ── Left pane: editable section list + field tray ───────────────────
   function renderEditor() {
     leftPane.innerHTML = "";
-    leftPane.appendChild(h("div", { class: "sbg-ly3-hint", text: "Drag ⋮⋮ to reorder. Expand a section to edit its fields, or drag fields in from the tray below. The right pane previews your panel live." }));
+    leftPane.appendChild(h("div", { class: "sbg-ly3-hint", text: t("le.hint") }));
 
     const list = h("div", { class: "sbg-ly3-seclist" });
     leftPane.appendChild(list);
     for (const sec of activeLayout()) list.appendChild(buildSectionEditor(sec, list));
 
-    const addSec = h("button", { class: "sbg-btn sbg-btn--sm sbg-ly3-addsec", text: "+ Add Section" });
+    const addSec = h("button", { class: "sbg-btn sbg-btn--sm sbg-ly3-addsec", text: t("le.add_section") });
     addSec.addEventListener("click", () => {
-      const sec = { id: TL.uid(), title: "New Section", style: "flat", open: true, params: [] };
+      const sec = { id: TL.uid(), title: t("le.new_section"), style: "flat", open: true, params: [] };
       expanded.add(sec.id);
       activeLayout().push(sec); persist(); render();
     });
@@ -408,18 +408,18 @@ export function renderLayout(content, galleryCtx, closeGS) {
     card._section = sec;
 
     const head = h("div", { class: "sbg-ly3-sechead" });
-    const grip = h("span", { class: "sbg-grip", text: "⋮⋮", title: "Drag to reorder section" });
+    const grip = h("span", { class: "sbg-grip", text: "⋮⋮", title: t("le.drag_reorder") });
     head.appendChild(grip);
 
     const exp = h("button", { class: "sbg-ly3-exp", text: isOpen ? "▼" : "▶", title: "Expand / collapse fields" });
     exp.addEventListener("click", () => { if (isOpen) expanded.delete(sec.id); else expanded.add(sec.id); renderEditor(); });
     head.appendChild(exp);
 
-    const eye = h("button", { class: "sbg-iconbtn sbg-eyebtn" + (sec.hidden ? " sbg-iconbtn--off" : ""), title: sec.hidden ? "Hidden from panel — click to show" : "Shown in panel — click to hide", text: "👁" });
+    const eye = h("button", { class: "sbg-iconbtn sbg-eyebtn" + (sec.hidden ? " sbg-iconbtn--off" : ""), title: sec.hidden ? t("le.hidden_from_panel") : t("le.shown_in_panel"), text: "👁" });
     eye.addEventListener("click", () => { sec.hidden = !sec.hidden; persist(); render(); });
     head.appendChild(eye);
 
-    const title = h("input", { type: "text", class: "sbg-ly3-title", value: sec.title || "", placeholder: "Section title" });
+    const title = h("input", { type: "text", class: "sbg-ly3-title", value: sec.title || "", placeholder: t("le.section_title") });
     title.addEventListener("input", () => { sec.title = title.value || "Untitled"; persist(); refreshPreview(); });
     head.appendChild(title);
 
@@ -427,7 +427,7 @@ export function renderLayout(content, galleryCtx, closeGS) {
 
     // Section background / colour (e.g. green Positive, red Negative). Seeds the
     // default so the picker's Background tab shows the real current colour.
-    const secColorBtn = h("button", { class: "sbg-iconbtn", title: "Section background / colours", text: "🎨" });
+    const secColorBtn = h("button", { class: "sbg-iconbtn", title: t("le.section_colors"), text: "🎨" });
     _paintSwatch(secColorBtn, sec.color, _swatchDefaults("section", sec));
     secColorBtn.addEventListener("click", () => {
       if (!sec.color) { const d = TL.defaultSectionColor(sec); if (d) sec.color = { ...d }; }
@@ -435,16 +435,16 @@ export function renderLayout(content, galleryCtx, closeGS) {
     });
     head.appendChild(secColorBtn);
 
-    const openLbl = h("label", { class: "sbg-ly3-openlbl", title: "Expanded by default in the panel" });
+    const openLbl = h("label", { class: "sbg-ly3-openlbl", title: t("le.expanded_default") });
     const openCb = h("input", { type: "checkbox" }); openCb.checked = sec.open !== false;
     openCb.addEventListener("change", () => { sec.open = openCb.checked; persist(); refreshPreview(); });
-    openLbl.appendChild(openCb); openLbl.appendChild(document.createTextNode("open"));
+    openLbl.appendChild(openCb); openLbl.appendChild(document.createTextNode(t("le.open")));
     head.appendChild(openLbl);
 
-    const del = h("button", { class: "sbg-iconbtn sbg-iconbtn--danger", title: "Delete section", text: "🗑" });
+    const del = h("button", { class: "sbg-iconbtn sbg-iconbtn--danger", title: t("le.delete_section"), text: "🗑" });
     let dc = false;
     del.addEventListener("click", () => {
-      if (!dc) { dc = true; del.textContent = "Sure?"; setTimeout(() => { dc = false; del.textContent = "🗑"; }, 2000); return; }
+      if (!dc) { dc = true; del.textContent = t("gs.sure"); setTimeout(() => { dc = false; del.textContent = "🗑"; }, 2000); return; }
       const l = activeLayout(); const i = l.indexOf(sec); if (i >= 0) l.splice(i, 1); expanded.delete(sec.id); persist(); render();
     });
     head.appendChild(del);
@@ -462,12 +462,12 @@ export function renderLayout(content, galleryCtx, closeGS) {
       // fields), so hide the section-level source row and field list.
       if (sec.style === "cards" && !hasTabs) {
         // High/Low pairing toggle (MoE) — shown inline in the source row.
-        const hlLbl = h("label", { class: "sbg-ly3-openlbl", title: "Pair high-noise / low-noise models side-by-side (Wan2.2-style MoE)" });
+        const hlLbl = h("label", { class: "sbg-ly3-openlbl", title: t("le.pair_highlow_tip") });
         const hlCb = h("input", { type: "checkbox" });
         const autoOn = sec.highlow == null && HIGHLOW_SOURCES.has(sec.source);
         hlCb.checked = sec.highlow === true || autoOn;
         hlCb.addEventListener("change", () => { sec.highlow = hlCb.checked; persist(); refreshPreview(); });
-        hlLbl.appendChild(hlCb); hlLbl.appendChild(document.createTextNode("pair high/low"));
+        hlLbl.appendChild(hlCb); hlLbl.appendChild(document.createTextNode(t("le.pair_highlow")));
         _buildCardSourceUI(sec, body, () => { persist(); renderEditor(); refreshPreview(); }, hlLbl);
       }
 

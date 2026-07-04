@@ -22,6 +22,7 @@ import {
   PLAY_SVG, VIDEO_ICON, IMG_ICON, IMG_FILTER_ICON, SEARCH_SVG, GEAR_SVG,
   S, getSetting, getLayout,
   progressPoller, formatProgress,
+  t,
 } from "./sbg-core.js";
 
 import { SectionRegistry } from "./sbg-section-registry.js";
@@ -330,7 +331,7 @@ export function initGallery(mountEl, config) {
 
     // Root button (only shown if multiple roots)
     if (state.roots.length > 1) {
-      const rootBtn = h("button", { class: "sbg-crumb sbg-crumb--root", text: rootLabel, title: "Click to change root" });
+      const rootBtn = h("button", { class: "sbg-crumb sbg-crumb--root", text: rootLabel, title: t("gallery.click_change_root") });
       rootBtn.addEventListener("click", () => {
         const popup = h("div", { class: "sbg-crumb-popup" });
         for (const r of state.roots) {
@@ -358,11 +359,11 @@ export function initGallery(mountEl, config) {
 
     // Folder dropdown button
     if (state.subfolders.length > 0) {
-      const currentLabel = state.subfolder || "All folders";
-      const pickBtn = h("button", { class: "sbg-crumb sbg-crumb--pick", text: "📂 " + currentLabel, title: "Browse folders" });
+      const currentLabel = state.subfolder || t("gallery.all_folders");
+      const pickBtn = h("button", { class: "sbg-crumb sbg-crumb--pick", text: "📂 " + currentLabel, title: t("gallery.browse_folders") });
       pickBtn.addEventListener("click", () => {
         const popup = h("div", { class: "sbg-crumb-popup sbg-crumb-popup--folders" });
-        const allItem = h("div", { class: `sbg-crumb-popup__item${!state.subfolder ? " sbg-crumb-popup__item--active" : ""}`, text: "📁 All folders" });
+        const allItem = h("div", { class: `sbg-crumb-popup__item${!state.subfolder ? " sbg-crumb-popup__item--active" : ""}`, text: "📁 " + t("gallery.all_folders") });
         allItem.addEventListener("click", () => {
           _dataCache.folderScrollTop = popup.scrollTop;
           popup.remove();
@@ -421,31 +422,31 @@ export function initGallery(mountEl, config) {
 
   // Kind toggle buttons
   const VID_FILTER_ICON = `<svg viewBox="0 0 24 24" width="14" height="14" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><polygon points="23 7 16 12 23 17 23 7"/><rect x="1" y="5" width="15" height="14" rx="2" ry="2"/></svg>`;
-  const kindBtnAll = h("button", { class: "sbg-kind-btn sbg-kind-btn--active", text: "All", "data-kind": "", title: "Show all files" });
-  const kindBtnImg = h("button", { class: "sbg-kind-btn", html: IMG_FILTER_ICON, "data-kind": "image", title: "Images only" });
-  const kindBtnVid = h("button", { class: "sbg-kind-btn", html: VID_FILTER_ICON, "data-kind": "video", title: "Videos only" });
+  const kindBtnAll = h("button", { class: "sbg-kind-btn sbg-kind-btn--active", text: t("gallery.all"), "data-kind": "", title: t("gallery.show_all_files") });
+  const kindBtnImg = h("button", { class: "sbg-kind-btn", html: IMG_FILTER_ICON, "data-kind": "image", title: t("gallery.images_only") });
+  const kindBtnVid = h("button", { class: "sbg-kind-btn", html: VID_FILTER_ICON, "data-kind": "video", title: t("gallery.videos_only") });
   const kindGroup = h("div", { class: "sbg-kind-group" }, [kindBtnAll, kindBtnImg, kindBtnVid]);
 
-  const sortSel = h("select", { class: "sbg-select", title: "Sort order", style: "flex:0 0 auto;width:auto" }, [
-    h("option", { value: "created_desc", text: "Created ↓" }),
-    h("option", { value: "created_asc", text: "Created ↑" }),
-    h("option", { value: "modified_desc", text: "Modified ↓" }),
-    h("option", { value: "modified_asc", text: "Modified ↑" }),
-    h("option", { value: "name_asc", text: "Name ↑" }),
-    h("option", { value: "name_desc", text: "Name ↓" }),
-    h("option", { value: "size_desc", text: "Size ↓" }),
-    h("option", { value: "size_asc", text: "Size ↑" }),
+  const sortSel = h("select", { class: "sbg-select", title: t("gallery.sort_tip"), style: "flex:0 0 auto;width:auto" }, [
+    h("option", { value: "created_desc", text: t("gallery.created_desc") }),
+    h("option", { value: "created_asc", text: t("gallery.created_asc") }),
+    h("option", { value: "modified_desc", text: t("gallery.modified_desc") }),
+    h("option", { value: "modified_asc", text: t("gallery.modified_asc") }),
+    h("option", { value: "name_asc", text: t("gallery.name_asc") }),
+    h("option", { value: "name_desc", text: t("gallery.name_desc") }),
+    h("option", { value: "size_desc", text: t("gallery.size_desc") }),
+    h("option", { value: "size_asc", text: t("gallery.size_asc") }),
   ]);
   sortSel.value = state.sort;
-  const diagBtn = h("button", { class: "sbg-btn", html: GEAR_SVG, title: "Gallery Settings" });
+  const diagBtn = h("button", { class: "sbg-btn", html: GEAR_SVG, title: t("gallery.settings") });
 
   /* ── Search bar ─────────────────────────────────────────────────── */
 
-  const qInput = h("input", { class: "sbg-input", placeholder: "Search all fields… (name: for filename only)", title: "Search across all metadata fields. Press Enter to add as a tag. Use name: for filename-only, model: lora: prompt: keyword: sampler: controlnet: for specific fields" });
-  const searchClear = h("button", { class: "sbg-search-clear", text: "✕", title: "Clear search" });
+  const qInput = h("input", { class: "sbg-input", placeholder: t("gallery.search_ph"), title: t("gallery.search_tip") });
+  const searchClear = h("button", { class: "sbg-search-clear", text: "✕", title: t("gallery.clear_search") });
   // Refresh button shown in the same slot when the search is empty; swaps to the
   // clear "✕" once a query/tags are active. Rescans disk without opening Diagnostics.
-  const searchRefresh = h("button", { class: "sbg-search-refresh", text: "⟳", title: "Refresh gallery (rescan disk)" });
+  const searchRefresh = h("button", { class: "sbg-search-refresh", text: "⟳", title: t("gallery.refresh_tip") });
   searchRefresh.addEventListener("click", () => { fetchAllItems({ rescan: true }); });
   const _syncSearchBtns = () => {
     const active = state.searchTags.length > 0 || qInput.value.length > 0;
@@ -454,7 +455,7 @@ export function initGallery(mountEl, config) {
   };
   const searchTagsWrap = h("div", { class: "sbg-search-tags" });
 
-  const searchModeSel = h("select", { class: "sbg-search-mode", title: "Toggle whether tags should match ALL requirements (AND) or ANY requirement (OR)", style: "display:none;" }, [
+  const searchModeSel = h("select", { class: "sbg-search-mode", title: t("gallery.toggle_and_or"), style: "display:none;" }, [
     h("option", { value: "AND", text: "AND" }),
     h("option", { value: "OR", text: "OR" })
   ]);
@@ -571,7 +572,7 @@ export function initGallery(mountEl, config) {
 
   /* ── Status bar ─────────────────────────────────────────────────── */
 
-  const statusLeft = h("span", { class: "sbg-status__left", text: "Ready" });
+  const statusLeft = h("span", { class: "sbg-status__left", text: t("gallery.ready") });
   const statusRight = h("span", { class: "sbg-status__right" });
 
   // Auto-reindex indicator. After a restart that updated the metadata parser,
@@ -745,7 +746,7 @@ export function initGallery(mountEl, config) {
     // Search match badges
     if (it._matchedFields && state._searchMatches) {
       const _layout = getLayout();
-      const _BADGE_FALLBACK = { pos_prompt: "POSITIVE", neg_prompt: "NEGATIVE", filename: "FILENAME", keyword: "KEYWORD", app: "APP", any: "ANY" };
+      const _BADGE_FALLBACK = { pos_prompt: t("gallery.positive"), neg_prompt: t("gallery.negative"), filename: t("gallery.filename"), keyword: t("gallery.keyword"), app: "APP", any: "ANY" };
       const _searchToCanonical = {};
       for (const [name, def] of Object.entries(SectionRegistry.sectionDefs)) {
         if (def.searchField) _searchToCanonical[def.searchField] = name;
@@ -947,7 +948,7 @@ export function initGallery(mountEl, config) {
       if (state.filteredItems.length === 0) {
         _emptyMsg = h("div", { class: "sbg-empty", style: "grid-column:1/-1" }, [
           h("div", { class: "sbg-empty__icon", text: "📂" }),
-          h("div", { text: "No media found" }),
+          h("div", { text: t("gallery.no_media") }),
         ]);
         grid.appendChild(_emptyMsg);
       }
@@ -1192,7 +1193,7 @@ export function initGallery(mountEl, config) {
     const showedLoading = !rescan && rid === state.rootId;
     if (showedLoading) setLoading(true);
     if (rescan) resetFailedThumbs(); // give previously-failed thumbnails another chance
-    if (rid === state.rootId) statusLeft.textContent = rescan ? "Scanning…" : "Loading…";
+    if (rid === state.rootId) statusLeft.textContent = rescan ? t("gs.refreshing") : t("gs.loading");
     try {
       const ts = Math.max(512, thumbSize * 2);
       _dataCache._thumbSize = ts;
@@ -1265,12 +1266,12 @@ export function initGallery(mountEl, config) {
 
       if (isCurrent) {
         state.allItems = newItems;
-        statusLeft.textContent = "Ready";
+        statusLeft.textContent = t("gallery.ready");
         applyFilters();
         if (!noChange || cacheReset) renderFromScratch();
       }
     } catch (e) {
-      if (rid === state.rootId) statusLeft.textContent = `Error: ${e.message || e}`;
+      if (rid === state.rootId) statusLeft.textContent = t("lb.error", { e: e.message || e });
     } finally {
       if (showedLoading) setLoading(false);
     }
@@ -1284,14 +1285,14 @@ export function initGallery(mountEl, config) {
 
     const overlay = h("div", { class: "sbg-first-time-overlay" });
     const modal = h("div", { class: "sbg-first-time-modal" });
-    const title = h("h3", { text: "🗂️ Building Index for the First Time" });
-    const desc = h("p", { text: "This will scan all media files and parse their metadata. This may take 2-10 minutes depending on library size." });
+    const title = h("h3", { text: t("gallery.building_index") });
+    const desc = h("p", { text: t("gallery.building_desc") });
     const progressBar = h("div", { class: "sbg-progress__bar" });
     const progressFillM = h("div", { class: "sbg-progress__fill" });
     progressBar.appendChild(progressFillM);
     const progressTextM = h("span", { class: "sbg-first-time-progress", text: "" });
-    const startBtn = h("button", { class: "sbg-btn sbg-btn--primary", text: "🚀 Start Indexing" });
-    const skipBtn = h("button", { class: "sbg-btn", text: "Skip (no metadata)" });
+    const startBtn = h("button", { class: "sbg-btn sbg-btn--primary", text: t("gallery.start_indexing") });
+    const skipBtn = h("button", { class: "sbg-btn", text: t("gallery.skip_no_meta") });
 
     modal.appendChild(title);
     modal.appendChild(desc);
@@ -1590,7 +1591,7 @@ export function initGallery(mountEl, config) {
       applyFilters();
       renderFromScratch();
       document.dispatchEvent(new CustomEvent("sbg-items-updated", { detail: { items: state.filteredItems } }));
-      statusLeft.textContent = "Ready";
+      statusLeft.textContent = t("gallery.ready");
     } catch (e) {
       console.warn("[SBG] Delta refresh failed, falling back to full:", e);
       return fetchAllItems({ rescan: true, rootId: rid });

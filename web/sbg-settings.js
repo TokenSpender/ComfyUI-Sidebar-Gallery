@@ -13,6 +13,7 @@ import {
   _thumbCacheAPI, _thumbMemCache, resetFailedThumbs,
   _sectionOrderKey, S, APP_REGISTRY,
   progressPoller, formatProgress,
+  t,
 } from "./sbg-core.js";
 
 import { renderLayout, clearSwatchCache } from "./sbg-layout-editor.js";
@@ -32,16 +33,17 @@ const gsOverlay = h("div", { class: "sbg-gs-overlay" });
 const gsPanel = h("div", { class: "sbg-gs-panel" });
 
 // Header
-const gsClose = h("button", { class: "sbg-gs-close", text: "✕", title: "Close" });
+const gsClose = h("button", { class: "sbg-gs-close", text: "✕", title: t("gs.close") });
 const gsHeader = h("div", { class: "sbg-gs-header" }, [
-  h("span", { class: "sbg-gs-title", text: "⚙ Gallery Settings" }),
+  h("span", { class: "sbg-gs-title", text: t("gs.title") }),
   gsClose,
 ]);
 
-// Tab bar
-const TAB_NAMES = ["Layout", "Appearance", "Keybindings", "Settings", "Presets", "Diagnostics"];
-const tabBtns = TAB_NAMES.map(name =>
-  h("button", { class: "sbg-gs-tab", text: name, "data-tab": name.toLowerCase() })
+// Tab bar — separate IDs (stable) from display names (translated)
+const TAB_IDS = ["layout", "appearance", "keybindings", "settings", "presets", "diagnostics"];
+const TAB_LABELS = [t("gs.tab_layout"), t("gs.tab_appearance"), t("gs.tab_keybindings"), t("gs.tab_settings"), t("gs.tab_presets"), t("gs.tab_diagnostics")];
+const tabBtns = TAB_IDS.map((id, i) =>
+  h("button", { class: "sbg-gs-tab", text: TAB_LABELS[i], "data-tab": id })
 );
 const tabBar = h("div", { class: "sbg-gs-tabs" }, tabBtns);
 const content = h("div", { class: "sbg-gs-content" });
@@ -90,7 +92,7 @@ async function refreshDiagStats(diagStatsContainer) {
 
     const indexInfo = st.index || {};
     const counts = indexInfo.counts || st.index || {};
-    const indexTitle = h("div", { class: "sbg-diag-section__title", text: "SQLite Index", title: "Server-side SQLite database that stores the file listing and parsed metadata summaries for fast gallery loading without disk scanning" });
+    const indexTitle = h("div", { class: "sbg-diag-section__title", text: t("gs.sqlite_index"), title: t("gs.sqlite_index_tip") });
     diagStatsContainer.appendChild(indexTitle);
 
     const countsObj = typeof counts === "object" && !Array.isArray(counts) ? counts : {};
@@ -98,19 +100,19 @@ async function refreshDiagStats(diagStatsContainer) {
       if (rid === "db_path" || rid === "db_size_mb" || rid === "counts") continue;
       diagStatsContainer.appendChild(h("div", { class: "sbg-diag-stat" }, [
         h("span", { class: "sbg-diag-stat__label", text: rid }),
-        h("span", { class: "sbg-diag-stat__value", text: Number(count).toLocaleString() + " files" }),
+        h("span", { class: "sbg-diag-stat__value", text: Number(count).toLocaleString() + t("gs.files") }),
       ]));
     }
 
     if (indexInfo.db_path) {
-      diagStatsContainer.appendChild(h("div", { class: "sbg-diag-stat", title: "Full filesystem path of the SQLite database file" }, [
-        h("span", { class: "sbg-diag-stat__label", text: "DB Path" }),
+      diagStatsContainer.appendChild(h("div", { class: "sbg-diag-stat", title: t("gs.db_path_tip") }, [
+        h("span", { class: "sbg-diag-stat__label", text: t("gs.db_path") }),
         h("span", { class: "sbg-diag-stat__value sbg-diag-stat__value--path", text: indexInfo.db_path }),
       ]));
     }
     if (indexInfo.db_size_mb !== undefined) {
-      diagStatsContainer.appendChild(h("div", { class: "sbg-diag-stat", title: "Size of the SQLite database file on disk" }, [
-        h("span", { class: "sbg-diag-stat__label", text: "DB Size" }),
+      diagStatsContainer.appendChild(h("div", { class: "sbg-diag-stat", title: t("gs.db_size_tip") }, [
+        h("span", { class: "sbg-diag-stat__label", text: t("gs.db_size") }),
         h("span", { class: "sbg-diag-stat__value", text: `${indexInfo.db_size_mb} MB` }),
       ]));
     }
@@ -131,23 +133,23 @@ async function refreshDiagStats(diagStatsContainer) {
       }
     } catch { }
 
-    diagStatsContainer.appendChild(h("div", { class: "sbg-diag-section__title", text: "Server Thumbnails", title: "JPEG thumbnails generated and stored on the server in the .thumbs folder. Shared across all browsers/clients. No in-memory cache - served directly from disk on each request.", style: "margin-top:10px" }));
-    diagStatsContainer.appendChild(h("div", { class: "sbg-diag-stat" }, [h("span", { class: "sbg-diag-stat__label", text: "Count" }), h("span", { class: "sbg-diag-stat__value", text: (st.thumbnails?.count || 0).toLocaleString() })]));
-    diagStatsContainer.appendChild(h("div", { class: "sbg-diag-stat" }, [h("span", { class: "sbg-diag-stat__label", text: "Size" }), h("span", { class: "sbg-diag-stat__value", text: `${st.thumbnails?.size_mb || 0} MB` })]));
+    diagStatsContainer.appendChild(h("div", { class: "sbg-diag-section__title", text: t("gs.server_thumbs"), title: t("gs.server_thumbs_tip"), style: "margin-top:10px" }));
+    diagStatsContainer.appendChild(h("div", { class: "sbg-diag-stat" }, [h("span", { class: "sbg-diag-stat__label", text: t("gs.count") }), h("span", { class: "sbg-diag-stat__value", text: (st.thumbnails?.count || 0).toLocaleString() })]));
+    diagStatsContainer.appendChild(h("div", { class: "sbg-diag-stat" }, [h("span", { class: "sbg-diag-stat__label", text: t("gs.size") }), h("span", { class: "sbg-diag-stat__value", text: `${st.thumbnails?.size_mb || 0} MB` })]));
 
-    diagStatsContainer.appendChild(h("div", { class: "sbg-diag-section__title", text: "Browser Thumb Cache", title: "Thumbnails cached in this browser's IndexedDB for instant loading without server requests.", style: "margin-top:10px" }));
+    diagStatsContainer.appendChild(h("div", { class: "sbg-diag-section__title", text: t("gs.browser_thumb_cache"), title: t("gs.browser_thumb_tip"), style: "margin-top:10px" }));
     const _tcCountEl = h("span", { class: "sbg-diag-stat__value", text: "…" });
     const _tcSizeEl = h("span", { class: "sbg-diag-stat__value", text: "…" });
-    diagStatsContainer.appendChild(h("div", { class: "sbg-diag-stat" }, [h("span", { class: "sbg-diag-stat__label", text: "Cached" }), _tcCountEl]));
-    diagStatsContainer.appendChild(h("div", { class: "sbg-diag-stat" }, [h("span", { class: "sbg-diag-stat__label", text: "Size" }), _tcSizeEl]));
+    diagStatsContainer.appendChild(h("div", { class: "sbg-diag-stat" }, [h("span", { class: "sbg-diag-stat__label", text: t("gs.cached") }), _tcCountEl]));
+    diagStatsContainer.appendChild(h("div", { class: "sbg-diag-stat" }, [h("span", { class: "sbg-diag-stat__label", text: t("gs.size") }), _tcSizeEl]));
 
-    diagStatsContainer.appendChild(h("div", { class: "sbg-diag-section__title", text: "Browser Meta Cache", title: "Parsed metadata summaries cached in IndexedDB and in-memory.", style: "margin-top:10px" }));
+    diagStatsContainer.appendChild(h("div", { class: "sbg-diag-section__title", text: t("gs.browser_meta_cache"), title: t("gs.browser_meta_tip"), style: "margin-top:10px" }));
     const _mcCountEl = h("span", { class: "sbg-diag-stat__value", text: "…" });
     const _mcSizeEl = h("span", { class: "sbg-diag-stat__value", text: "…" });
     const _mcMemEl = h("span", { class: "sbg-diag-stat__value", text: `${_metaCache.size} entries` });
-    diagStatsContainer.appendChild(h("div", { class: "sbg-diag-stat" }, [h("span", { class: "sbg-diag-stat__label", text: "IndexedDB" }), _mcCountEl]));
-    diagStatsContainer.appendChild(h("div", { class: "sbg-diag-stat" }, [h("span", { class: "sbg-diag-stat__label", text: "Size" }), _mcSizeEl]));
-    diagStatsContainer.appendChild(h("div", { class: "sbg-diag-stat", title: "Metadata entries in JS memory for this session" }, [h("span", { class: "sbg-diag-stat__label", text: "In-memory" }), _mcMemEl]));
+    diagStatsContainer.appendChild(h("div", { class: "sbg-diag-stat" }, [h("span", { class: "sbg-diag-stat__label", text: t("gs.indexed_db") }), _mcCountEl]));
+    diagStatsContainer.appendChild(h("div", { class: "sbg-diag-stat" }, [h("span", { class: "sbg-diag-stat__label", text: t("gs.size") }), _mcSizeEl]));
+    diagStatsContainer.appendChild(h("div", { class: "sbg-diag-stat", title: t("gs.in_memory_tip") }, [h("span", { class: "sbg-diag-stat__label", text: t("gs.in_memory") }), _mcMemEl]));
 
     Promise.all([_thumbCacheAPI.getStats(), _metaCacheAPI.getStats()]).then(([ts, ms]) => {
       _tcCountEl.textContent = `${ts.count.toLocaleString()} thumbs`;
@@ -325,7 +327,7 @@ function _numberInput(id, fallback, label, tooltip) {
 function renderAppearance() {
   content.innerHTML = "";
   const wrap = h("div", { class: "sbg-gs-form" });
-  wrap.appendChild(h("div", { class: "sbg-gs-section-title", text: "Badge Colors" }));
+  wrap.appendChild(h("div", { class: "sbg-gs-section-title", text: t("gs.badge_colors") }));
 
   // Helper: create a live preview badge chip
   function _badgePreview(text, color) {
@@ -369,7 +371,7 @@ function renderAppearance() {
   wrap.appendChild(negRow);
 
   // Search Highlight with live preview
-  wrap.appendChild(h("div", { class: "sbg-gs-section-title", text: "Highlight Color", style: "margin-top:16px" }));
+  wrap.appendChild(h("div", { class: "sbg-gs-section-title", text: t("gs.highlight_color"), style: "margin-top:16px" }));
   const hlColor = localStorage.getItem("SBG.GS.HighlightBg") || "rgba(250, 204, 21, 0.35)";
   const hlSample = h("span", { text: "Highlight", style: `background:${hlColor};padding:1px 4px;border-radius:2px;` });
   const hlRow = _colorInput("HighlightBg", "rgba(250, 204, 21, 0.35)", "", "Background color for search match highlighting in metadata panel", (c) => {
@@ -381,11 +383,11 @@ function renderAppearance() {
   if (hlLabel) { hlLabel.innerHTML = "Search "; hlLabel.appendChild(hlSample); }
   wrap.appendChild(hlRow);
 
-  wrap.appendChild(h("div", { class: "sbg-gs-section-title", text: "Theme", style: "margin-top:16px" }));
+  wrap.appendChild(h("div", { class: "sbg-gs-section-title", text: t("gs.theme"), style: "margin-top:16px" }));
 
   const customWrap = h("div", { class: "sbg-gs-form sbg-gs-custom-theme", style: _readSetting(S.THEME, "comfyui") === "custom" ? "display:block; margin-top:10px; padding:10px; background:rgba(0,0,0,0.15); border-radius:5px; border:1px solid var(--sbg-border)" : "display:none" });
 
-  wrap.appendChild(_comboInput(S.THEME, "comfyui", ["comfyui", "dark", "blue", "midnight", "synthwave", "retro", "custom"], "Gallery Theme", "Color theme for the gallery sidebar", (val) => {
+  wrap.appendChild(_comboInput(S.THEME, "comfyui", ["comfyui", "dark", "blue", "midnight", "synthwave", "retro", "custom"], t("gs.gallery_theme"), t("gs.gallery_theme_tip"), (val) => {
     const rootEl = document.querySelector(".sbg-root");
     if (rootEl) {
       if (val !== "comfyui") rootEl.setAttribute("data-theme", val);
@@ -408,18 +410,18 @@ function renderAppearance() {
     customWrap.style.display = val === "custom" ? "block" : "none";
   }));
 
-  customWrap.appendChild(h("div", { class: "sbg-gs-desc", text: "Configure your own custom UI colors." }));
+  customWrap.appendChild(h("div", { class: "sbg-gs-desc", text: t("gs.custom_theme_desc") }));
   const applyVar = (v, c) => { if (_readSetting(S.THEME, "comfyui") === "custom") document.querySelector(".sbg-root")?.style.setProperty(v, c); };
-  customWrap.appendChild(_colorInput("CUSTOM_BG", "#1a1a1a", "Background", "Base background color", (c) => applyVar("--sbg-bg", c)));
-  customWrap.appendChild(_colorInput("CUSTOM_SURFACE", "#222222", "Surface", "Surface background color", (c) => applyVar("--sbg-surface", c)));
-  customWrap.appendChild(_colorInput("CUSTOM_BORDER", "#444444", "Border elements", "Borders and dividers", (c) => applyVar("--sbg-border", c)));
-  customWrap.appendChild(_colorInput("CUSTOM_TEXT", "#e0e0e0", "Text", "Main text color", (c) => applyVar("--sbg-text", c)));
-  customWrap.appendChild(_colorInput("CUSTOM_ACCENT", "#7c6aef", "Accent", "Primary accent color", (c) => applyVar("--sbg-accent", c)));
+  customWrap.appendChild(_colorInput("CUSTOM_BG", "#1a1a1a", t("gs.background"), "Base background color", (c) => applyVar("--sbg-bg", c)));
+  customWrap.appendChild(_colorInput("CUSTOM_SURFACE", "#222222", t("gs.surface"), "Surface background color", (c) => applyVar("--sbg-surface", c)));
+  customWrap.appendChild(_colorInput("CUSTOM_BORDER", "#444444", t("gs.border"), "Borders and dividers", (c) => applyVar("--sbg-border", c)));
+  customWrap.appendChild(_colorInput("CUSTOM_TEXT", "#e0e0e0", t("gs.text"), "Main text color", (c) => applyVar("--sbg-text", c)));
+  customWrap.appendChild(_colorInput("CUSTOM_ACCENT", "#7c6aef", t("gs.accent"), "Primary accent color", (c) => applyVar("--sbg-accent", c)));
   wrap.appendChild(customWrap);
 
   // Lightbox Button Colors with live preview buttons
-  wrap.appendChild(h("div", { class: "sbg-gs-section-title", text: "Lightbox Button Colors", style: "margin-top:16px" }));
-  wrap.appendChild(h("div", { class: "sbg-gs-desc", text: "Leave blank for default colors." }));
+  wrap.appendChild(h("div", { class: "sbg-gs-section-title", text: t("gs.lb_btn_colors"), style: "margin-top:16px" }));
+  wrap.appendChild(h("div", { class: "sbg-gs-desc", text: t("gs.lb_btn_colors_desc") }));
 
   function _btnPreview(text, color) {
     return h("span", { text, style: `display:inline-block;padding:3px 8px;border-radius:6px;font-size:10px;font-weight:500;color:#fff;background:${color || "var(--sbg-accent,#7c6aef)"};cursor:default;` });
@@ -454,8 +456,8 @@ function renderAppearance() {
   wrap.appendChild(lwRow);
 
   // App Badge Colors
-  wrap.appendChild(h("div", { class: "sbg-gs-section-title", text: "App Badge Colors", style: "margin-top:16px" }));
-  wrap.appendChild(h("div", { class: "sbg-gs-desc", text: "Customize the color of each source application badge. Leave blank for defaults." }));
+  wrap.appendChild(h("div", { class: "sbg-gs-section-title", text: t("gs.app_badge_colors"), style: "margin-top:16px" }));
+  wrap.appendChild(h("div", { class: "sbg-gs-desc", text: t("gs.app_badge_desc") }));
 
   // Rows derive from the single app registry in sbg-core.js, so the preview here,
   // the boot-time CSS vars, and the lightbox badge all read the same defaults.
@@ -478,7 +480,7 @@ function renderAppearance() {
   }
 
   // Initial Image Tab Color
-  wrap.appendChild(h("div", { class: "sbg-gs-section-title", text: "Initial Image Tab", style: "margin-top:16px" }));
+  wrap.appendChild(h("div", { class: "sbg-gs-section-title", text: t("gs.initial_image_tab"), style: "margin-top:16px" }));
   const initTabBadge = _badgePreview("Initial Image", _readSetting(S.INITIAL_IMAGE_TAB_COLOR, "") || "#94a3b8");
   const initTabRow = _colorInput(S.INITIAL_IMAGE_TAB_COLOR, "#94a3b8", "", "Color for the Initial Image tab button in the lightbox metadata panel", (c) => {
     initTabBadge.style.background = c || "#94a3b8";
@@ -488,28 +490,28 @@ function renderAppearance() {
   wrap.appendChild(initTabRow);
 
   // Pill/Badge Colors
-  wrap.appendChild(h("div", { class: "sbg-gs-section-title", text: "Pill / Badge Colors", style: "margin-top:16px" }));
-  wrap.appendChild(h("div", { class: "sbg-gs-desc", text: "Customize the color of metadata pills and badges. Leave empty for defaults." }));
+  wrap.appendChild(h("div", { class: "sbg-gs-section-title", text: t("gs.pill_colors"), style: "margin-top:16px" }));
+  wrap.appendChild(h("div", { class: "sbg-gs-desc", text: t("gs.pill_colors_desc") }));
   const pillPreview = _badgePreview("Example Pill", _readSetting(S.PILL_BG_COLOR, "") || "rgba(255,255,255,0.06)");
   pillPreview.style.color = _readSetting(S.PILL_TEXT_COLOR, "") || "rgba(255,255,255,0.8)";
   pillPreview.style.border = `1px solid ${_readSetting(S.PILL_BORDER_COLOR, "") || "rgba(255,255,255,0.08)"}`;
-  const pillBgRow = _colorInput(S.PILL_BG_COLOR, "rgba(255,255,255,0.06)", "Background", "Pill background color", (c) => {
+  const pillBgRow = _colorInput(S.PILL_BG_COLOR, "rgba(255,255,255,0.06)", t("gs.pill_bg"), "Pill background color", (c) => {
     pillPreview.style.background = c || "rgba(255,255,255,0.06)";
     if (c) document.documentElement.style.setProperty("--sbg-pill-bg", c);
     else document.documentElement.style.removeProperty("--sbg-pill-bg");
   }, "bg");
-  const pillTextRow = _colorInput(S.PILL_TEXT_COLOR, "rgba(255,255,255,0.8)", "Text", "Pill text color", (c) => {
+  const pillTextRow = _colorInput(S.PILL_TEXT_COLOR, "rgba(255,255,255,0.8)", t("gs.pill_text"), "Pill text color", (c) => {
     pillPreview.style.color = c || "rgba(255,255,255,0.8)";
     if (c) document.documentElement.style.setProperty("--sbg-pill-text", c);
     else document.documentElement.style.removeProperty("--sbg-pill-text");
   }, "text");
-  const pillBorderRow = _colorInput(S.PILL_BORDER_COLOR, "rgba(255,255,255,0.08)", "Border", "Pill border color", (c) => {
+  const pillBorderRow = _colorInput(S.PILL_BORDER_COLOR, "rgba(255,255,255,0.08)", t("gs.pill_border"), "Pill border color", (c) => {
     pillPreview.style.border = `1px solid ${c || "rgba(255,255,255,0.08)"}`;
     if (c) document.documentElement.style.setProperty("--sbg-pill-border", c);
     else document.documentElement.style.removeProperty("--sbg-pill-border");
   }, "border");
   const pillPreviewRow = h("div", { style: "display:flex;align-items:center;gap:8px;margin-bottom:8px" });
-  pillPreviewRow.appendChild(h("span", { class: "sbg-gs-label", text: "Preview:", style: "font-size:11px;opacity:0.6" }));
+  pillPreviewRow.appendChild(h("span", { class: "sbg-gs-label", text: t("gs.preview"), style: "font-size:11px;opacity:0.6" }));
   pillPreviewRow.appendChild(pillPreview);
   wrap.appendChild(pillPreviewRow);
   wrap.appendChild(pillBgRow);
@@ -522,22 +524,22 @@ function renderAppearance() {
 function renderKeybindings() {
   content.innerHTML = "";
   const wrap = h("div", { class: "sbg-gs-form" });
-  wrap.appendChild(h("div", { class: "sbg-gs-section-title", text: "Keyboard Shortcuts" }));
-  wrap.appendChild(h("div", { class: "sbg-gs-desc", text: "Comma-separated key names. Example: ArrowLeft,a" }));
-  wrap.appendChild(_textInput(S.KEY_PREV, "ArrowLeft,a", "Previous Image", "Keys for previous image in lightbox"));
-  wrap.appendChild(_textInput(S.KEY_NEXT, "ArrowRight,d", "Next Image", "Keys for next image in lightbox"));
-  wrap.appendChild(_textInput(S.KEY_CLOSE, "Escape", "Close Lightbox", "Key to close lightbox"));
-  wrap.appendChild(_textInput(S.KEY_TOGGLE, "z,0", "Toggle Gallery", "Keys to open/close the gallery sidebar"));
-  wrap.appendChild(_textInput(S.KEY_REFRESH, "", "Refresh Gallery", "Key to refresh gallery (leave empty to disable)"));
+  wrap.appendChild(h("div", { class: "sbg-gs-section-title", text: t("gs.kb_title") }));
+  wrap.appendChild(h("div", { class: "sbg-gs-desc", text: t("gs.kb_desc") }));
+  wrap.appendChild(_textInput(S.KEY_PREV, "ArrowLeft,a", t("gs.kb_prev"), "Keys for previous image in lightbox"));
+  wrap.appendChild(_textInput(S.KEY_NEXT, "ArrowRight,d", t("gs.kb_next"), "Keys for next image in lightbox"));
+  wrap.appendChild(_textInput(S.KEY_CLOSE, "Escape", t("gs.kb_close"), "Key to close lightbox"));
+  wrap.appendChild(_textInput(S.KEY_TOGGLE, "z,0", t("gs.kb_toggle"), "Keys to open/close the gallery sidebar"));
+  wrap.appendChild(_textInput(S.KEY_REFRESH, "", t("gs.kb_refresh"), "Key to refresh gallery (leave empty to disable)"));
 
-  wrap.appendChild(h("div", { class: "sbg-gs-section-title", text: "Lightbox Actions", style: "margin-top:16px" }));
-  wrap.appendChild(_textInput(S.KEY_FULLSCREEN, "f", "Fullscreen", "Toggle fullscreen in lightbox"));
-  wrap.appendChild(_textInput(S.KEY_DOWNLOAD, "", "Download", "Download current file (leave empty to disable)"));
-  wrap.appendChild(_textInput(S.KEY_COPY_PROMPT, "", "Copy Prompt", "Copy positive prompt (leave empty to disable)"));
-  wrap.appendChild(_textInput(S.KEY_COPY_WF, "", "Copy Workflow", "Copy workflow JSON (leave empty to disable)"));
-  wrap.appendChild(_textInput(S.KEY_LOAD_WF, "", "Load Workflow", "Load workflow into ComfyUI (leave empty to disable)"));
+  wrap.appendChild(h("div", { class: "sbg-gs-section-title", text: t("gs.lb_actions"), style: "margin-top:16px" }));
+  wrap.appendChild(_textInput(S.KEY_FULLSCREEN, "f", t("gs.kb_fullscreen"), "Toggle fullscreen in lightbox"));
+  wrap.appendChild(_textInput(S.KEY_DOWNLOAD, "", t("gs.kb_download"), "Download current file (leave empty to disable)"));
+  wrap.appendChild(_textInput(S.KEY_COPY_PROMPT, "", t("gs.kb_copy_prompt"), "Copy positive prompt (leave empty to disable)"));
+  wrap.appendChild(_textInput(S.KEY_COPY_WF, "", t("gs.kb_copy_wf"), "Copy workflow JSON (leave empty to disable)"));
+  wrap.appendChild(_textInput(S.KEY_LOAD_WF, "", t("gs.kb_load_wf"), "Load workflow into ComfyUI (leave empty to disable)"));
 
-  wrap.appendChild(h("div", { class: "sbg-gs-desc", text: "Note: Arrows seek video in fullscreen. A/D always navigate." }));
+  wrap.appendChild(h("div", { class: "sbg-gs-desc", text: t("gs.kb_note") }));
   content.appendChild(wrap);
 }
 
@@ -545,10 +547,10 @@ function renderSettings() {
   content.innerHTML = "";
   const wrap = h("div", { class: "sbg-gs-form" });
 
-  wrap.appendChild(h("div", { class: "sbg-gs-section-title", text: "Gallery" }));
-  wrap.appendChild(_numberInput(S.THUMB_SIZE, 110, "Thumbnail Size (px)", "Size of thumbnail grid cells (64-256). Only used when Items Per Row is 'auto' - it decides how many columns fit."));
-  wrap.appendChild(_comboInput(S.THUMB_PER_ROW, "auto", ["auto", "1", "2", "3", "4", "5", "6", "8", "10"], "Items Per Row", "auto = fit as many as the Thumbnail Size allows. A number = ALWAYS that many per row; thumbnails are sized to fill the row based on their aspect ratios. Reopen the gallery to apply."));
-  wrap.appendChild(_comboInput(S.THUMB_SHAPE, "square", ["square", "ar"], "Thumbnail Shape", "Square crops; AR preserves aspect ratio"));
+  wrap.appendChild(h("div", { class: "sbg-gs-section-title", text: t("gs.gallery_section") }));
+  wrap.appendChild(_numberInput(S.THUMB_SIZE, 110, t("gs.thumb_size"), t("gs.thumb_size_tip")));
+  wrap.appendChild(_comboInput(S.THUMB_PER_ROW, "auto", ["auto", "1", "2", "3", "4", "5", "6", "8", "10"], t("gs.items_per_row"), t("gs.items_per_row_tip")));
+  wrap.appendChild(_comboInput(S.THUMB_SHAPE, "square", ["square", "ar"], t("gs.thumb_shape"), t("gs.thumb_shape_tip")));
   // Normalize a legacy stored sort value so the combo shows the right selection.
   {
     const _sortAlias = { newest: "created_desc", oldest: "created_asc" };
@@ -557,8 +559,8 @@ function renderSettings() {
   }
   wrap.appendChild(_comboInput(S.SORT, "created_desc",
     ["created_desc", "created_asc", "modified_desc", "modified_asc", "name_asc", "name_desc", "size_desc", "size_asc"],
-    "Default Sort", "Default sort order for gallery items (matches the gallery's sort menu)"));
-  wrap.appendChild(_numberInput(S.VSCROLL_BUFFER, 8, "Scroll Buffer (rows)", "Extra rows pre-rendered above/below viewport (2-30). Higher = less blank space on fast scroll, but more DOM nodes."));
+    t("gs.default_sort"), t("gs.default_sort_tip")));
+  wrap.appendChild(_numberInput(S.VSCROLL_BUFFER, 8, t("gs.scroll_buffer"), t("gs.scroll_buffer_tip")));
 
   // Shared config helpers, defined before the first server-backed row so it can
   // call them directly. _postConfig checks the response, so a failed save
@@ -592,9 +594,9 @@ function renderSettings() {
         const cfg = await _postConfig({ auto_refresh_interval_s: n });
         const eff = (cfg && typeof cfg.auto_refresh_interval_s === "number") ? cfg.auto_refresh_interval_s : n;
         arInput.value = String(eff);
-        if (eff <= 0) showToast("Auto-refresh timer off (still checks when you return)");
-        else if (eff !== n) showToast(`Auto-refresh every ${eff}s (5s minimum)`);
-        else showToast(`Auto-refresh every ${eff}s`);
+        if (eff <= 0) showToast(t("lb.loading_wf") + " - " + t("gs.auto_refresh"));
+        else if (eff !== n) showToast(t("gs.auto_refresh") + ` ${eff}s (5s minimum)`);
+        else showToast(t("gs.auto_refresh") + ` ${eff}s`);
         if (galleryCtx.refreshConfig) await galleryCtx.refreshConfig();
       } catch (e) {
         arInput.value = String(n);
@@ -602,34 +604,34 @@ function renderSettings() {
       }
       finally { arBusy = false; }
     });
-    wrap.appendChild(_settingRow("Auto-refresh interval", arInput,
-      "How often the open gallery checks for files added, removed, or renamed on disk (minimum 5s). 0 turns off the background timer; the gallery still checks once when you come back to it. Applies right away."));
+    wrap.appendChild(_settingRow(t("gs.auto_refresh"), arInput,
+      t("gs.auto_refresh_tip")));
   }
 
-  wrap.appendChild(h("div", { class: "sbg-gs-section-title", text: "Tooltips", style: "margin-top:16px" }));
-  wrap.appendChild(_toggle(S.TOOLTIP_NAME, true, "Show Filename", "Show filename in card tooltip"));
-  wrap.appendChild(_toggle(S.TOOLTIP_SIZE, true, "Show File Size", "Show file size in card tooltip"));
-  wrap.appendChild(_toggle(S.TOOLTIP_DATE, true, "Show Date", "Show date in card tooltip"));
+  wrap.appendChild(h("div", { class: "sbg-gs-section-title", text: t("gs.tooltips"), style: "margin-top:16px" }));
+  wrap.appendChild(_toggle(S.TOOLTIP_NAME, true, t("gs.show_filename"), t("gs.show_filename_tip")));
+  wrap.appendChild(_toggle(S.TOOLTIP_SIZE, true, t("gs.show_filesize"), t("gs.show_filesize_tip")));
+  wrap.appendChild(_toggle(S.TOOLTIP_DATE, true, t("gs.show_date"), t("gs.show_date_tip")));
 
-  wrap.appendChild(h("div", { class: "sbg-gs-section-title", text: "Lightbox Buttons", style: "margin-top:16px" }));
-  wrap.appendChild(h("div", { class: "sbg-gs-desc", text: "Show or hide individual buttons in the lightbox toolbar." }));
-  wrap.appendChild(_toggle(S.LB_SHOW_DOWNLOAD, true, "Download Button", "Show download button in lightbox"));
-  wrap.appendChild(_toggle(S.LB_SHOW_COPY_PROMPT, true, "Copy Prompt Button", "Show copy prompt button in lightbox"));
-  wrap.appendChild(_toggle(S.LB_SHOW_COPY_WF, true, "Copy WF Button", "Show copy workflow button in lightbox"));
-  wrap.appendChild(_toggle(S.LB_SHOW_LOAD_WF, true, "Load Workflow Button", "Show load workflow button in lightbox"));
+  wrap.appendChild(h("div", { class: "sbg-gs-section-title", text: t("gs.lb_buttons"), style: "margin-top:16px" }));
+  wrap.appendChild(h("div", { class: "sbg-gs-desc", text: t("gs.lb_buttons_desc") }));
+  wrap.appendChild(_toggle(S.LB_SHOW_DOWNLOAD, true, t("gs.dl_button"), t("gs.dl_button_tip")));
+  wrap.appendChild(_toggle(S.LB_SHOW_COPY_PROMPT, true, t("gs.cp_button"), t("gs.cp_button_tip")));
+  wrap.appendChild(_toggle(S.LB_SHOW_COPY_WF, true, t("gs.cwf_button"), t("gs.cwf_button_tip")));
+  wrap.appendChild(_toggle(S.LB_SHOW_LOAD_WF, true, t("gs.lwf_button"), t("gs.lwf_button_tip")));
 
-  wrap.appendChild(h("div", { class: "sbg-gs-section-title", text: "Metadata", style: "margin-top:16px" }));
-  wrap.appendChild(_comboInput(S.PROMPT_VIEW, "remember", ["enhanced", "initial", "remember"], "Default Tab View", "Which tab opens first in tabbed sections. For prompt sections this picks Enhanced or Original; 'Remember' keeps your last-opened tab on every tabbed section."));
-  wrap.appendChild(_comboInput(S.PROMPT_PADDING, "6", ["0", "1", "2", "3", "4", "5", "6", "8", "10", "12"], "Prompt Padding", "Horizontal padding inside prompt text boxes (in px); top/bottom run 2px tighter.", (v) => {
+  wrap.appendChild(h("div", { class: "sbg-gs-section-title", text: t("gs.metadata"), style: "margin-top:16px" }));
+  wrap.appendChild(_comboInput(S.PROMPT_VIEW, "remember", ["enhanced", "initial", "remember"], t("gs.default_tab_view"), t("gs.default_tab_view_tip")));
+  wrap.appendChild(_comboInput(S.PROMPT_PADDING, "6", ["0", "1", "2", "3", "4", "5", "6", "8", "10", "12"], t("gs.prompt_padding"), t("gs.prompt_padding_tip"), (v) => {
     document.documentElement.style.setProperty("--sbg-prompt-padding", v + "px");
   }));
-  wrap.appendChild(_comboInput(S.FILENAME_STYLE, "basename", ["basename", "relpath"], "Filename Display", "Show just the filename or the full relative path in File Info."));
-  wrap.appendChild(_comboInput(S.MODEL_NAME_STYLE, "basename", ["basename", "relpath"], "Model Display", "Show model and LoRA names as just the filename (basename) or the full relative path."));
-  wrap.appendChild(_toggle(S.META_TAB_PERSIST, false, "Remember Metadata Tab", "Keep the active metadata tab (Generated/Initial Image) when navigating between images."));
+  wrap.appendChild(_comboInput(S.FILENAME_STYLE, "basename", ["basename", "relpath"], t("gs.filename_display"), t("gs.filename_display_tip")));
+  wrap.appendChild(_comboInput(S.MODEL_NAME_STYLE, "basename", ["basename", "relpath"], t("gs.model_display"), t("gs.model_display_tip")));
+  wrap.appendChild(_toggle(S.META_TAB_PERSIST, false, t("gs.remember_tab"), t("gs.remember_tab_tip")));
 
   // ── Folders: extra media roots shown in the folder picker and indexed ──
-  wrap.appendChild(h("div", { class: "sbg-gs-section-title", text: "Folders", style: "margin-top:16px" }));
-  wrap.appendChild(h("div", { class: "sbg-gs-desc", text: "Extra folders to browse and index alongside ComfyUI's output folder. Paths are on the machine running ComfyUI." }));
+  wrap.appendChild(h("div", { class: "sbg-gs-section-title", text: t("gs.folders"), style: "margin-top:16px" }));
+  wrap.appendChild(h("div", { class: "sbg-gs-desc", text: t("gs.folders_desc") }));
   const foldersList = h("div", {});
   wrap.appendChild(foldersList);
 
@@ -643,11 +645,11 @@ function renderSettings() {
       el.appendChild(h("span", { class: "sbg-gs-label", text: label, title: sub || "" }));
       if (sub) el.appendChild(h("span", { style: "opacity:.55;font-size:11px;overflow:hidden;text-overflow:ellipsis;white-space:nowrap;max-width:50%", text: sub }));
       if (removeRaw != null) {
-        const del = h("button", { class: "sbg-iconbtn sbg-iconbtn--danger", text: "🗑", title: "Remove this folder from the gallery (files on disk are not touched)" });
+        const del = h("button", { class: "sbg-iconbtn sbg-iconbtn--danger", text: "🗑", title: t("gs.remove_folder_tip") });
         del.addEventListener("click", async () => {
           try {
             await _postRoots((cfg.extra_roots || []).filter(p => p !== removeRaw));
-            showToast("Folder removed");
+            showToast(t("gs.folder_removed"));
             if (galleryCtx.refreshConfig) await galleryCtx.refreshConfig();
             _renderFolders();
           } catch (e) { showToast("Failed to remove folder: " + (e?.message || e)); }
@@ -658,7 +660,7 @@ function renderSettings() {
       }
       return el;
     };
-    foldersList.appendChild(row("Output", "ComfyUI's output folder", null));
+    foldersList.appendChild(row(t("gs.output"), t("gs.output_desc"), null));
     for (const p of cfg.extra_roots || []) foldersList.appendChild(row(p.split(/[\\/]/).pop() || p, p, p));
 
     const addWrap = h("div", { class: "sbg-gs-row", style: "align-items:center;gap:6px" });
@@ -670,8 +672,8 @@ function renderSettings() {
       try {
         const res = await _postRoots([...(cfg.extra_roots || []), p]);
         const added = (res.extra_roots || []).length > (cfg.extra_roots || []).length;
-        if (!added) { showToast("Folder not added - check the path exists on the ComfyUI machine"); return; }
-        showToast("Folder added - it will be indexed when you open it");
+        if (!added) { showToast(t("gs.folder_not_added")); return; }
+        showToast(t("gs.folder_added"));
         inp.value = "";
         if (galleryCtx.refreshConfig) await galleryCtx.refreshConfig();
         _renderFolders();
@@ -685,8 +687,8 @@ function renderSettings() {
   }
 
   // ── Excluded folders: names skipped while scanning (+ optional hidden-folder skip) ──
-  wrap.appendChild(h("div", { class: "sbg-gs-section-title", text: "Excluded folders", style: "margin-top:16px" }));
-  wrap.appendChild(h("div", { class: "sbg-gs-desc", text: "Folder names to skip while scanning (e.g. thumbnails, backup). Matching is by folder name, not full path, and is not case-sensitive. Changes take effect on the next scan." }));
+  wrap.appendChild(h("div", { class: "sbg-gs-section-title", text: t("gs.excluded_folders"), style: "margin-top:16px" }));
+  wrap.appendChild(h("div", { class: "sbg-gs-desc", text: t("gs.excluded_folders_desc") }));
   const excludedList = h("div", {});
   wrap.appendChild(excludedList);
 
@@ -710,27 +712,27 @@ function renderSettings() {
       try {
         await _postConfig({ index_hidden_dirs: hiddenChk.checked });
         showToast(hiddenChk.checked
-          ? "Hidden folders will be scanned on the next scan"
-          : "Hidden folders will be skipped on the next scan");
+          ? t("gs.hidden_scanned")
+          : t("gs.hidden_skipped"));
         if (galleryCtx.refreshConfig) await galleryCtx.refreshConfig();
       } catch (e) {
         hiddenChk.checked = !hiddenChk.checked;
         showToast("Failed to update: " + (e?.message || e));
       } finally { excludedBusy = false; }
     });
-    excludedList.appendChild(_settingRow("Include hidden folders", hiddenChk,
-      "Also scan folders whose names start with a dot (e.g. .thumbs). Off by default - hidden folders are skipped."));
+    excludedList.appendChild(_settingRow(t("gs.include_hidden"), hiddenChk,
+      t("gs.include_hidden_tip")));
 
     const row = (name) => {
       const el = h("div", { class: "sbg-gs-row", style: "align-items:center" });
       el.appendChild(h("span", { class: "sbg-gs-label", text: name }));
-      const del = h("button", { class: "sbg-iconbtn sbg-iconbtn--danger", text: "🗑", title: "Stop excluding this folder (its files reappear on the next scan)" });
+      const del = h("button", { class: "sbg-iconbtn sbg-iconbtn--danger", text: "🗑", title: t("gs.stop_excluding_tip") });
       del.addEventListener("click", async () => {
         if (excludedBusy) return;
         excludedBusy = true;
         try {
           await _postExcluded(current.filter(d => d !== name));
-          showToast("Folder no longer excluded - it will be re-indexed on the next scan");
+          showToast(t("gs.folder_no_longer"));
           if (galleryCtx.refreshConfig) await galleryCtx.refreshConfig();
           _renderExcluded();
         } catch (e) { showToast("Failed to update: " + (e?.message || e)); }
@@ -740,24 +742,24 @@ function renderSettings() {
       return el;
     };
     if (current.length === 0) {
-      excludedList.appendChild(h("div", { class: "sbg-gs-row", style: "opacity:.5;font-size:11px", text: "No extra folders excluded." }));
+      excludedList.appendChild(h("div", { class: "sbg-gs-row", style: "opacity:.5;font-size:11px", text: t("gs.no_excluded") }));
     } else {
       for (const name of current) excludedList.appendChild(row(name));
     }
 
     const addWrap = h("div", { class: "sbg-gs-row", style: "align-items:center;gap:6px" });
     const inp = h("input", { type: "text", class: "sbg-gs-input", placeholder: "thumbnails", style: "flex:1" });
-    const addBtn = h("button", { class: "sbg-btn sbg-btn--accent", text: "+ Add" });
+    const addBtn = h("button", { class: "sbg-btn sbg-btn--accent", text: t("gs.add") });
     const doAdd = async () => {
       if (excludedBusy) return;
       // Accept a plain name or a pasted path; keep just the last real path segment.
       const name = (inp.value.split(/[\\/]/).filter(Boolean).pop() || "").trim().toLowerCase();
-      if (!name || name === "." || name === "..") { showToast("Enter a folder name to exclude"); return; }
-      if (current.includes(name)) { showToast("Already excluded"); inp.value = ""; return; }
+      if (!name || name === "." || name === "..") { showToast(t("gs.enter_folder_name")); return; }
+      if (current.includes(name)) { showToast(t("gs.already_excluded")); inp.value = ""; return; }
       excludedBusy = true;
       try {
         await _postExcluded([...current, name]);
-        showToast("Folder excluded - it will be skipped on the next scan");
+        showToast(t("gs.folder_excluded"));
         inp.value = "";
         if (galleryCtx.refreshConfig) await galleryCtx.refreshConfig();
         _renderExcluded();
@@ -785,8 +787,8 @@ function renderSettings() {
 function renderPresets() {
   content.innerHTML = "";
   const wrap = h("div", { class: "sbg-gs-form" });
-  wrap.appendChild(h("div", { class: "sbg-gs-section-title", text: "Presets" }));
-  wrap.appendChild(h("div", { class: "sbg-gs-desc", text: "Save and load gallery configuration presets." }));
+  wrap.appendChild(h("div", { class: "sbg-gs-section-title", text: t("gs.presets") }));
+  wrap.appendChild(h("div", { class: "sbg-gs-desc", text: t("gs.presets_desc") }));
 
   // Current presets list
   const PRESETS_KEY = "SBG.Presets";
@@ -806,11 +808,11 @@ function renderPresets() {
   wrap.appendChild(saveChecks);
 
   // Save button
-  const nameInput = h("input", { type: "text", class: "sbg-gs-input", placeholder: "Preset name" });
-  const saveBtn = h("button", { class: "sbg-btn sbg-btn--accent", text: "💾 Save Preset" });
+  const nameInput = h("input", { type: "text", class: "sbg-gs-input", placeholder: t("gs.preset_name") });
+  const saveBtn = h("button", { class: "sbg-btn sbg-btn--accent", text: t("gs.save_preset") });
   saveBtn.addEventListener("click", () => {
     const name = nameInput.value.trim();
-    if (!name) { showToast("Enter a preset name"); return; }
+    if (!name) { showToast(t("gs.enter_preset_name")); return; }
     const preset = { name, created: Date.now() };
     if (incLayout.checked) {
       // Active layout system: the per-app x per-media section profiles
@@ -844,7 +846,7 @@ function renderPresets() {
     presets = presets.filter(p => p.name !== name);
     presets.unshift(preset);
     localStorage.setItem(PRESETS_KEY, JSON.stringify(presets));
-    showToast(`Preset "${name}" saved`);
+    showToast(t("gs.preset_saved", { n: name }));
     renderPresets();
   });
   const saveRow = h("div", { class: "sbg-gs-preset-save" }, [nameInput, saveBtn]);
@@ -852,18 +854,18 @@ function renderPresets() {
 
   // Preset list
   if (presets.length > 0) {
-    wrap.appendChild(h("div", { class: "sbg-gs-section-title", text: "Saved Presets", style: "margin-top:16px" }));
+    wrap.appendChild(h("div", { class: "sbg-gs-section-title", text: t("gs.saved_presets"), style: "margin-top:16px" }));
     for (const p of presets) {
       const row = h("div", { class: "sbg-gs-preset-item" });
       row.appendChild(h("span", { class: "sbg-gs-preset-name", text: p.name }));
-      const loadBtn = h("button", { class: "sbg-btn sbg-btn--accent sbg-btn--sm", text: "Load" });
+      const loadBtn = h("button", { class: "sbg-btn sbg-btn--accent sbg-btn--sm", text: t("gs.load") });
       let loadConfirm = false;
       loadBtn.addEventListener("click", () => {
         if (!loadConfirm) {
           loadConfirm = true;
-          loadBtn.textContent = "Sure?";
+          loadBtn.textContent = t("gs.sure");
           loadBtn.style.background = "var(--sbg-danger)";
-          setTimeout(() => { loadConfirm = false; loadBtn.textContent = "Load"; loadBtn.style.background = ""; }, 2000);
+          setTimeout(() => { loadConfirm = false; loadBtn.textContent = t("gs.load"); loadBtn.style.background = ""; }, 2000);
           return;
         }
         // Active layout system (per-app/per-media profiles)
@@ -890,14 +892,14 @@ function renderPresets() {
         if (p.keys) {
           for (const [id, val] of Object.entries(p.keys)) _writeSetting(id, val);
         }
-        showToast(`Preset "${p.name}" loaded. Refresh gallery to apply.`);
+        showToast(t("gs.preset_loaded", { n: p.name }));
       });
       const delBtn = h("button", { class: "sbg-btn sbg-btn--danger sbg-btn--sm", text: "✕" });
       let delConfirm = false;
       delBtn.addEventListener("click", () => {
         if (!delConfirm) {
           delConfirm = true;
-          delBtn.textContent = "Sure?";
+          delBtn.textContent = t("gs.sure");
           setTimeout(() => { delConfirm = false; delBtn.textContent = "✕"; }, 2000);
           return;
         }
@@ -921,8 +923,8 @@ function renderPresets() {
   }
 
   // Import button
-  wrap.appendChild(h("div", { class: "sbg-gs-section-title", text: "Import", style: "margin-top:16px" }));
-  const importBtn = h("button", { class: "sbg-btn", text: "📥 Import Preset" });
+  wrap.appendChild(h("div", { class: "sbg-gs-section-title", text: t("gs.import"), style: "margin-top:16px" }));
+  const importBtn = h("button", { class: "sbg-btn", text: t("gs.import_preset") });
   importBtn.addEventListener("click", () => {
     const fi = h("input", { type: "file", accept: ".json" });
     fi.addEventListener("change", async () => {
@@ -930,43 +932,43 @@ function renderPresets() {
       try {
         const text = await fi.files[0].text();
         const p = JSON.parse(text);
-        if (!p.name) { showToast("Invalid preset file"); return; }
+        if (!p.name) { showToast(t("gs.invalid_preset")); return; }
         presets = presets.filter(x => x.name !== p.name);
         presets.unshift(p);
         localStorage.setItem(PRESETS_KEY, JSON.stringify(presets));
-        showToast(`Preset "${p.name}" imported`);
+        showToast(t("gs.preset_imported", { n: p.name }));
         renderPresets();
-      } catch (e) { showToast(`Import error: ${e.message}`); }
+      } catch (e) { showToast(t("gs.import_error", { e: e.message })); }
     });
     fi.click();
   });
   wrap.appendChild(importBtn);
 
   // Server-side themes (from the themes/ subfolder)
-  wrap.appendChild(h("div", { class: "sbg-gs-section-title", text: "Server Themes", style: "margin-top:16px" }));
-  wrap.appendChild(h("div", { class: "sbg-gs-desc", text: "Presets stored in the extension's themes/ folder. Persist across reinstalls." }));
+  wrap.appendChild(h("div", { class: "sbg-gs-section-title", text: t("gs.server_themes"), style: "margin-top:16px" }));
+  wrap.appendChild(h("div", { class: "sbg-gs-desc", text: t("gs.server_themes_desc") }));
   const serverList = h("div", { class: "sbg-gs-preset-list" });
-  serverList.textContent = "Loading...";
+  serverList.textContent = t("gs.loading");
   wrap.appendChild(serverList);
 
   // Fetch server presets
   fetch("/sidebar_gallery/presets").then(r => r.json()).then(data => {
     serverList.innerHTML = "";
     if (!data.presets || data.presets.length === 0) {
-      serverList.textContent = "No server themes found.";
+      serverList.textContent = t("gs.no_server_themes");
       return;
     }
     for (const sp of data.presets) {
       const row = h("div", { class: "sbg-gs-preset-item" });
       row.appendChild(h("span", { class: "sbg-gs-preset-name", text: sp.name }));
-      const loadBtn = h("button", { class: "sbg-btn sbg-btn--accent sbg-btn--sm", text: "Load" });
+      const loadBtn = h("button", { class: "sbg-btn sbg-btn--accent sbg-btn--sm", text: t("gs.load") });
       let loadServerConfirm = false;
       loadBtn.addEventListener("click", async () => {
         if (!loadServerConfirm) {
           loadServerConfirm = true;
-          loadBtn.textContent = "Sure?";
+          loadBtn.textContent = t("gs.sure");
           loadBtn.style.background = "var(--sbg-danger)";
-          setTimeout(() => { loadServerConfirm = false; loadBtn.textContent = "Load"; loadBtn.style.background = ""; }, 2000);
+          setTimeout(() => { loadServerConfirm = false; loadBtn.textContent = t("gs.load"); loadBtn.style.background = ""; }, 2000);
           return;
         }
         try {
@@ -996,7 +998,7 @@ function renderPresets() {
           if (p.keys) {
             for (const [id, val] of Object.entries(p.keys)) _writeSetting(id, val);
           }
-          showToast(`Server theme "${sp.name}" loaded. Refresh gallery to apply.`);
+          showToast(t("gs.server_theme_loaded", { n: sp.name }));
         } catch (e) { showToast("Error loading theme: " + e.message); }
       });
       const delBtn = h("button", { class: "sbg-btn sbg-btn--danger sbg-btn--sm", text: "\u2715" });
@@ -1004,7 +1006,7 @@ function renderPresets() {
       delBtn.addEventListener("click", async () => {
         if (!delServerConfirm) {
           delServerConfirm = true;
-          delBtn.textContent = "Sure?";
+          delBtn.textContent = t("gs.sure");
           setTimeout(() => { delServerConfirm = false; delBtn.textContent = "\u2715"; }, 2000);
           return;
         }
@@ -1022,10 +1024,10 @@ function renderPresets() {
   }).catch(() => { serverList.textContent = "Could not load server themes."; });
 
   // Save to server button
-  const saveServerBtn = h("button", { class: "sbg-btn", text: "💾 Save to Server", style: "margin-top:8px" });
+  const saveServerBtn = h("button", { class: "sbg-btn", text: t("gs.save_to_server"), style: "margin-top:8px" });
   saveServerBtn.addEventListener("click", async () => {
     const name = nameInput.value.trim();
-    if (!name) { showToast("Enter a preset name first"); return; }
+    if (!name) { showToast(t("gs.enter_preset_name")); return; }
     const preset = { name, created: Date.now() };
     if (incLayout.checked) {
       // Active layout system: the per-app x per-media section profiles
@@ -1062,7 +1064,7 @@ function renderPresets() {
         headers: { "Content-Type": "application/json" },
         body: JSON.stringify({ action: "save", name, data: preset }),
       });
-      showToast(`Theme "${name}" saved to server`);
+      showToast(t("gs.theme_saved_server", { n: name }));
       renderPresets();
     } catch (e) { showToast("Error saving to server: " + e.message); }
   });
@@ -1074,41 +1076,41 @@ function renderPresets() {
 function renderDiagnosticsTab() {
   content.innerHTML = "";
   const wrap = h("div", { class: "sbg-gs-form" });
-  wrap.appendChild(h("div", { class: "sbg-gs-section-title", text: "Diagnostics & Tools" }));
+  wrap.appendChild(h("div", { class: "sbg-gs-section-title", text: t("gs.diagnostics") }));
 
   const actionRow = h("div", { style: "display:flex;gap:8px;margin-bottom:16px;flex-wrap:wrap" });
 
   // Refresh Gallery button
-  const diagGalleryRefreshBtn = h("button", { class: "sbg-btn sbg-btn--accent", text: "🔃 Refresh", title: "Re-fetch all items from the server and refresh the gallery view" });
+  const diagGalleryRefreshBtn = h("button", { class: "sbg-btn sbg-btn--accent", text: t("gs.refresh"), title: t("gs.refresh_tip") });
   diagGalleryRefreshBtn.addEventListener("click", async () => {
     diagGalleryRefreshBtn.disabled = true;
-    diagGalleryRefreshBtn.textContent = "Refreshing…";
+    diagGalleryRefreshBtn.textContent = t("gs.refreshing");
     try {
       await galleryCtx.fetchAllItems({ rescan: true });
-      showToast("Gallery refreshed");
+      showToast(t("gs.gallery_refreshed"));
       await refreshDiagStats(diagStatsContainer);
     } catch (e) {
-      showToast(`Error: ${e?.message || e}`);
+      showToast(t("lb.error", { e: e?.message || e }));
     } finally {
       diagGalleryRefreshBtn.disabled = false;
-      diagGalleryRefreshBtn.textContent = "🔃 Refresh";
+      diagGalleryRefreshBtn.textContent = t("gs.refresh");
     }
   });
 
   // Rebuild DB Index with two-click confirmation
-  const diagRefreshBtn = h("button", { class: "sbg-btn sbg-btn--accent", text: "🔄 Rebuild DB Index", title: "Rescan all roots and rebuild metadata/tag index on server" });
+  const diagRefreshBtn = h("button", { class: "sbg-btn sbg-btn--accent", text: t("gs.rebuild_db"), title: t("gs.rebuild_db_tip") });
   let _rebuildConfirm = false;
   diagRefreshBtn.addEventListener("click", async () => {
     if (!_rebuildConfirm) {
       _rebuildConfirm = true;
-      diagRefreshBtn.textContent = "Sure?";
+      diagRefreshBtn.textContent = t("gs.sure");
       diagRefreshBtn.style.background = "#f59e0b"; diagRefreshBtn.style.color = "#000";
-      setTimeout(() => { _rebuildConfirm = false; diagRefreshBtn.textContent = "🔄 Rebuild DB Index"; diagRefreshBtn.style.background = ""; diagRefreshBtn.style.color = ""; }, 2000);
+      setTimeout(() => { _rebuildConfirm = false; diagRefreshBtn.textContent = t("gs.rebuild_db"); diagRefreshBtn.style.background = ""; diagRefreshBtn.style.color = ""; }, 2000);
       return;
     }
     diagRefreshBtn.disabled = true;
     diagRefreshBtn.style.background = ""; diagRefreshBtn.style.color = "";
-    diagRefreshBtn.textContent = "🔄 Rebuilding DB... (0%)";
+    diagRefreshBtn.textContent = t("gs.rebuilding", { p: "0%" });
     try {
       await fetch("/sidebar_gallery/rebuild_index", { method: "POST" });
     } catch { }
@@ -1127,18 +1129,18 @@ function renderDiagnosticsTab() {
       if (e && data.running) {
         const f = formatProgress(e);
         diagRefreshBtn.textContent = f.pct >= 0
-          ? `🔄 Rebuilding DB... (${f.pct}%)`
-          : `🔄 Rebuilding DB... (${f.text})`;
+          ? t("gs.rebuilding", { p: f.pct + "%" })
+          : t("gs.rebuilding", { p: f.text });
       }
       if (meta.settled) {
         active = false;
         unsub();
         diagRefreshBtn.textContent = sawRunning
-          ? "🔄 DB Indexed Successfully!"
-          : "Couldn't start - another scan is running";
+          ? t("gs.db_success")
+          : t("gs.db_busy");
         setTimeout(() => {
           diagRefreshBtn.disabled = false;
-          diagRefreshBtn.textContent = "🔄 Rebuild DB Index";
+          diagRefreshBtn.textContent = t("gs.rebuild_db");
         }, 3000);
         if (sawRunning) {
           galleryCtx.fetchAllItems({ rescan: true });
@@ -1148,10 +1150,10 @@ function renderDiagnosticsTab() {
     });
   });
 
-  const diagCacheMetaBtn = h("button", { class: "sbg-btn", text: "📦 Cache All Metadata", title: "Fetch and cache metadata summaries for all files to IndexedDB" });
+  const diagCacheMetaBtn = h("button", { class: "sbg-btn", text: t("gs.cache_meta"), title: t("gs.cache_meta_tip") });
   diagCacheMetaBtn.addEventListener("click", async () => {
     diagCacheMetaBtn.disabled = true;
-    diagCacheMetaBtn.textContent = "Caching…";
+    diagCacheMetaBtn.textContent = t("gs.caching");
     try {
       const items = galleryCtx.allItems || [];
       let cached = 0;
@@ -1165,27 +1167,27 @@ function renderDiagnosticsTab() {
           batch.push({ key, value: m });
           cached++;
           if (cached % 50 === 0) {
-            diagCacheMetaBtn.textContent = `Caching… ${cached}/${items.length}`;
+            diagCacheMetaBtn.textContent = t("gs.caching") + ` ${cached}/${items.length}`;
             if (batch.length >= 50) { await _metaCacheAPI.putBatch(batch.splice(0)); }
           }
         } catch { cached++; }
       }
       if (batch.length) await _metaCacheAPI.putBatch(batch);
-      diagCacheMetaBtn.textContent = "📦 Cache All Metadata";
+      diagCacheMetaBtn.textContent = t("gs.cache_meta");
       diagCacheMetaBtn.disabled = false;
-      showToast(`Metadata cached: ${cached} items`);
+      showToast(t("gs.meta_cached", { n: cached }));
       await refreshDiagStats(diagStatsContainer);
     } catch (e) {
-      diagCacheMetaBtn.textContent = "📦 Cache All Metadata";
+      diagCacheMetaBtn.textContent = t("gs.cache_meta");
       diagCacheMetaBtn.disabled = false;
-      showToast(`Error: ${e?.message || e}`);
+      showToast(t("lb.error", { e: e?.message || e }));
     }
   });
 
-  const diagCacheThumbBtn = h("button", { class: "sbg-btn", text: "🖼️ Cache Thumbnails", title: "Cache all lazy-load thumbnails into the local browser IndexedDB" });
+  const diagCacheThumbBtn = h("button", { class: "sbg-btn", text: t("gs.cache_thumbs"), title: t("gs.cache_thumbs_tip") });
   diagCacheThumbBtn.addEventListener("click", async () => {
     diagCacheThumbBtn.disabled = true;
-    diagCacheThumbBtn.textContent = "Caching…";
+    diagCacheThumbBtn.textContent = t("gs.caching");
     try {
       const items = galleryCtx.allItems || [];
       let cached = 0;
@@ -1197,47 +1199,47 @@ function renderDiagnosticsTab() {
           await _thumbCacheAPI.getOrFetch(it.thumb_url);
           cached++;
           if (cached % 20 === 0) {
-            diagCacheThumbBtn.textContent = `Caching… ${cached}/${items.length}`;
+            diagCacheThumbBtn.textContent = t("gs.caching") + ` ${cached}/${items.length}`;
           }
         } catch { cached++; }
       }
-      diagCacheThumbBtn.textContent = "🖼️ Cache Thumbnails";
+      diagCacheThumbBtn.textContent = t("gs.cache_thumbs");
       diagCacheThumbBtn.disabled = false;
-      showToast(`Thumbnails cached: ${cached} items`);
+      showToast(t("gs.thumbs_cached", { n: cached }));
       await refreshDiagStats(diagStatsContainer);
     } catch (e) {
-      diagCacheThumbBtn.textContent = "🖼️ Cache Thumbnails";
+      diagCacheThumbBtn.textContent = t("gs.cache_thumbs");
       diagCacheThumbBtn.disabled = false;
-      showToast(`Error: ${e?.message || e}`);
+      showToast(t("lb.error", { e: e?.message || e }));
     }
   });
 
-  const diagClearMetaBtn = h("button", { class: "sbg-btn sbg-btn--danger", text: "🗑️ Clear Meta Cache", title: "Clear browser IndexedDB metadata cache" });
+  const diagClearMetaBtn = h("button", { class: "sbg-btn sbg-btn--danger", text: t("gs.clear_meta_cache"), title: t("gs.clear_meta_tip") });
   let clearMetaConfirm = false;
   diagClearMetaBtn.addEventListener("click", async () => {
     if (!clearMetaConfirm) {
       clearMetaConfirm = true;
-      diagClearMetaBtn.textContent = "Sure?";
+      diagClearMetaBtn.textContent = t("gs.sure");
       diagClearMetaBtn.style.background = "#f59e0b"; diagClearMetaBtn.style.color = "#000";
-      setTimeout(() => { clearMetaConfirm = false; diagClearMetaBtn.textContent = "🗑️ Clear Meta Cache"; diagClearMetaBtn.style.background = ""; diagClearMetaBtn.style.color = ""; }, 2000);
+      setTimeout(() => { clearMetaConfirm = false; diagClearMetaBtn.textContent = t("gs.clear_meta_cache"); diagClearMetaBtn.style.background = ""; diagClearMetaBtn.style.color = ""; }, 2000);
       return;
     }
     try {
       await _metaCacheAPI.clear();
       _metaCache.clear();
-      showToast("Metadata cache cleared");
+      showToast(t("gs.meta_cache_cleared"));
       await refreshDiagStats(diagStatsContainer);
     } catch (e) { showToast("Error clearing meta cache: " + e.message); }
   });
 
-  const diagClearThumbBtn = h("button", { class: "sbg-btn sbg-btn--danger", text: "🗑️ Clear Thumb Cache", title: "Clear browser IndexedDB thumbnails cache" });
+  const diagClearThumbBtn = h("button", { class: "sbg-btn sbg-btn--danger", text: t("gs.clear_thumb_cache"), title: t("gs.clear_thumb_tip") });
   let clearThumbConfirm = false;
   diagClearThumbBtn.addEventListener("click", async () => {
     if (!clearThumbConfirm) {
       clearThumbConfirm = true;
-      diagClearThumbBtn.textContent = "Sure?";
+      diagClearThumbBtn.textContent = t("gs.sure");
       diagClearThumbBtn.style.background = "#f59e0b"; diagClearThumbBtn.style.color = "#000";
-      setTimeout(() => { clearThumbConfirm = false; diagClearThumbBtn.textContent = "🗑️ Clear Thumb Cache"; diagClearThumbBtn.style.background = ""; diagClearThumbBtn.style.color = ""; }, 2000);
+      setTimeout(() => { clearThumbConfirm = false; diagClearThumbBtn.textContent = t("gs.clear_thumb_cache"); diagClearThumbBtn.style.background = ""; diagClearThumbBtn.style.color = ""; }, 2000);
       return;
     }
     try {
@@ -1253,18 +1255,18 @@ function renderDiagnosticsTab() {
         _thumbMemCache.delete(url);
       }
       resetFailedThumbs();
-      showToast("Thumbnails cache cleared");
+      showToast(t("gs.thumb_cache_cleared"));
       await refreshDiagStats(diagStatsContainer);
     } catch (e) { showToast("Error clearing thumb cache: " + e.message); }
   });
 
   // Nuclear option: delete entire IDB database + clear version tracking
-  const diagNukeBtn = h("button", { class: "sbg-btn sbg-btn--danger", text: "💣 Nuclear Clear All", title: "Delete ALL browser cache databases (including legacy), reset version tracking, clean up old settings keys, and reload. Fixes any corruption." });
+  const diagNukeBtn = h("button", { class: "sbg-btn sbg-btn--danger", text: t("gs.nuclear_clear"), title: t("gs.nuclear_tip") });
   let nukeConfirm = false;
   diagNukeBtn.addEventListener("click", () => {
     if (!nukeConfirm) {
       nukeConfirm = true;
-      diagNukeBtn.textContent = "⚠️ Sure? This will reload the page";
+      diagNukeBtn.textContent = t("gs.nuclear_confirm");
       diagNukeBtn.style.background = "#ef4444"; diagNukeBtn.style.color = "#fff";
       setTimeout(() => { nukeConfirm = false; diagNukeBtn.textContent = "💣 Nuclear Clear All"; diagNukeBtn.style.background = ""; diagNukeBtn.style.color = ""; }, 3000);
       return;

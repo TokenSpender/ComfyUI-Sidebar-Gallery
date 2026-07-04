@@ -12,6 +12,8 @@
  * removed.
  */
 
+import { t } from "./sbg-core.js";
+
 // Canonical section name → backend search field (+ optional legacy display name).
 // ORDER IS SIGNIFICANT: the gallery builds a searchField → canonical map with
 // "last wins" for match-badge labels (so "prompt" → Negative Prompt, and
@@ -56,6 +58,24 @@ const SEARCH_FIELD_ALIASES = {
   "prompt enhancer": "Prompt Enhancer",
 };
 
+// Canonical section name → i18n key for translated display names
+const _SECTION_I18N = {
+  "File Info": "section.file_info",
+  "Models": "section.models",
+  "Positive Prompt": "section.positive",
+  "Negative Prompt": "section.negative",
+  "Sampling": "section.sampling",
+  "LoRAs": "section.loras",
+  "ControlNet": "section.controlnet",
+  "ADetailer": "section.adetailer",
+  "Upscaling": "section.upscaling",
+  "Interpolation": "section.interpolation",
+  "MMAudio": "section.mmaudio",
+  "Extra Metadata": "section.extra",
+  "Workflow Nodes": "section.workflow_nodes",
+  "Raw Metadata": "section.raw",
+};
+
 const SectionRegistry = {
   /** Canonical section name from a user-typed display name (handles renames + aliases). */
   getCanonicalName(displayName, layout) {
@@ -75,9 +95,11 @@ const SectionRegistry = {
     return null; // Unknown section
   },
 
-  /** Display name for a canonical section (applies renames + legacy displayName default). */
+  /** Display name for a canonical section (applies renames + i18n + legacy displayName default). */
   getDisplayName(canonicalName, layout) {
     if (layout?.renames?.[canonicalName]) return layout.renames[canonicalName];
+    const i18nKey = _SECTION_I18N[canonicalName];
+    if (i18nKey) return t(i18nKey);
     const def = SECTION_DEFS[canonicalName];
     if (def?.displayName) return def.displayName;
     return canonicalName;

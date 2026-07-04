@@ -14,6 +14,7 @@ import {
   _thumbCacheAPI,
   searchState, highlightSearchMatches,
   S, getSetting, getLayout, APP_REGISTRY,
+  t,
 } from "./sbg-core.js";
 
 import * as TL from "./sbg-translation-layer.js";
@@ -106,15 +107,15 @@ export function openLightbox(_initialItems, startItemOrIndex) {
   /* ── Build DOM ──────────────────────────────────────────────── */
 
   const mediaContainer = h("div", { style: "display:flex;align-items:center;justify-content:center;width:100%;height:100%" });
-  const prevBtn = h("button", { class: "sbg-lb__nav sbg-lb__nav--prev", text: "‹", title: `Previous (${keyPrev})` });
-  const nextBtn = h("button", { class: "sbg-lb__nav sbg-lb__nav--next", text: "›", title: `Next (${keyNext})` });
-  const closeBtn = h("button", { class: "sbg-lb__close", text: "✕", title: `Close (${keyClose})` });
+  const prevBtn = h("button", { class: "sbg-lb__nav sbg-lb__nav--prev", text: "‹", title: t("lb.prev", { k: keyPrev }) });
+  const nextBtn = h("button", { class: "sbg-lb__nav sbg-lb__nav--next", text: "›", title: t("lb.next", { k: keyNext }) });
+  const closeBtn = h("button", { class: "sbg-lb__close", text: "✕", title: t("lb.close", { k: keyClose }) });
 
   const bottomName = h("span", { class: "sbg-lb__bottom-name" });
-  const dlBtn = h("a", { class: "sbg-btn sbg-btn--sm", text: "⬇ Download", title: "Download file", download: "", target: "_blank" });
-  const loadWfBtn = h("button", { class: "sbg-btn sbg-btn--sm sbg-btn--accent", text: "Load Workflow", title: "Load workflow into ComfyUI", disabled: "true" });
-  const copyPromptBtn = h("button", { class: "sbg-btn sbg-btn--sm", text: "Copy Prompt", title: "Copy positive prompt", disabled: "true" });
-  const copyWfBtn = h("button", { class: "sbg-btn sbg-btn--sm", text: "Copy WF", title: "Copy workflow JSON", disabled: "true" });
+  const dlBtn = h("a", { class: "sbg-btn sbg-btn--sm", text: t("lb.download"), title: t("lb.download_tip"), download: "", target: "_blank" });
+  const loadWfBtn = h("button", { class: "sbg-btn sbg-btn--sm sbg-btn--accent", text: t("lb.load_wf"), title: t("lb.load_wf_tip"), disabled: "true" });
+  const copyPromptBtn = h("button", { class: "sbg-btn sbg-btn--sm", text: t("lb.copy_prompt"), title: t("lb.copy_prompt_tip"), disabled: "true" });
+  const copyWfBtn = h("button", { class: "sbg-btn sbg-btn--sm", text: t("lb.copy_wf"), title: t("lb.copy_wf_tip"), disabled: "true" });
 
   // Apply lightbox button visibility settings
   if (!getSetting(S.LB_SHOW_DOWNLOAD, true)) dlBtn.style.display = "none";
@@ -132,7 +133,7 @@ export function openLightbox(_initialItems, startItemOrIndex) {
   if (_lbcWf) copyWfBtn.style.background = _lbcWf;
   if (_lbcLw) loadWfBtn.style.background = _lbcLw;
   // Compare button
-  const compareBtn = h("button", { class: "sbg-btn sbg-btn--sm", text: "⚖ Compare", title: "Compare with another image (C)" });
+  const compareBtn = h("button", { class: "sbg-btn sbg-btn--sm", text: t("lb.compare"), title: t("lb.compare_tip") });
 
   const bottomBar = h("div", { class: "sbg-lb__bottom" }, [
     bottomName,
@@ -144,7 +145,7 @@ export function openLightbox(_initialItems, startItemOrIndex) {
   ]);
 
   const metaBody = h("div", { class: "sbg-lb__meta-body" }, [
-    h("div", { class: "sbg-lb__loading sbg-loading", text: "Loading metadata…" }),
+    h("div", { class: "sbg-lb__loading sbg-loading", text: t("lb.loading_meta") }),
   ]);
   const metaResizeHandle = h("div", { class: "sbg-lb__meta-resize" });
   const savedMetaWidth = localStorage.getItem("SBG.MetaPanelWidth");
@@ -152,8 +153,8 @@ export function openLightbox(_initialItems, startItemOrIndex) {
 
   // Tab bar for Generated / Initial Image.
   // Tabs are hidden by default and only shown when initial_image data exists.
-  const _tabGenerated = h("button", { class: "sbg-lb__meta-tab sbg-lb__meta-tab--active", text: "Generated" });
-  const _tabInitialImage = h("button", { class: "sbg-lb__meta-tab", text: "Initial Image" });
+  const _tabGenerated = h("button", { class: "sbg-lb__meta-tab sbg-lb__meta-tab--active", text: t("lb.generated") });
+  const _tabInitialImage = h("button", { class: "sbg-lb__meta-tab", text: t("lb.initial_image") });
   const initTabColor = getSetting(S.INITIAL_IMAGE_TAB_COLOR, "");
   if (initTabColor) {
     _tabInitialImage.style.color = initTabColor;
@@ -305,7 +306,7 @@ export function openLightbox(_initialItems, startItemOrIndex) {
     _metaTabs.style.display = "none"; // hide entire tab bar until initial_image found
 
     if (!m) {
-      metaBody.appendChild(h("div", { class: "sbg-lb__loading", text: "No metadata" }));
+      metaBody.appendChild(h("div", { class: "sbg-lb__loading", text: t("lb.no_meta") }));
       return;
     }
 
@@ -398,7 +399,7 @@ export function openLightbox(_initialItems, startItemOrIndex) {
 
       // Show the initial image name
       const imgName = typeof s.initial_image === "string" ? s.initial_image : (s.initial_image.filename || "Unknown");
-      initWrap.appendChild(h("div", { style: "font-size:12px;font-weight:600;color:var(--sbg-text);margin-bottom:6px", text: "Source Image" }));
+      initWrap.appendChild(h("div", { style: "font-size:12px;font-weight:600;color:var(--sbg-text);margin-bottom:6px", text: t("lb.source_image") }));
 
       // Try to show a thumbnail preview via ComfyUI's /view endpoint
       const imgPath = typeof s.initial_image === "string" ? s.initial_image : (s.initial_image.path || s.initial_image.filename || "");
@@ -434,7 +435,7 @@ export function openLightbox(_initialItems, startItemOrIndex) {
 
       // Try to load the initial image's own metadata from any indexed root
       if (imgPath) {
-        const metaNote = h("div", { class: "sbg-lb__loading sbg-loading", text: "Loading initial image metadata…", style: "font-size:10px;padding:8px" });
+        const metaNote = h("div", { class: "sbg-lb__loading sbg-loading", text: t("lb.loading_init_meta"), style: "font-size:10px;padding:8px" });
         initWrap.appendChild(metaNote);
         (async () => {
           const m = await _resolveInitMeta(imgPath, items[idx]?.root_id);
@@ -451,7 +452,7 @@ export function openLightbox(_initialItems, startItemOrIndex) {
               initWrap.appendChild(makeSection(section, contentEl));
             }
           } else {
-            metaNote.textContent = "Source image metadata unavailable";
+            metaNote.textContent = t("lb.source_meta_unavail");
             metaNote.classList.remove("sbg-loading");
             metaNote.style.cssText = "font-size:10px;padding:8px;opacity:0.5";
           }
@@ -593,7 +594,7 @@ export function openLightbox(_initialItems, startItemOrIndex) {
     } else {
       // L2: check IndexedDB persistent cache
       metaBody.innerHTML = "";
-      metaBody.appendChild(h("div", { class: "sbg-lb__loading sbg-loading", text: "Loading metadata…" }));
+      metaBody.appendChild(h("div", { class: "sbg-lb__loading sbg-loading", text: t("lb.loading_meta") }));
 
       _metaCacheAPI.get(cacheKey).then(idbCached => {
         // Validate IDB cache: reject if file was modified since cache was stored
@@ -617,7 +618,7 @@ export function openLightbox(_initialItems, startItemOrIndex) {
       }).catch((e) => {
         if (!destroyed && _navGen === gen) {
           metaBody.innerHTML = "";
-          metaBody.appendChild(h("div", { class: "sbg-lb__loading", text: `Error: ${e?.message || e}` }));
+          metaBody.appendChild(h("div", { class: "sbg-lb__loading", text: t("lb.error", { e: e?.message || e }) }));
         }
       });
     }
@@ -817,7 +818,7 @@ export function openLightbox(_initialItems, startItemOrIndex) {
 
   loadWfBtn.addEventListener("click", async () => {
     try {
-      loadWfBtn.textContent = "Loading…";
+      loadWfBtn.textContent = t("lb.loading_wf");
       const m = await _fetchFullMeta();
       if (!m?.workflow) { showToast("No workflow data"); return; }
       let wf = m.workflow;
@@ -828,7 +829,7 @@ export function openLightbox(_initialItems, startItemOrIndex) {
     } catch (e) {
       showToast(`Failed: ${e?.message || e}`, 5000);
     } finally {
-      loadWfBtn.textContent = "Load Workflow";
+      loadWfBtn.textContent = t("lb.load_wf");
     }
   });
 
@@ -839,14 +840,14 @@ export function openLightbox(_initialItems, startItemOrIndex) {
 
   copyWfBtn.addEventListener("click", async () => {
     try {
-      copyWfBtn.textContent = "Loading…";
+      copyWfBtn.textContent = t("lb.loading_wf");
       const m = await _fetchFullMeta();
       if (m?.workflow) copyText(typeof m.workflow === "string" ? m.workflow : pj(m.workflow));
-      else showToast("No workflow data");
+      else showToast(t("lb.no_workflow"));
     } catch (e) {
       showToast(`Failed: ${e?.message || e}`);
     } finally {
-      copyWfBtn.textContent = "Copy WF";
+      copyWfBtn.textContent = t("lb.copy_wf");
     }
   });
 
@@ -864,7 +865,7 @@ export function openLightbox(_initialItems, startItemOrIndex) {
     _compareIdx = idx === 0 ? 1 : idx - 1;
     if (_compareIdx < 0 || _compareIdx >= items.length) _compareIdx = 0;
 
-    compareBtn.textContent = "✕ Exit Compare";
+    compareBtn.textContent = t("lb.exit_compare");
     compareBtn.classList.add("sbg-btn--active");
 
     // Create right panel
@@ -884,12 +885,12 @@ export function openLightbox(_initialItems, startItemOrIndex) {
     // "COMPARED" label - mirrors the "CURRENT" label on the left
     const rightLabel = h("div", {
       class: "sbg-compare__left-label",
-      text: "COMPARED",
+      text: t("lb.compared").toUpperCase(),
       style: "left:auto;right:8px;color:#f87171;"
     });
     rightWrapper.appendChild(rightLabel);
 
-    const leftOverlay = h("div", { class: "sbg-compare__left-label", text: "CURRENT" });
+    const leftOverlay = h("div", { class: "sbg-compare__left-label", text: t("lb.current").toUpperCase() });
     const leftFilename = h("div", { class: "sbg-compare__filename sbg-compare__filename--left", text: currentItem.filename || "" });
     const divider = h("div", { class: "sbg-compare__divider" });
     mediaContainer.classList.add("sbg-compare--active");
@@ -906,7 +907,7 @@ export function openLightbox(_initialItems, startItemOrIndex) {
     if (!_compareActive) return;
     _compareActive = false;
     _compareSummary = null;
-    compareBtn.textContent = "⚖ Compare";
+    compareBtn.textContent = t("lb.compare");
     compareBtn.classList.remove("sbg-btn--active");
     if (_compareElements) {
       releaseVideo(_compareElements.rightMedia);
@@ -999,12 +1000,12 @@ export function openLightbox(_initialItems, startItemOrIndex) {
 
     // Header with filename and bold color legend
     const header = h("div", { class: "sbg-compare-header", style: "padding:8px 10px;background:rgba(124,106,239,0.12);border-radius:8px;margin-bottom:8px;" });
-    header.appendChild(h("div", { style: "font-weight:700;font-size:12px;margin-bottom:4px;color:var(--sbg-text,#eee);", text: `⚖ Comparing: ${compItem?.filename || "?"}` }));
+    header.appendChild(h("div", { style: "font-weight:700;font-size:12px;margin-bottom:4px;color:var(--sbg-text,#eee);", text: t("lb.compare_with", { f: compItem?.filename || "?" }) }));
     const legend = h("div", { style: "display:flex;gap:12px;font-size:11px;" });
-    legend.appendChild(h("span", { text: "■ Same", style: "color:rgba(255,255,255,0.4)" }));
-    legend.appendChild(h("span", { text: "■ Changed", style: "color:#facc15;font-weight:700" }));
-    legend.appendChild(h("span", { text: "■ Current only", style: "color:#4ade80;font-weight:700" }));
-    legend.appendChild(h("span", { text: "■ Compared only", style: "color:#f87171;font-weight:700" }));
+    legend.appendChild(h("span", { text: t("lb.same"), style: "color:rgba(255,255,255,0.4)" }));
+    legend.appendChild(h("span", { text: t("lb.changed"), style: "color:#facc15;font-weight:700" }));
+    legend.appendChild(h("span", { text: t("lb.current_only"), style: "color:#4ade80;font-weight:700" }));
+    legend.appendChild(h("span", { text: t("lb.compared_only"), style: "color:#f87171;font-weight:700" }));
     header.appendChild(legend);
     metaBody.appendChild(header);
 
@@ -1029,20 +1030,20 @@ export function openLightbox(_initialItems, startItemOrIndex) {
       });
       sectionHeader.appendChild(h("span", { style: "font-weight:600;font-size:11.5px;", text: section.title }));
       sectionHeader.appendChild(hasDiff
-        ? h("span", { text: "DIFF", style: "margin-left:8px;font-size:9px;font-weight:700;background:#facc15;color:#000;padding:1px 6px;border-radius:3px;" })
-        : h("span", { text: "SAME", style: "margin-left:8px;font-size:9px;color:rgba(255,255,255,0.3);" }));
+        ? h("span", { text: t("lb.diff"), style: "margin-left:8px;font-size:9px;font-weight:700;background:#facc15;color:#000;padding:1px 6px;border-radius:3px;" })
+        : h("span", { text: t("lb.same_label"), style: "margin-left:8px;font-size:9px;color:rgba(255,255,255,0.3);" }));
       sectionWrap.appendChild(sectionHeader);
 
       if (hasDiff && hasCurrent && hasCompare) {
         // Stacked: Current on top, Compared below (panel is too narrow for side-by-side)
         const stack = h("div", { style: "display:flex;flex-direction:column;gap:0;" });
         const topBlock = h("div", { style: "padding:6px 8px;border-left:3px solid #4ade80;margin:4px 0;" });
-        topBlock.appendChild(h("div", { style: "font-size:9px;font-weight:700;color:#4ade80;margin-bottom:4px;text-transform:uppercase;letter-spacing:0.5px;", text: "▎Current" }));
+        topBlock.appendChild(h("div", { style: "font-size:9px;font-weight:700;color:#4ade80;margin-bottom:4px;text-transform:uppercase;letter-spacing:0.5px;", text: "▎" + t("lb.current") }));
         const tc = TL.renderSection(section, _curMerged, {}); if (tc) topBlock.appendChild(tc);
         stack.appendChild(topBlock);
         stack.appendChild(h("div", { style: "height:1px;background:rgba(255,255,255,0.08);margin:0 8px;" }));
         const bottomBlock = h("div", { style: "padding:6px 8px;border-left:3px solid #f87171;margin:4px 0;" });
-        bottomBlock.appendChild(h("div", { style: "font-size:9px;font-weight:700;color:#f87171;margin-bottom:4px;text-transform:uppercase;letter-spacing:0.5px;", text: "▎Compared" }));
+        bottomBlock.appendChild(h("div", { style: "font-size:9px;font-weight:700;color:#f87171;margin-bottom:4px;text-transform:uppercase;letter-spacing:0.5px;", text: "▎" + t("lb.compared") }));
         const bc = TL.renderSection(section, _cmpMerged, {}); if (bc) bottomBlock.appendChild(bc);
         stack.appendChild(bottomBlock);
         sectionWrap.appendChild(stack);
@@ -1058,7 +1059,7 @@ export function openLightbox(_initialItems, startItemOrIndex) {
       } else {
         const single = hasCurrent ? TL.renderSection(section, _curMerged, {}) : TL.renderSection(section, _cmpMerged, {});
         if (single) {
-          const label = hasCurrent ? "Current only" : "Compared only";
+          const label = hasCurrent ? t("lb.current_only") : t("lb.compared_only");
           const color = hasCurrent ? "#4ade80" : "#f87171";
           const wrapper = h("div", { style: `padding:6px 8px;border-left:3px solid ${color};` });
           wrapper.appendChild(h("div", { style: `font-size:9px;font-weight:700;color:${color};margin-bottom:4px;text-transform:uppercase;`, text: label }));

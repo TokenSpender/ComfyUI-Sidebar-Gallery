@@ -17,6 +17,7 @@ import {
   EXT_NAME, CSS_URL,
   _dataCache, ensureCss, h, api, showToast,
   S, getSetting, loadSettings, APP_REGISTRY,
+  t,
 } from "./sbg-core.js";
 
 import { openGallerySettings as _openGallerySettings } from "./sbg-settings.js";
@@ -139,7 +140,7 @@ app.registerExtension({
         try { widget.callback?.(uploaded); } catch { }
       }
       app.graph?.setDirtyCanvas?.(true, true);
-      showToast(`Loaded image into ${node.title || node.type}`);
+      showToast(t("sidebar.loaded_into", { n: node.title || node.type }));
     }
 
     document.body.addEventListener("drop", async (e) => {
@@ -173,13 +174,13 @@ app.registerExtension({
         }
 
         const m = await api("/sidebar_gallery/metadata", { root_id, relpath });
-        if (!m?.workflow) { showToast("No workflow data in this image"); return; }
+        if (!m?.workflow) { showToast(t("sidebar.no_workflow")); return; }
         let wf = m.workflow;
         if (typeof wf === "string") wf = JSON.parse(wf);
         app.loadGraphData(wf);
-        showToast("Workflow loaded from drag & drop!");
+        showToast(t("sidebar.workflow_loaded"));
       } catch (err) {
-        showToast(`Failed to load: ${err?.message || err}`, 5000);
+        showToast(t("sidebar.load_failed", { e: err?.message || err }), 5000);
       }
     }, true);
 
@@ -196,8 +197,8 @@ app.registerExtension({
     app.extensionManager.registerSidebarTab({
       id: "sidebarGallery",
       icon: "pi pi-images",
-      title: "Gallery",
-      tooltip: "Sidebar Gallery",
+      title: t("sidebar.title"),
+      tooltip: t("sidebar.tooltip"),
       type: "custom",
       render: (mountEl) => {
         ensureCss();

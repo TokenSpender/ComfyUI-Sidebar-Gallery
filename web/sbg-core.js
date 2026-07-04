@@ -158,10 +158,10 @@ export function fmtBytes(b) {
 
 export function timeAgo(ts) {
   const diff = (Date.now() / 1000) - ts;
-  if (diff < 60) return "just now";
-  if (diff < 3600) return `${Math.floor(diff / 60)}m ago`;
-  if (diff < 86400) return `${Math.floor(diff / 3600)}h ago`;
-  if (diff < 604800) return `${Math.floor(diff / 86400)}d ago`;
+  if (diff < 60) return t("core.just_now");
+  if (diff < 3600) return t("core.m_ago", { n: Math.floor(diff / 60) });
+  if (diff < 86400) return t("core.h_ago", { n: Math.floor(diff / 3600) });
+  if (diff < 604800) return t("core.d_ago", { n: Math.floor(diff / 86400) });
   return new Date(ts * 1000).toLocaleDateString();
 }
 
@@ -177,18 +177,18 @@ export function showToast(msg, duration = 1800) {
 }
 
 export function copyText(text) {
-  if (text == null || text === "") { showToast("Nothing to copy"); return; }
+  if (text == null || text === "") { showToast(t("core.nothing_to_copy")); return; }
   const str = String(text);
   // navigator.clipboard only exists in a secure context (https or localhost).
   // ComfyUI is often served over plain HTTP on a LAN IP, where it is undefined,
   // so fall back to the legacy execCommand path.
   if (navigator.clipboard && window.isSecureContext) {
     navigator.clipboard.writeText(str)
-      .then(() => showToast("Copied"))
-      .catch(() => { if (!_copyFallback(str)) showToast("Copy failed"); });
+      .then(() => showToast(t("core.copied")))
+      .catch(() => { if (!_copyFallback(str)) showToast(t("core.copy_failed")); });
     return;
   }
-  if (!_copyFallback(str)) showToast("Copy failed");
+  if (!_copyFallback(str)) showToast(t("core.copy_failed"));
 }
 
 function _copyFallback(str) {
@@ -204,7 +204,7 @@ function _copyFallback(str) {
     ta.setSelectionRange(0, str.length);
     const ok = document.execCommand("copy");
     document.body.removeChild(ta);
-    if (ok) showToast("Copied");
+    if (ok) showToast(t("core.copied"));
     return ok;
   } catch {
     return false;
@@ -708,10 +708,10 @@ export const progressPoller = {
 export function formatProgress(entry) {
   if (!entry) return null;
   if (entry.phase === "error") {
-    return { text: `Indexing failed: ${entry.error || "unknown error"}`, pct: -1, error: true };
+    return { text: t("core.indexing_failed", { e: entry.error || "unknown error" }), pct: -1, error: true };
   }
   if (entry.phase === "scanning") {
-    return { text: `Scanning folder… ${(entry.total || 0).toLocaleString()} found`, pct: -1 };
+    return { text: t("core.scanning", { n: (entry.total || 0).toLocaleString() }), pct: -1 };
   }
   const total = entry.total || 0;
   const done = entry.done || 0;
@@ -1063,4 +1063,360 @@ export function highlightSearchMatches(container, query) {
       node.parentNode.replaceChild(frag, node);
     }
   }
+}
+
+/* ═══════════════════════════════════════════════════════════════════════
+   i18n – Lightweight translation layer
+   Auto-detects locale from navigator.language; falls back to English.
+   ═══════════════════════════════════════════════════════════════════════ */
+
+const _SBG_I18N = {
+  // ── sbg-core.js ──
+  "core.just_now":           { en: "just now",       zh: "刚刚" },
+  "core.m_ago":              { en: "{n}m ago",       zh: "{n}分钟前" },
+  "core.h_ago":              { en: "{n}h ago",       zh: "{n}小时前" },
+  "core.d_ago":              { en: "{n}d ago",       zh: "{n}天前" },
+  "core.nothing_to_copy":    { en: "Nothing to copy",zh: "没有可复制的内容" },
+  "core.copied":             { en: "Copied",         zh: "已复制" },
+  "core.copy_failed":        { en: "Copy failed",    zh: "复制失败" },
+  "core.scanning":           { en: "Scanning folder… {n} found", zh: "正在扫描文件夹… 找到 {n} 个文件" },
+  "core.indexing_failed":    { en: "Indexing failed: {e}",       zh: "索引失败: {e}" },
+
+  // ── sidebar_gallery.js ──
+  "sidebar.title":           { en: "Gallery",        zh: "图库" },
+  "sidebar.tooltip":         { en: "Sidebar Gallery",zh: "侧边栏图库" },
+  "sidebar.no_workflow":     { en: "No workflow data in this image", zh: "此图片中没有工作流数据" },
+  "sidebar.workflow_loaded": { en: "Workflow loaded from drag & drop!", zh: "已通过拖放加载工作流！" },
+  "sidebar.loaded_into":     { en: "Loaded image into {n}", zh: "已将图片加载到 {n}" },
+  "sidebar.load_failed":     { en: "Failed to load: {e}",   zh: "加载失败: {e}" },
+
+  // ── sbg-gallery.js ──
+  "gallery.all_folders":     { en: "All folders",    zh: "所有文件夹" },
+  "gallery.all":             { en: "All",            zh: "全部" },
+  "gallery.images_only":     { en: "Images only",    zh: "仅图片" },
+  "gallery.videos_only":     { en: "Videos only",    zh: "仅视频" },
+  "gallery.show_all_files":  { en: "Show all files", zh: "显示所有文件" },
+  "gallery.settings":        { en: "Gallery Settings", zh: "图库设置" },
+  "gallery.ready":           { en: "Ready",          zh: "就绪" },
+  "gallery.refresh_tip":     { en: "Refresh gallery (rescan disk)", zh: "刷新图库（重新扫描磁盘）" },
+  "gallery.clear_search":    { en: "Clear search",   zh: "清除搜索" },
+  "gallery.search_ph":       { en: "Search all fields… (name: for filename only)", zh: "搜索所有字段…（name: 仅搜文件名）" },
+  "gallery.search_tip":      { en: "Search across all metadata fields. Press Enter to add as a tag. Use name: for filename-only, model: lora: prompt: keyword: sampler: controlnet: for specific fields", zh: "搜索所有元数据字段。按 Enter 添加为标签。使用 name: 仅搜文件名，model: lora: prompt: keyword: sampler: controlnet: 搜索特定字段" },
+  "gallery.sort_tip":        { en: "Sort order",     zh: "排序方式" },
+  "gallery.click_change_root":{ en: "Click to change root", zh: "点击切换根目录" },
+  "gallery.browse_folders":  { en: "Browse folders", zh: "浏览文件夹" },
+  "gallery.toggle_and_or":   { en: "Toggle whether tags should match ALL requirements (AND) or ANY requirement (OR)", zh: "切换标签匹配模式：全部匹配(AND) 或 任意匹配(OR)" },
+  "gallery.created_desc":    { en: "Created ↓",      zh: "创建时间 ↓" },
+  "gallery.created_asc":     { en: "Created ↑",      zh: "创建时间 ↑" },
+  "gallery.modified_desc":   { en: "Modified ↓",     zh: "修改时间 ↓" },
+  "gallery.modified_asc":    { en: "Modified ↑",     zh: "修改时间 ↑" },
+  "gallery.name_asc":        { en: "Name ↑",         zh: "名称 ↑" },
+  "gallery.name_desc":       { en: "Name ↓",         zh: "名称 ↓" },
+  "gallery.size_desc":       { en: "Size ↓",         zh: "大小 ↓" },
+  "gallery.size_asc":        { en: "Size ↑",         zh: "大小 ↑" },
+  "gallery.positive":        { en: "POSITIVE",       zh: "正面" },
+  "gallery.negative":        { en: "NEGATIVE",       zh: "负面" },
+  "gallery.filename":        { en: "FILENAME",       zh: "文件名" },
+  "gallery.keyword":         { en: "KEYWORD",        zh: "关键词" },
+
+  // ── First-time modal ──
+  "gallery.building_index":  { en: "🗂️ Building Index for the First Time", zh: "🗂️ 首次构建索引" },
+  "gallery.building_desc":   { en: "This will scan all media files and parse their metadata. This may take 2-10 minutes depending on library size.", zh: "将扫描所有媒体文件并解析元数据。根据库大小，可能需要 2-10 分钟。" },
+  "gallery.start_indexing":  { en: "🚀 Start Indexing",  zh: "🚀 开始索引" },
+  "gallery.skip_no_meta":    { en: "Skip (no metadata)", zh: "跳过（无元数据）" },
+  "gallery.no_media":        { en: "No media found",     zh: "未找到媒体文件" },
+
+  // ── sbg-lightbox.js ──
+  "lb.prev":                 { en: "Previous ({k})",     zh: "上一张 ({k})" },
+  "lb.next":                 { en: "Next ({k})",         zh: "下一张 ({k})" },
+  "lb.close":                { en: "Close ({k})",        zh: "关闭 ({k})" },
+  "lb.download":             { en: "⬇ Download",         zh: "⬇ 下载" },
+  "lb.download_tip":         { en: "Download file",      zh: "下载文件" },
+  "lb.load_wf":              { en: "Load Workflow",      zh: "加载工作流" },
+  "lb.load_wf_tip":          { en: "Load workflow into ComfyUI", zh: "将工作流加载到 ComfyUI" },
+  "lb.copy_prompt":          { en: "Copy Prompt",        zh: "复制提示词" },
+  "lb.copy_prompt_tip":      { en: "Copy positive prompt", zh: "复制正面提示词" },
+  "lb.copy_wf":              { en: "Copy WF",            zh: "复制工作流" },
+  "lb.copy_wf_tip":          { en: "Copy workflow JSON",  zh: "复制工作流 JSON" },
+  "lb.compare":              { en: "⚖ Compare",          zh: "⚖ 对比" },
+  "lb.compare_tip":          { en: "Compare with another image (C)", zh: "与另一张图片对比 (C)" },
+  "lb.exit_compare":         { en: "✕ Exit Compare",     zh: "✕ 退出对比" },
+  "lb.loading_meta":         { en: "Loading metadata…",  zh: "正在加载元数据…" },
+  "lb.no_meta":              { en: "No metadata",        zh: "无元数据" },
+  "lb.generated":            { en: "Generated",          zh: "生成信息" },
+  "lb.initial_image":        { en: "Initial Image",      zh: "初始图片" },
+  "lb.source_image":         { en: "Source Image",       zh: "源图片" },
+  "lb.loading_init_meta":    { en: "Loading initial image metadata…", zh: "正在加载初始图片元数据…" },
+  "lb.source_meta_unavail":  { en: "Source image metadata unavailable", zh: "源图片元数据不可用" },
+  "lb.loading_wf":           { en: "Loading…",           zh: "加载中…" },
+  "lb.no_workflow":           { en: "No workflow data",   zh: "无工作流数据" },
+  "lb.compare_with":         { en: "⚖ Comparing: {f}",   zh: "⚖ 对比中: {f}" },
+  "lb.same":                 { en: "■ Same",             zh: "■ 相同" },
+  "lb.changed":              { en: "■ Changed",          zh: "■ 已变更" },
+  "lb.current_only":         { en: "■ Current only",     zh: "■ 仅当前" },
+  "lb.compared_only":        { en: "■ Compared only",    zh: "■ 仅对比" },
+  "lb.current":              { en: "Current",            zh: "当前" },
+  "lb.compared":             { en: "Compared",           zh: "对比" },
+  "lb.diff":                 { en: "DIFF",               zh: "差异" },
+  "lb.same_label":           { en: "SAME",               zh: "相同" },
+  "lb.error":                { en: "Error: {e}",         zh: "错误: {e}" },
+
+  // ── sbg-settings.js ──
+  "gs.title":                { en: "⚙ Gallery Settings",    zh: "⚙ 图库设置" },
+  "gs.close":                { en: "Close",                  zh: "关闭" },
+  "gs.tab_layout":           { en: "Layout",                 zh: "布局" },
+  "gs.tab_appearance":       { en: "Appearance",             zh: "外观" },
+  "gs.tab_keybindings":      { en: "Keybindings",            zh: "快捷键" },
+  "gs.tab_settings":         { en: "Settings",               zh: "设置" },
+  "gs.tab_presets":          { en: "Presets",                 zh: "预设" },
+  "gs.tab_diagnostics":      { en: "Diagnostics",            zh: "诊断" },
+  "gs.badge_colors":         { en: "Badge Colors",           zh: "徽章颜色" },
+  "gs.high_badge":           { en: " Badge",                 zh: " 徽章" },
+  "gs.low_badge":            { en: " Badge",                 zh: " 徽章" },
+  "gs.video_badge":          { en: " Badge",                 zh: " 徽章" },
+  "gs.search_badge":         { en: " Search Badge",          zh: " 搜索徽章" },
+  "gs.exclude_badge":        { en: " Exclude Badge",         zh: " 排除徽章" },
+  "gs.highlight_color":      { en: "Highlight Color",        zh: "高亮颜色" },
+  "gs.search_highlight":     { en: "Search ",                zh: "搜索 " },
+  "gs.theme":                { en: "Theme",                  zh: "主题" },
+  "gs.gallery_theme":        { en: "Gallery Theme",          zh: "图库主题" },
+  "gs.gallery_theme_tip":    { en: "Color theme for the gallery sidebar", zh: "图库侧边栏的配色主题" },
+  "gs.custom_theme_desc":    { en: "Configure your own custom UI colors.", zh: "自定义你的 UI 颜色。" },
+  "gs.background":           { en: "Background",             zh: "背景" },
+  "gs.surface":              { en: "Surface",                zh: "表面" },
+  "gs.border":               { en: "Border elements",        zh: "边框" },
+  "gs.text":                 { en: "Text",                   zh: "文字" },
+  "gs.accent":               { en: "Accent",                 zh: "强调色" },
+  "gs.lb_btn_colors":        { en: "Lightbox Button Colors", zh: "灯箱按钮颜色" },
+  "gs.lb_btn_colors_desc":   { en: "Leave blank for default colors.", zh: "留空使用默认颜色。" },
+  "gs.app_badge_colors":     { en: "App Badge Colors",       zh: "应用徽章颜色" },
+  "gs.app_badge_desc":       { en: "Customize the color of each source application badge. Leave blank for defaults.", zh: "自定义各来源应用徽章的颜色。留空使用默认值。" },
+  "gs.initial_image_tab":    { en: "Initial Image Tab",      zh: "初始图片选项卡" },
+  "gs.pill_colors":          { en: "Pill / Badge Colors",    zh: "药丸/徽章颜色" },
+  "gs.pill_colors_desc":     { en: "Customize the color of metadata pills and badges. Leave empty for defaults.", zh: "自定义元数据药丸和徽章的颜色。留空使用默认值。" },
+  "gs.pill_bg":              { en: "Background",             zh: "背景" },
+  "gs.pill_text":            { en: "Text",                   zh: "文字" },
+  "gs.pill_border":          { en: "Border",                 zh: "边框" },
+  "gs.preview":              { en: "Preview:",               zh: "预览:" },
+  "gs.kb_title":             { en: "Keyboard Shortcuts",     zh: "键盘快捷键" },
+  "gs.kb_desc":              { en: "Comma-separated key names. Example: ArrowLeft,a", zh: "逗号分隔的按键名称。例如: ArrowLeft,a" },
+  "gs.kb_prev":              { en: "Previous Image",         zh: "上一张图片" },
+  "gs.kb_next":              { en: "Next Image",             zh: "下一张图片" },
+  "gs.kb_close":             { en: "Close Lightbox",         zh: "关闭灯箱" },
+  "gs.kb_toggle":            { en: "Toggle Gallery",         zh: "切换图库" },
+  "gs.kb_refresh":           { en: "Refresh Gallery",        zh: "刷新图库" },
+  "gs.kb_fullscreen":        { en: "Fullscreen",             zh: "全屏" },
+  "gs.kb_download":          { en: "Download",               zh: "下载" },
+  "gs.kb_copy_prompt":       { en: "Copy Prompt",            zh: "复制提示词" },
+  "gs.kb_copy_wf":           { en: "Copy Workflow",          zh: "复制工作流" },
+  "gs.kb_load_wf":           { en: "Load Workflow",          zh: "加载工作流" },
+  "gs.kb_note":              { en: "Note: Arrows seek video in fullscreen. A/D always navigate.", zh: "注意: 全屏时方向键控制视频播放进度。A/D 始终用于导航。" },
+  "gs.lb_actions":           { en: "Lightbox Actions",       zh: "灯箱操作" },
+  "gs.gallery_section":      { en: "Gallery",                zh: "图库" },
+  "gs.thumb_size":           { en: "Thumbnail Size (px)",    zh: "缩略图大小 (px)" },
+  "gs.thumb_size_tip":       { en: "Size of thumbnail grid cells (64-256). Only used when Items Per Row is 'auto' - it decides how many columns fit.", zh: "缩略图网格单元大小(64-256)。仅当每行项目数为'auto'时使用 - 决定可容纳多少列。" },
+  "gs.items_per_row":        { en: "Items Per Row",          zh: "每行项目数" },
+  "gs.items_per_row_tip":    { en: "auto = fit as many as the Thumbnail Size allows. A number = ALWAYS that many per row; thumbnails are sized to fill the row based on their aspect ratios. Reopen the gallery to apply.", zh: "auto = 按缩略图大小自适应。数字 = 固定每行数量；缩略图根据宽高比自适应。重新打开图库生效。" },
+  "gs.thumb_shape":          { en: "Thumbnail Shape",        zh: "缩略图形状" },
+  "gs.thumb_shape_tip":      { en: "Square crops; AR preserves aspect ratio", zh: "正方形裁剪；AR 保持原始宽高比" },
+  "gs.default_sort":         { en: "Default Sort",           zh: "默认排序" },
+  "gs.default_sort_tip":     { en: "Default sort order for gallery items (matches the gallery's sort menu)", zh: "图库项目的默认排序（与图库排序菜单一致）" },
+  "gs.scroll_buffer":        { en: "Scroll Buffer (rows)",   zh: "滚动缓冲区（行）" },
+  "gs.scroll_buffer_tip":    { en: "Extra rows pre-rendered above/below viewport (2-30). Higher = less blank space on fast scroll, but more DOM nodes.", zh: "视口上方/下方预渲染的额外行数(2-30)。越高 = 快速滚动时空白越少，但 DOM 节点越多。" },
+  "gs.auto_refresh":         { en: "Auto-refresh interval",  zh: "自动刷新间隔" },
+  "gs.auto_refresh_tip":     { en: "How often the open gallery checks for files added, removed, or renamed on disk (minimum 5s). 0 turns off the background timer; the gallery still checks once when you come back to it. Applies right away.", zh: "打开的图库检查磁盘文件增删改的频率（最少5秒）。0 关闭后台定时器；切换回图库时仍会检查一次。立即生效。" },
+  "gs.tooltips":             { en: "Tooltips",               zh: "工具提示" },
+  "gs.show_filename":        { en: "Show Filename",          zh: "显示文件名" },
+  "gs.show_filename_tip":    { en: "Show filename in card tooltip", zh: "在卡片工具提示中显示文件名" },
+  "gs.show_filesize":        { en: "Show File Size",         zh: "显示文件大小" },
+  "gs.show_filesize_tip":    { en: "Show file size in card tooltip", zh: "在卡片工具提示中显示文件大小" },
+  "gs.show_date":            { en: "Show Date",              zh: "显示日期" },
+  "gs.show_date_tip":        { en: "Show date in card tooltip", zh: "在卡片工具提示中显示日期" },
+  "gs.lb_buttons":           { en: "Lightbox Buttons",       zh: "灯箱按钮" },
+  "gs.lb_buttons_desc":      { en: "Show or hide individual buttons in the lightbox toolbar.", zh: "显示或隐藏灯箱工具栏中的各个按钮。" },
+  "gs.dl_button":            { en: "Download Button",        zh: "下载按钮" },
+  "gs.dl_button_tip":        { en: "Show download button in lightbox", zh: "在灯箱中显示下载按钮" },
+  "gs.cp_button":            { en: "Copy Prompt Button",     zh: "复制提示词按钮" },
+  "gs.cp_button_tip":        { en: "Show copy prompt button in lightbox", zh: "在灯箱中显示复制提示词按钮" },
+  "gs.cwf_button":           { en: "Copy WF Button",         zh: "复制工作流按钮" },
+  "gs.cwf_button_tip":       { en: "Show copy workflow button in lightbox", zh: "在灯箱中显示复制工作流按钮" },
+  "gs.lwf_button":           { en: "Load Workflow Button",   zh: "加载工作流按钮" },
+  "gs.lwf_button_tip":       { en: "Show load workflow button in lightbox", zh: "在灯箱中显示加载工作流按钮" },
+  "gs.metadata":             { en: "Metadata",               zh: "元数据" },
+  "gs.default_tab_view":     { en: "Default Tab View",       zh: "默认选项卡视图" },
+  "gs.default_tab_view_tip": { en: "Which tab opens first in tabbed sections. For prompt sections this picks Enhanced or Original; 'Remember' keeps your last-opened tab on every tabbed section.", zh: "选项卡区域默认打开哪个。对于提示词区域选择增强版或原始版；'记住'会保留上次打开的选项卡。" },
+  "gs.prompt_padding":       { en: "Prompt Padding",         zh: "提示词内边距" },
+  "gs.prompt_padding_tip":   { en: "Horizontal padding inside prompt text boxes (in px); top/bottom run 2px tighter.", zh: "提示词文本框内的水平内边距(px)；上下内边距少2px。" },
+  "gs.filename_display":     { en: "Filename Display",       zh: "文件名显示" },
+  "gs.filename_display_tip": { en: "Show just the filename or the full relative path in File Info.", zh: "在文件信息中显示文件名或完整相对路径。" },
+  "gs.model_display":        { en: "Model Display",          zh: "模型显示" },
+  "gs.model_display_tip":    { en: "Show model and LoRA names as just the filename (basename) or the full relative path.", zh: "显示模型和 LoRA 名称时使用文件名或完整相对路径。" },
+  "gs.remember_tab":         { en: "Remember Metadata Tab",  zh: "记住元数据选项卡" },
+  "gs.remember_tab_tip":     { en: "Keep the active metadata tab (Generated/Initial Image) when navigating between images.", zh: "在图片间导航时保持活动的元数据选项卡（生成信息/初始图片）。" },
+  "gs.folders":              { en: "Folders",                zh: "文件夹" },
+  "gs.folders_desc":         { en: "Extra folders to browse and index alongside ComfyUI's output folder. Paths are on the machine running ComfyUI.", zh: "除 ComfyUI 输出文件夹外，额外浏览和索引的文件夹。路径为运行 ComfyUI 的机器上的路径。" },
+  "gs.output":               { en: "Output",                 zh: "输出" },
+  "gs.output_desc":          { en: "ComfyUI's output folder", zh: "ComfyUI 的输出文件夹" },
+  "gs.builtin":              { en: "built-in",               zh: "内置" },
+  "gs.add":                  { en: "+ Add",                  zh: "+ 添加" },
+  "gs.folder_removed":       { en: "Folder removed",         zh: "文件夹已移除" },
+  "gs.remove_folder_tip":    { en: "Remove this folder from the gallery (files on disk are not touched)", zh: "从图库中移除此文件夹（不删除磁盘上的文件）" },
+  "gs.folder_added":         { en: "Folder added - it will be indexed when you open it", zh: "文件夹已添加 - 打开时将被索引" },
+  "gs.folder_not_added":     { en: "Folder not added - check the path exists on the ComfyUI machine", zh: "文件夹未添加 - 请检查路径在 ComfyUI 机器上是否存在" },
+  "gs.excluded_folders":     { en: "Excluded folders",       zh: "排除的文件夹" },
+  "gs.excluded_folders_desc":{ en: "Folder names to skip while scanning (e.g. thumbnails, backup). Matching is by folder name, not full path, and is not case-sensitive. Changes take effect on the next scan.", zh: "扫描时跳过的文件夹名（如 thumbnails, backup）。按文件夹名匹配，不区分大小写。更改在下次扫描时生效。" },
+  "gs.include_hidden":       { en: "Include hidden folders", zh: "包含隐藏文件夹" },
+  "gs.include_hidden_tip":   { en: "Also scan folders whose names start with a dot (e.g. .thumbs). Off by default - hidden folders are skipped.", zh: "同时扫描以点开头的文件夹（如 .thumbs）。默认关闭 - 跳过隐藏文件夹。" },
+  "gs.hidden_scanned":       { en: "Hidden folders will be scanned on the next scan", zh: "隐藏文件夹将在下次扫描时被扫描" },
+  "gs.hidden_skipped":       { en: "Hidden folders will be skipped on the next scan", zh: "隐藏文件夹将在下次扫描时被跳过" },
+  "gs.no_excluded":          { en: "No extra folders excluded.", zh: "没有额外排除的文件夹。" },
+  "gs.stop_excluding_tip":   { en: "Stop excluding this folder (its files reappear on the next scan)", zh: "停止排除此文件夹（文件将在下次扫描时重新出现）" },
+  "gs.folder_no_longer":     { en: "Folder no longer excluded - it will be re-indexed on the next scan", zh: "文件夹不再排除 - 将在下次扫描时重新索引" },
+  "gs.enter_folder_name":    { en: "Enter a folder name to exclude", zh: "请输入要排除的文件夹名" },
+  "gs.already_excluded":     { en: "Already excluded",       zh: "已被排除" },
+  "gs.folder_excluded":      { en: "Folder excluded - it will be skipped on the next scan", zh: "文件夹已排除 - 将在下次扫描时被跳过" },
+  "gs.presets":              { en: "Presets",                 zh: "预设" },
+  "gs.presets_desc":         { en: "Save and load gallery configuration presets.", zh: "保存和加载图库配置预设。" },
+  "gs.layout":               { en: " Layout",                zh: " 布局" },
+  "gs.colors":               { en: " Colors",                zh: " 颜色" },
+  "gs.settings_label":       { en: " Settings",              zh: " 设置" },
+  "gs.keybindings_label":    { en: " Keybindings",           zh: " 快捷键" },
+  "gs.preset_name":          { en: "Preset name",            zh: "预设名称" },
+  "gs.save_preset":          { en: "💾 Save Preset",         zh: "💾 保存预设" },
+  "gs.enter_preset_name":    { en: "Enter a preset name",    zh: "请输入预设名称" },
+  "gs.preset_saved":         { en: "Preset \"{n}\" saved",   zh: "预设 \"{n}\" 已保存" },
+  "gs.saved_presets":        { en: "Saved Presets",          zh: "已保存的预设" },
+  "gs.load":                 { en: "Load",                   zh: "加载" },
+  "gs.sure":                 { en: "Sure?",                  zh: "确定？" },
+  "gs.preset_loaded":        { en: "Preset \"{n}\" loaded. Refresh gallery to apply.", zh: "预设 \"{n}\" 已加载。刷新图库以应用。" },
+  "gs.import":               { en: "Import",                 zh: "导入" },
+  "gs.import_preset":        { en: "📥 Import Preset",       zh: "📥 导入预设" },
+  "gs.invalid_preset":       { en: "Invalid preset file",    zh: "无效的预设文件" },
+  "gs.preset_imported":      { en: "Preset \"{n}\" imported", zh: "预设 \"{n}\" 已导入" },
+  "gs.import_error":         { en: "Import error: {e}",      zh: "导入错误: {e}" },
+  "gs.server_themes":        { en: "Server Themes",          zh: "服务器主题" },
+  "gs.server_themes_desc":   { en: "Presets stored in the extension's themes/ folder. Persist across reinstalls.", zh: "存储在扩展 themes/ 文件夹中的预设。重装后仍然保留。" },
+  "gs.loading":              { en: "Loading...",              zh: "加载中..." },
+  "gs.no_server_themes":     { en: "No server themes found.", zh: "未找到服务器主题。" },
+  "gs.server_theme_loaded":  { en: "Server theme \"{n}\" loaded. Refresh gallery to apply.", zh: "服务器主题 \"{n}\" 已加载。刷新图库以应用。" },
+  "gs.save_to_server":       { en: "💾 Save to Server",      zh: "💾 保存到服务器" },
+  "gs.theme_saved_server":   { en: "Theme \"{n}\" saved to server", zh: "主题 \"{n}\" 已保存到服务器" },
+  "gs.diagnostics":          { en: "Diagnostics & Tools",    zh: "诊断与工具" },
+  "gs.refresh":              { en: "🔃 Refresh",             zh: "🔃 刷新" },
+  "gs.refresh_tip":          { en: "Re-fetch all items from the server and refresh the gallery view", zh: "从服务器重新获取所有项目并刷新图库视图" },
+  "gs.refreshing":           { en: "Refreshing…",            zh: "正在刷新…" },
+  "gs.gallery_refreshed":    { en: "Gallery refreshed",      zh: "图库已刷新" },
+  "gs.rebuild_db":           { en: "🔄 Rebuild DB Index",    zh: "🔄 重建数据库索引" },
+  "gs.rebuild_db_tip":       { en: "Rescan all roots and rebuild metadata/tag index on server", zh: "重新扫描所有根目录并重建服务器上的元数据/标签索引" },
+  "gs.rebuilding":           { en: "🔄 Rebuilding DB... ({p}%)", zh: "🔄 正在重建数据库... ({p}%)" },
+  "gs.db_success":           { en: "🔄 DB Indexed Successfully!", zh: "🔄 数据库索引成功！" },
+  "gs.db_busy":              { en: "Couldn't start - another scan is running", zh: "无法启动 - 另一个扫描正在运行" },
+  "gs.cache_meta":           { en: "📦 Cache All Metadata",  zh: "📦 缓存所有元数据" },
+  "gs.cache_meta_tip":       { en: "Fetch and cache metadata summaries for all files to IndexedDB", zh: "获取所有文件的元数据摘要并缓存到 IndexedDB" },
+  "gs.caching":              { en: "Caching…",               zh: "缓存中…" },
+  "gs.meta_cached":          { en: "Metadata cached: {n} items", zh: "元数据已缓存: {n} 项" },
+  "gs.cache_thumbs":         { en: "🖼️ Cache Thumbnails",   zh: "🖼️ 缓存缩略图" },
+  "gs.cache_thumbs_tip":     { en: "Cache all lazy-load thumbnails into the local browser IndexedDB", zh: "将所有延迟加载的缩略图缓存到浏览器 IndexedDB" },
+  "gs.thumbs_cached":        { en: "Thumbnails cached: {n} items", zh: "缩略图已缓存: {n} 项" },
+  "gs.clear_meta_cache":     { en: "🗑️ Clear Meta Cache",   zh: "🗑️ 清除元数据缓存" },
+  "gs.clear_meta_tip":       { en: "Clear browser IndexedDB metadata cache", zh: "清除浏览器 IndexedDB 元数据缓存" },
+  "gs.meta_cache_cleared":   { en: "Metadata cache cleared",  zh: "元数据缓存已清除" },
+  "gs.clear_thumb_cache":    { en: "🗑️ Clear Thumb Cache",  zh: "🗑️ 清除缩略图缓存" },
+  "gs.clear_thumb_tip":      { en: "Clear browser IndexedDB thumbnails cache", zh: "清除浏览器 IndexedDB 缩略图缓存" },
+  "gs.thumb_cache_cleared":  { en: "Thumbnails cache cleared", zh: "缩略图缓存已清除" },
+  "gs.nuclear_clear":        { en: "💣 Nuclear Clear All",   zh: "💣 全部清除" },
+  "gs.nuclear_tip":          { en: "Delete ALL browser cache databases (including legacy), reset version tracking, clean up old settings keys, and reload. Fixes any corruption.", zh: "删除所有浏览器缓存数据库（包括旧版），重置版本跟踪，清理旧设置键并重新加载。修复任何损坏。" },
+  "gs.nuclear_confirm":      { en: "⚠️ Sure? This will reload the page", zh: "⚠️ 确定？这将重新加载页面" },
+  "gs.sqlite_index":         { en: "SQLite Index",           zh: "SQLite 索引" },
+  "gs.sqlite_index_tip":     { en: "Server-side SQLite database that stores the file listing and parsed metadata summaries for fast gallery loading without disk scanning", zh: "服务器端 SQLite 数据库，存储文件列表和解析后的元数据摘要，用于无需磁盘扫描的快速图库加载" },
+  "gs.db_path":              { en: "DB Path",                zh: "数据库路径" },
+  "gs.db_path_tip":          { en: "Full filesystem path of the SQLite database file", zh: "SQLite 数据库文件的完整文件系统路径" },
+  "gs.db_size":              { en: "DB Size",                zh: "数据库大小" },
+  "gs.db_size_tip":          { en: "Size of the SQLite database file on disk", zh: "磁盘上 SQLite 数据库文件的大小" },
+  "gs.server_thumbs":        { en: "Server Thumbnails",      zh: "服务器缩略图" },
+  "gs.server_thumbs_tip":    { en: "JPEG thumbnails generated and stored on the server in the .thumbs folder. Shared across all browsers/clients. No in-memory cache - served directly from disk on each request.", zh: "在服务器 .thumbs 文件夹中生成和存储的 JPEG 缩略图。所有浏览器/客户端共享。无内存缓存 - 每次请求直接从磁盘提供。" },
+  "gs.count":                { en: "Count",                  zh: "数量" },
+  "gs.size":                 { en: "Size",                   zh: "大小" },
+  "gs.browser_thumb_cache":  { en: "Browser Thumb Cache",    zh: "浏览器缩略图缓存" },
+  "gs.browser_thumb_tip":    { en: "Thumbnails cached in this browser's IndexedDB for instant loading without server requests.", zh: "缓存在浏览器 IndexedDB 中的缩略图，可即时加载无需服务器请求。" },
+  "gs.cached":               { en: "Cached",                 zh: "已缓存" },
+  "gs.browser_meta_cache":   { en: "Browser Meta Cache",     zh: "浏览器元数据缓存" },
+  "gs.browser_meta_tip":     { en: "Parsed metadata summaries cached in IndexedDB and in-memory.", zh: "解析后的元数据摘要缓存在 IndexedDB 和内存中。" },
+  "gs.indexed_db":           { en: "IndexedDB",              zh: "IndexedDB" },
+  "gs.in_memory":            { en: "In-memory",              zh: "内存中" },
+  "gs.in_memory_tip":        { en: "Metadata entries in JS memory for this session", zh: "本次会话中 JS 内存中的元数据条目" },
+  "gs.files":                { en: " files",                 zh: " 个文件" },
+  "gs.entries":              { en: " entries",               zh: " 条目" },
+  "gs.thumbs":               { en: " thumbs",                zh: " 个缩略图" },
+
+  // ── sbg-layout-editor.js ──
+  "le.images":               { en: "Images",                 zh: "图片" },
+  "le.videos":               { en: "Videos",                 zh: "视频" },
+  "le.clone_images":         { en: "⇐ Clone Images",         zh: "⇐ 克隆图片布局" },
+  "le.cloned":               { en: "Cloned image layout to video", zh: "已将图片布局克隆到视频" },
+  "le.reset":                { en: "↺ Reset",                zh: "↺ 重置" },
+  "le.profile_reset":        { en: "Profile reset to default", zh: "配置已重置为默认值" },
+  "le.hint":                 { en: "Drag ⋮⋮ to reorder. Expand a section to edit its fields, or drag fields in from the tray below. The right pane previews your panel live.", zh: "拖动 ⋮⋮ 重新排序。展开区域编辑字段，或从下方托盘拖入字段。右侧面板实时预览。" },
+  "le.add_section":          { en: "+ Add Section",          zh: "+ 添加区域" },
+  "le.new_section":          { en: "New Section",            zh: "新区域" },
+  "le.drag_reorder":         { en: "Drag to reorder section",zh: "拖动以重新排序区域" },
+  "le.expand_collapse":      { en: "Expand / collapse fields", zh: "展开/折叠字段" },
+  "le.hidden_from_panel":    { en: "Hidden from panel — click to show", zh: "面板中已隐藏 - 点击显示" },
+  "le.shown_in_panel":       { en: "Shown in panel — click to hide", zh: "面板中已显示 - 点击隐藏" },
+  "le.section_title":        { en: "Section title",          zh: "区域标题" },
+  "le.section_colors":       { en: "Section background / colours", zh: "区域背景/颜色" },
+  "le.expanded_default":     { en: "Expanded by default in the panel", zh: "面板中默认展开" },
+  "le.open":                 { en: "open",                   zh: "展开" },
+  "le.delete_section":       { en: "Delete section",         zh: "删除区域" },
+  "le.cards_from":           { en: "Cards from:",            zh: "卡片来源:" },
+  "le.cards_from_help":      { en: "Leave empty for one card per whole image, or set a source like 'loras' to render one card per item in that array.", zh: "留空为每张图片一个卡片，或设置来源如 'loras' 为该数组的每个项目渲染一个卡片。" },
+  "le.show_when":            { en: "Show when:",             zh: "显示条件:" },
+  "le.show_when_help":       { en: "Show this section only when a specific app is the source. Empty = always show.", zh: "仅当特定应用为来源时显示此区域。留空 = 始终显示。" },
+  "le.pair_highlow":         { en: "pair high/low",          zh: "配对高/低" },
+  "le.pair_highlow_tip":     { en: "Pair high-noise / low-noise models side-by-side (Wan2.2-style MoE)", zh: "将高噪声/低噪声模型并排配对（Wan2.2 风格 MoE）" },
+  "le.section_bg_tip":       { en: "Color for {app} source badge", zh: "{app} 来源徽章的颜色" },
+
+  // ── Section display names (used in search match badges) ──
+  "section.file_info":       { en: "File Info",              zh: "文件信息" },
+  "section.models":          { en: "Models",                 zh: "模型" },
+  "section.positive":        { en: "Positive Prompt",        zh: "正面提示词" },
+  "section.negative":        { en: "Negative Prompt",        zh: "负面提示词" },
+  "section.initial_prompt":  { en: "Original Prompt (pre-enhance)", zh: "原始提示词（增强前）" },
+  "section.sampling":        { en: "Sampling",               zh: "采样" },
+  "section.loras":           { en: "LoRAs",                  zh: "LoRAs" },
+  "section.controlnet":      { en: "ControlNet",             zh: "ControlNet" },
+  "section.adetailer":       { en: "ADetailer",              zh: "ADetailer" },
+  "section.upscaling":       { en: "Upscaling",              zh: "放大" },
+  "section.interpolation":   { en: "Interpolation",          zh: "插值" },
+  "section.mmaudio":         { en: "MMAudio",                zh: "MMAudio" },
+  "section.extra":           { en: "Extra Metadata",         zh: "额外元数据" },
+  "section.workflow_nodes":  { en: "Workflow Nodes",         zh: "工作流节点" },
+  "section.raw":             { en: "Raw Metadata",           zh: "原始元数据" },
+};
+
+let _sbgLang = null;
+
+/** Detect locale: returns "zh" for Chinese, "en" otherwise. */
+function _detectLocale() {
+  const nav = (navigator.language || navigator.userLanguage || "en").toLowerCase();
+  return nav.startsWith("zh") ? "zh" : "en";
+}
+
+/** Translate a key. Falls back to English if missing. Supports {k} placeholders. */
+export function t(key, replacements) {
+  if (_sbgLang === null) _sbgLang = _detectLocale();
+  const entry = _SBG_I18N[key];
+  let str = entry ? (entry[_sbgLang] || entry.en) : key;
+  if (replacements) {
+    for (const [k, v] of Object.entries(replacements)) {
+      str = str.replace(new RegExp(`\\{${k}\\}`, "g"), v);
+    }
+  }
+  return str;
+}
+
+/** Get current language code ("en" or "zh"). */
+export function getLang() {
+  if (_sbgLang === null) _sbgLang = _detectLocale();
+  return _sbgLang;
 }
