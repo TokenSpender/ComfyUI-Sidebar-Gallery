@@ -123,6 +123,19 @@ export function ensureCss() {
   document.head.appendChild(link);
 }
 
+/** Lazy-load the <model-viewer> web component for 3D preview. */
+let _mvLoaded = false;
+export function ensureModelViewer() {
+  if (_mvLoaded || document.querySelector("model-viewer")) { _mvLoaded = true; return; }
+  if (document.querySelector('script[data-sbg-mv="1"]')) return;
+  const s = document.createElement("script");
+  s.type = "module";
+  s.src = "https://ajax.googleapis.com/ajax/libs/model-viewer/4.0.0/model-viewer.min.js";
+  s.dataset.sbgMv = "1";
+  document.head.appendChild(s);
+  _mvLoaded = true;
+}
+
 export function h(tag, attrs = {}, children = []) {
   const el = document.createElement(tag);
   for (const [k, v] of Object.entries(attrs)) {
@@ -222,6 +235,8 @@ export function fileUrl(it) {
 }
 
 export function isVideo(it) { return it.kind === "video"; }
+export function isAudio(it) { return it.kind === "audio"; }
+export function is3D(it) { return it.kind === "mesh"; }
 
 /* ── Persistent IndexedDB cache (thumbnails + metadata) ──────────── */
 
@@ -584,6 +599,8 @@ export function resetFailedThumbs() {
 
 export const PLAY_SVG = `<svg viewBox="0 0 24 24" width="16" height="16" fill="white"><polygon points="8,5 19,12 8,19"/></svg>`;
 export const VIDEO_ICON = `<svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.5"><polygon points="23 7 16 12 23 17 23 7"/><rect x="1" y="5" width="15" height="14" rx="2" ry="2"/></svg>`;
+export const AUDIO_ICON = `<svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.5"><path d="M9 18V5l12-2v13"/><circle cx="6" cy="18" r="3"/><circle cx="18" cy="16" r="3"/></svg>`;
+export const MESH_ICON = `<svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.5"><path d="M12 2L2 7l10 5 10-5-10-5z"/><path d="M2 17l10 5 10-5"/><path d="M2 12l10 5 10-5"/></svg>`;
 export const IMG_ICON = `<svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.5"><rect x="3" y="3" width="18" height="18" rx="2" ry="2"/><circle cx="8.5" cy="8.5" r="1.5"/><polyline points="21 15 16 10 5 21"/></svg>`;
 export const IMG_FILTER_ICON = `<svg viewBox="0 0 24 24" width="14" height="14" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><rect x="3" y="3" width="18" height="18" rx="2"/><circle cx="8.5" cy="8.5" r="1.5"/><path d="M21 15l-5-5L5 21"/></svg>`;
 export const SEARCH_SVG = `<svg viewBox="0 0 24 24" width="14" height="14" fill="none" stroke="currentColor" stroke-width="2"><circle cx="11" cy="11" r="7"/><line x1="16.65" y1="16.65" x2="21" y2="21"/></svg>`;
@@ -1095,6 +1112,8 @@ const _SBG_I18N = {
   "gallery.all":             { en: "All",            zh: "全部" },
   "gallery.images_only":     { en: "Images only",    zh: "仅图片" },
   "gallery.videos_only":     { en: "Videos only",    zh: "仅视频" },
+  "gallery.audio_only":      { en: "Audio only",     zh: "仅音频" },
+  "gallery.mesh_only":       { en: "3D only",        zh: "仅3D" },
   "gallery.show_all_files":  { en: "Show all files", zh: "显示所有文件" },
   "gallery.settings":        { en: "Gallery Settings", zh: "图库设置" },
   "gallery.ready":           { en: "Ready",          zh: "就绪" },
@@ -1375,6 +1394,18 @@ const _SBG_I18N = {
   "le.pair_highlow":         { en: "pair high/low",          zh: "配对高/低" },
   "le.pair_highlow_tip":     { en: "Pair high-noise / low-noise models side-by-side (Wan2.2-style MoE)", zh: "将高噪声/低噪声模型并排配对（Wan2.2 风格 MoE）" },
   "le.section_bg_tip":       { en: "Color for {app} source badge", zh: "{app} 来源徽章的颜色" },
+
+  // ── Context menu ──
+  "ctx.preview":             { en: "Preview",                zh: "预览" },
+  "ctx.download":            { en: "Download",               zh: "下载" },
+  "ctx.insert_node":        { en: "Insert as Node",         zh: "作为节点插入" },
+  "ctx.load_workflow":       { en: "Load Workflow",          zh: "加载工作流" },
+  "ctx.copy_prompt":         { en: "Copy Prompt",            zh: "复制提示词" },
+  "ctx.export_workflow":     { en: "Export Workflow",         zh: "导出工作流" },
+  "ctx.copy_path":           { en: "Copy Path",              zh: "复制路径" },
+  "ctx.open_explorer":       { en: "Open in Explorer",       zh: "在资源管理器中打开" },
+  "ctx.delete":              { en: "Delete",                 zh: "删除" },
+  "ctx.delete_confirm":      { en: "Delete \"{f}\"?",        zh: "确定删除 \"{f}\"？" },
 
   // ── Section display names (used in search match badges) ──
   "section.file_info":       { en: "File Info",              zh: "文件信息" },

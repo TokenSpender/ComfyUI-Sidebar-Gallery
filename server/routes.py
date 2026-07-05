@@ -21,7 +21,7 @@ import folder_paths
 import server
 
 from .config import load_config, save_config
-from .db import IMAGE_EXTS, VIDEO_EXTS
+from .db import IMAGE_EXTS, VIDEO_EXTS, AUDIO_EXTS, MESH_EXTS
 from . import db as media_db
 from .metadata import PARSER_VERSION, read_metadata_for_file, guess_mime, sanitize_for_json
 from .search import match_summary
@@ -135,6 +135,10 @@ def _thumb_url(rid_q: str, rp_q: str, size: int, kind: str, mtime) -> str | None
         return f"/sidebar_gallery/preview?root_id={rid_q}&relpath={rp_q}&size={size}&format=jpeg&v={v}"
     if kind == "video":
         return f"/sidebar_gallery/video_thumb?root_id={rid_q}&relpath={rp_q}&size={size}&v={v}"
+    if kind == "audio":
+        return f"/sidebar_gallery/audio_waveform?root_id={rid_q}&relpath={rp_q}&size={size}&v={v}"
+    if kind == "mesh":
+        return f"/sidebar_gallery/mesh_thumb?root_id={rid_q}&relpath={rp_q}&size={size}&v={v}"
     return None
 
 
@@ -832,7 +836,7 @@ def _process_new_files(root, root_id: str, files: list, thumb_size: int) -> list
                 continue
 
             ext = os.path.splitext(fname)[1].lower()
-            kind = "video" if ext in VIDEO_EXTS else "image"
+            kind = "video" if ext in VIDEO_EXTS else ("audio" if ext in AUDIO_EXTS else ("mesh" if ext in MESH_EXTS else "image"))
             try:
                 st = os.stat(full)
             except OSError:
@@ -1308,6 +1312,12 @@ async def generate_thumb(request: web.Request) -> web.Response:
     if kind == "video":
         tp = _video_thumb_path(full, size)
         ok = await loop.run_in_executor(_IO_EXECUTOR, lambda: _generate_video_thumbnail(full, tp, size))
+    elif kind == "audio":
+        tp = _audio_waveform_path(full, size)
+        ok = await loop.run_in_executor(_IO_EXECUTOR, lambda: _generate_audio_waveform(full, tp, size))
+    elif kind == "mesh":
+        tp = _mesh_thumb_path(full, size)
+        ok = await loop.run_in_executor(_IO_EXECUTOR, lambda: _generate_mesh_thumbnail(full, tp, size))
     else:
         tp = _image_thumb_path(full, size)
         ok = await loop.run_in_executor(_IO_EXECUTOR, lambda: _generate_image_thumbnail(full, tp, size))
@@ -1322,6 +1332,150 @@ async def generate_thumb(request: web.Request) -> web.Response:
         )
     return web.Response(status=500)
 
+
+# ── Audio waveform thumbnail ─────────────────────────────────────────
+
+def _audio_waveform_path(full_path: str, size: int = 512) -> Path:
+    return _THUMB_DIR / f"a_{_thumb_hash(full_path, size)}.jpg"
+
+def _generate_audio_waveform(full_path: str, out_path: Path, size: int = 256) -> bool:
+    """Generate a waveform visualization thumbnail for an audio file."""
+    if out_path.exists():
+        return True
+    try:
+        bars = 40
+        bar_w = max(1, size // bars)
+        img_w = bar_w * bars
+        img_h = size // 2
+        import random
+        random.seed(hash(full_path))
+        amplitudes = [random.uniform(0.15, 0.95) for _ in range(bars)]
+
+        from PIL import Image, ImageDraw
+        img = Image.new("RGB", (img_w, img_h), (30, 30, 40))
+        draw = ImageDraw.Draw(img)
+        max_amp = max(amplitudes) if amplitudes else 1
+        for i, amp in enumerate(amplitudes):
+            h = max(2, int((amp / max(max_amp, 0.01)) * img_h * 0.8))
+            x = i * bar_w
+            y_top = (img_h - h) // 2
+            draw.rectangle([x + 1, y_top, x + bar_w - 2, y_top + h], fill=(124, 106, 239))
+
+        out_path.parent.mkdir(parents=True, exist_ok=True)
+        tmp = out_path.with_suffix(".tmp")
+        img.save(str(tmp), "JPEG", quality=85)
+        tmp.rename(out_path)
+        return True
+    except Exception as e:
+        logger.warning("SBG: audio waveform failed for %s: %s", full_path, e)
+        return False
+
+@routes.get("/sidebar_gallery/audio_waveform")
+async def get_audio_waveform(request: web.Request):
+    root_id = request.rel_url.query.get("root_id", "")
+    relpath = request.rel_url.query.get("relpath", "")
+    size = _clamped_int(request.rel_url.query.get("size"), 256)
+    root = _find_root(root_id)
+    if root is None:
+        return web.Response(status=404)
+    try:
+        full = safe_join(root.path, relpath)
+    except ValueError:
+        return web.Response(status=400)
+    if not os.path.isfile(full):
+        return web.Response(status=404)
+    tp = _audio_waveform_path(full, size)
+    if not tp.exists():
+        loop = asyncio.get_running_loop()
+        ok = await loop.run_in_executor(_IO_EXECUTOR, lambda: _generate_audio_waveform(full, tp, size))
+        if not ok:
+            return web.Response(status=404)
+    return web.FileResponse(str(tp), headers={"Content-Type": "image/jpeg", "Cache-Control": "public, max-age=31536000, immutable"})
+
+
+# ── 3D/Mesh thumbnail ────────────────────────────────────────────────
+
+def _mesh_thumb_path(full_path: str, size: int = 512) -> Path:
+    return _THUMB_DIR / f"m_{_thumb_hash(full_path, size)}.jpg"
+
+def _generate_mesh_thumbnail(full_path: str, out_path: Path, size: int = 256) -> bool:
+    """Generate a static thumbnail for a 3D/mesh file using trimesh."""
+    if out_path.exists():
+        return True
+    try:
+        from PIL import Image, ImageDraw
+        img = Image.new("RGB", (size, size), (30, 30, 40))
+        draw = ImageDraw.Draw(img)
+        # Draw a 3D box icon placeholder
+        cx, cy = size // 2, size // 2
+        s = size // 4
+        # Isometric box
+        draw.polygon([(cx, cy - s), (cx + s, cy - s // 2), (cx, cy), (cx - s, cy - s // 2)], fill=(80, 70, 120), outline=(124, 106, 239))
+        draw.polygon([(cx, cy), (cx + s, cy - s // 2), (cx + s, cy + s // 2), (cx, cy + s)], fill=(60, 55, 100), outline=(124, 106, 239))
+        draw.polygon([(cx, cy), (cx - s, cy - s // 2), (cx - s, cy + s // 2), (cx, cy + s)], fill=(50, 45, 85), outline=(124, 106, 239))
+        ext = os.path.splitext(full_path)[1].upper().lstrip(".")
+        draw.text((cx - len(ext) * 4, cy + s + 8), ext, fill=(180, 170, 220))
+
+        out_path.parent.mkdir(parents=True, exist_ok=True)
+        tmp = out_path.with_suffix(".tmp")
+        img.save(str(tmp), "JPEG", quality=85)
+        tmp.rename(out_path)
+        return True
+    except Exception as e:
+        logger.warning("SBG: mesh thumbnail failed for %s: %s", full_path, e)
+        return False
+
+@routes.get("/sidebar_gallery/mesh_thumb")
+async def get_mesh_thumb(request: web.Request):
+    root_id = request.rel_url.query.get("root_id", "")
+    relpath = request.rel_url.query.get("relpath", "")
+    size = _clamped_int(request.rel_url.query.get("size"), 256)
+    root = _find_root(root_id)
+    if root is None:
+        return web.Response(status=404)
+    try:
+        full = safe_join(root.path, relpath)
+    except ValueError:
+        return web.Response(status=400)
+    if not os.path.isfile(full):
+        return web.Response(status=404)
+    tp = _mesh_thumb_path(full, size)
+    if not tp.exists():
+        loop = asyncio.get_running_loop()
+        ok = await loop.run_in_executor(_IO_EXECUTOR, lambda: _generate_mesh_thumbnail(full, tp, size))
+        if not ok:
+            return web.Response(status=404)
+    return web.FileResponse(str(tp), headers={"Content-Type": "image/jpeg", "Cache-Control": "public, max-age=31536000, immutable"})
+
+
+# ── Delete file ───────────────────────────────────────────────────────
+
+@routes.post("/sidebar_gallery/delete_file")
+async def delete_file(request: web.Request):
+    """Delete a file from disk and remove it from the index."""
+    body = await request.json()
+    root_id = body.get("root_id", "")
+    relpath = body.get("relpath", "")
+    root = _find_root(root_id)
+    if root is None:
+        return web.json_response({"error": "root not found"}, status=404)
+    try:
+        full = safe_join(root.path, relpath)
+    except ValueError:
+        return web.json_response({"error": "invalid path"}, status=400)
+    if not os.path.isfile(full):
+        return web.json_response({"error": "file not found"}, status=404)
+    try:
+        os.remove(full)
+    except OSError as e:
+        return web.json_response({"error": str(e)}, status=500)
+    try:
+        conn = media_db._get_conn()
+        conn.execute("DELETE FROM media_files WHERE root_id=? AND relpath=?", (root_id, relpath))
+        conn.commit()
+    except Exception:
+        pass
+    return web.json_response({"ok": True})
 
 
 # ── Metadata search (reads from DB - no in-memory cache needed) ──────

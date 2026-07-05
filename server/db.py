@@ -26,7 +26,16 @@ _DB_PATH = Path(__file__).resolve().parents[1] / "sidebar_gallery_cache.db"
 
 IMAGE_EXTS = {".png", ".jpg", ".jpeg", ".webp"}
 VIDEO_EXTS = {".mp4", ".webm", ".mov", ".mkv", ".avi"}
-ALL_MEDIA_EXTS = IMAGE_EXTS | VIDEO_EXTS
+AUDIO_EXTS = {".mp3", ".wav", ".ogg", ".flac", ".aac", ".m4a", ".wma", ".opus", ".aiff"}
+MESH_EXTS = {".glb", ".gltf", ".obj", ".fbx", ".stl", ".ply", ".3ds", ".dae", ".spz", ".splat", ".ksplat"}
+ALL_MEDIA_EXTS = IMAGE_EXTS | VIDEO_EXTS | AUDIO_EXTS | MESH_EXTS
+
+def _kind_from_ext(ext: str) -> str:
+    """Derive media kind from file extension."""
+    if ext in VIDEO_EXTS: return "video"
+    if ext in AUDIO_EXTS: return "audio"
+    if ext in MESH_EXTS: return "mesh"
+    return "image"
 
 # Parallel metadata reads during a full reindex. Opening + parsing each file is the
 # slow part on a network share; reading a batch concurrently overlaps that I/O. Kept
@@ -671,7 +680,7 @@ def _iter_media_files(base_abs, excluded, skip_hidden, errors: _ScanErrors | Non
                     errors.file_errors += 1
                 continue
             rel = os.path.relpath(entry.path, base_abs).replace("\\", "/")
-            kind = "video" if ext in VIDEO_EXTS else "image"
+            kind = _kind_from_ext(ext)
             yield rel, ext, kind, int(st.st_size), float(st.st_mtime), float(st.st_ctime)
         # Prune subdirs exactly like os.walk + _filter_scan_dirs, then recurse.
         _filter_scan_dirs(subdirs, excluded, skip_hidden=skip_hidden)

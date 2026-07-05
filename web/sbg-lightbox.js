@@ -9,12 +9,12 @@ import { app } from "../../scripts/app.js";
 
 import {
   ensureCss, h, api, fmtBytes, pj,
-  showToast, copyText, fileUrl, isVideo,
+  showToast, copyText, fileUrl, isVideo, isAudio, is3D,
   _metaCache, _metaCacheAPI, _mediaState,
   _thumbCacheAPI,
   searchState, highlightSearchMatches,
   S, getSetting, getLayout, APP_REGISTRY,
-  t,
+  t, ensureModelViewer,
 } from "./sbg-core.js";
 
 import * as TL from "./sbg-translation-layer.js";
@@ -557,6 +557,73 @@ export function openLightbox(_initialItems, startItemOrIndex) {
       mediaContainer.appendChild(video);
       video.src = fileUrl(it);
       if (video.readyState >= 2) _swapIn(video); // already buffered (revisit)
+    } else if (isAudio(it)) {
+      // Audio player with custom UI
+      const audioWrap = h("div", { class: "sbg-lb__audio-wrap" });
+      const audio = h("audio", { preload: "metadata" });
+      audio.volume = _mediaState.volume;
+      audio.muted = _mediaState.muted;
+      audio.onvolumechange = () => { _mediaState.volume = audio.volume; _mediaState.muted = audio.muted; };
+
+      const playBtn = h("button", { class: "sbg-lb__audio-play", text: "▶" });
+      const timeDisplay = h("span", { class: "sbg-lb__audio-time", text: "0:00" });
+      const seekBar = h("input", { type: "range", class: "sbg-lb__audio-seek", min: "0", max: "100", value: "0" });
+      const volumeBtn = h("button", { class: "sbg-lb__audio-vol", text: audio.muted ? "🔇" : "🔊" });
+
+      const fmtTime = (s) => {
+        if (!isFinite(s)) return "0:00";
+        const m = Math.floor(s / 60);
+        const sec = Math.floor(s % 60);
+        return `${m}:${sec.toString().padStart(2, "0")}`;
+      };
+
+      playBtn.onclick = () => { if (audio.paused) { audio.play(); playBtn.textContent = "⏸"; } else { audio.pause(); playBtn.textContent = "▶"; } };
+      volumeBtn.onclick = () => { audio.muted = !audio.muted; volumeBtn.textContent = audio.muted ? "🔇" : "🔊"; };
+      seekBar.oninput = () => { if (isFinite(audio.duration)) audio.currentTime = (seekBar.value / 100) * audio.duration; };
+      audio.ontimeupdate = () => {
+        timeDisplay.textContent = `${fmtTime(audio.currentTime)} / ${fmtTime(audio.duration)}`;
+        if (isFinite(audio.duration)) seekBar.value = (audio.currentTime / audio.duration) * 100;
+      };
+      audio.onended = () => { playBtn.textContent = "▶"; };
+      audio.onloadeddata = () => _swapIn(audioWrap);
+
+      audioWrap.appendChild(audio);
+      const controls = h("div", { class: "sbg-lb__audio-controls" }, [playBtn, timeDisplay, seekBar, volumeBtn]);
+      audioWrap.appendChild(controls);
+
+      // Audio icon placeholder
+      const icon = h("div", { class: "sbg-lb__audio-icon", html: `<svg viewBox="0 0 24 24" width="80" height="80" fill="none" stroke="currentColor" stroke-width="1"><path d="M9 18V5l12-2v13"/><circle cx="6" cy="18" r="3"/><circle cx="18" cy="16" r="3"/></svg>` });
+      audioWrap.insertBefore(icon, controls);
+
+      currentMediaEl = audio;
+      mediaContainer.appendChild(audioWrap);
+      audio.src = fileUrl(it);
+      _swapIn(audioWrap);
+    } else if (is3D(it)) {
+      // 3D model viewer using <model-viewer> web component
+      ensureModelViewer();
+      const viewerWrap = h("div", { class: "sbg-lb__3d-wrap" });
+      const viewer = h("model-viewer", {
+        src: fileUrl(it),
+        alt: it.filename || "3D model",
+        "auto-rotate": "true",
+        "camera-controls": "true",
+        "shadow-intensity": "1",
+        style: "width:100%;height:100%;background:#1a1a2e;",
+      });
+      viewer.onload = () => _swapIn(viewerWrap);
+      viewer.onerror = () => {
+        // Fallback: show thumbnail
+        const img = h("img", { class: "sbg-lb__img", style: "object-fit:contain;" });
+        img.src = it.thumb_url || "";
+        viewerWrap.innerHTML = "";
+        viewerWrap.appendChild(img);
+        _swapIn(viewerWrap);
+      };
+      viewerWrap.appendChild(viewer);
+      currentMediaEl = viewer;
+      mediaContainer.appendChild(viewerWrap);
+      _swapIn(viewerWrap);
     } else {
       const img = h("img", { class: "sbg-lb__img" });
       img.dataset.sbgPending = "1";

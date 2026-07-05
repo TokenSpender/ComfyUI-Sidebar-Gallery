@@ -16,16 +16,17 @@ import {
   _dataCache, searchState,
   _metaCache, _persistItems, _loadPersistedItems,
   h, api, fmtBytes, timeAgo,
-  showToast, isVideo,
+  showToast, isVideo, isAudio, is3D,
   _thumbMemCache, _thumbCacheAPI, _metaCacheAPI, _resetIdb,
   initThumbObserver, getThumbObserver, resetThumbObserver, resetFailedThumbs,
-  PLAY_SVG, VIDEO_ICON, IMG_ICON, IMG_FILTER_ICON, SEARCH_SVG, GEAR_SVG,
+  PLAY_SVG, VIDEO_ICON, IMG_ICON, AUDIO_ICON, MESH_ICON, IMG_FILTER_ICON, SEARCH_SVG, GEAR_SVG,
   S, getSetting, getLayout,
   progressPoller, formatProgress,
   t,
 } from "./sbg-core.js";
 
 import { SectionRegistry } from "./sbg-section-registry.js";
+import { showContextMenu } from "./sbg-context-menu.js";
 
 /* ═══════════════════════════════════════════════════════════════════════
    SEARCH PREFIXES
@@ -422,10 +423,14 @@ export function initGallery(mountEl, config) {
 
   // Kind toggle buttons
   const VID_FILTER_ICON = `<svg viewBox="0 0 24 24" width="14" height="14" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><polygon points="23 7 16 12 23 17 23 7"/><rect x="1" y="5" width="15" height="14" rx="2" ry="2"/></svg>`;
+  const AUDIO_FILTER_ICON = `<svg viewBox="0 0 24 24" width="14" height="14" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M9 18V5l12-2v13"/><circle cx="6" cy="18" r="3"/><circle cx="18" cy="16" r="3"/></svg>`;
+  const MESH_FILTER_ICON = `<svg viewBox="0 0 24 24" width="14" height="14" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M12 2L2 7l10 5 10-5-10-5z"/><path d="M2 17l10 5 10-5"/><path d="M2 12l10 5 10-5"/></svg>`;
   const kindBtnAll = h("button", { class: "sbg-kind-btn sbg-kind-btn--active", text: t("gallery.all"), "data-kind": "", title: t("gallery.show_all_files") });
   const kindBtnImg = h("button", { class: "sbg-kind-btn", html: IMG_FILTER_ICON, "data-kind": "image", title: t("gallery.images_only") });
   const kindBtnVid = h("button", { class: "sbg-kind-btn", html: VID_FILTER_ICON, "data-kind": "video", title: t("gallery.videos_only") });
-  const kindGroup = h("div", { class: "sbg-kind-group" }, [kindBtnAll, kindBtnImg, kindBtnVid]);
+  const kindBtnAud = h("button", { class: "sbg-kind-btn", html: AUDIO_FILTER_ICON, "data-kind": "audio", title: t("gallery.audio_only") });
+  const kindBtnMesh = h("button", { class: "sbg-kind-btn", html: MESH_FILTER_ICON, "data-kind": "mesh", title: t("gallery.mesh_only") });
+  const kindGroup = h("div", { class: "sbg-kind-group" }, [kindBtnAll, kindBtnImg, kindBtnVid, kindBtnAud, kindBtnMesh]);
 
   const sortSel = h("select", { class: "sbg-select", title: t("gallery.sort_tip"), style: "flex:0 0 auto;width:auto" }, [
     h("option", { value: "created_desc", text: t("gallery.created_desc") }),
@@ -720,15 +725,19 @@ export function initGallery(mountEl, config) {
           getThumbObserver().observe(thumbWrap);
         });
         thumbWrap.appendChild(h("div", { class: "sbg-card__spinner" }));
-        thumbWrap.appendChild(h("div", { class: "sbg-card__placeholder sbg-card__placeholder--dim", html: isVideo(it) ? VIDEO_ICON : IMG_ICON }));
+        thumbWrap.appendChild(h("div", { class: "sbg-card__placeholder sbg-card__placeholder--dim", html: isVideo(it) ? VIDEO_ICON : (isAudio(it) ? AUDIO_ICON : (is3D(it) ? MESH_ICON : IMG_ICON)) }));
       }
     } else {
-      thumbWrap.appendChild(h("div", { class: "sbg-card__placeholder", html: isVideo(it) ? VIDEO_ICON : IMG_ICON }));
+      thumbWrap.appendChild(h("div", { class: "sbg-card__placeholder", html: isVideo(it) ? VIDEO_ICON : (isAudio(it) ? AUDIO_ICON : (is3D(it) ? MESH_ICON : IMG_ICON)) }));
     }
 
     if (isVideo(it)) {
       thumbWrap.appendChild(h("span", { class: "sbg-card__video-badge", text: (it.ext || "").replace(".", "").toUpperCase() || "VID" }));
       thumbWrap.appendChild(h("div", { class: "sbg-card__play-icon", html: PLAY_SVG }));
+    } else if (isAudio(it)) {
+      thumbWrap.appendChild(h("span", { class: "sbg-card__video-badge sbg-card__audio-badge", text: (it.ext || "").replace(".", "").toUpperCase() || "AUD" }));
+    } else if (is3D(it)) {
+      thumbWrap.appendChild(h("span", { class: "sbg-card__video-badge sbg-card__mesh-badge", text: (it.ext || "").replace(".", "").toUpperCase() || "3D" }));
     }
 
     const card = h("div", {
@@ -773,6 +782,20 @@ export function initGallery(mountEl, config) {
       e.dataTransfer.setData("text/plain", it.filename);
       e.dataTransfer.effectAllowed = "copy";
     });
+
+    // Right-click context menu
+    card.addEventListener("contextmenu", (e) => {
+      showContextMenu(e, it, { openLightbox, fetchAllItems, filteredItems: state.filteredItems });
+    });
+
+    // "···" more button (bottom-right of card)
+    const moreBtn = h("div", {
+      class: "sbg-card__more",
+      text: "···",
+      title: t("gallery.settings"),
+      onclick: (e) => { e.stopPropagation(); showContextMenu(e, it, { openLightbox, fetchAllItems, filteredItems: state.filteredItems }); },
+    });
+    thumbWrap.appendChild(moreBtn);
 
     card.dataset.idx = String(index);
     card.dataset.relpath = it.relpath;  // bind card → item so we can detect stale reuse

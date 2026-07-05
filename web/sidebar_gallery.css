@@ -2908,3 +2908,210 @@ body.sbg-dragging-tab .sbg-ly3-tablist--empty {
 .sbg-ly3-pickitem:hover { background: rgba(124,106,239,0.18); }
 .sbg-ly3-pickname { font-size: 11.5px; }
 .sbg-ly3-pickpath { font-size: 8.5px; font-family: monospace; opacity: 0.4; }
+
+/* ══════════════════════════════════════════════════════════════════════
+   AUDIO / 3D MESH SUPPORT
+   ══════════════════════════════════════════════════════════════════════ */
+
+/* Audio badge on card */
+.sbg-card__audio-badge {
+  color: #c084fc !important;
+}
+
+/* 3D/Mesh badge on card */
+.sbg-card__mesh-badge {
+  color: #38bdf8 !important;
+}
+
+/* "···" more button on card */
+.sbg-card__more {
+  position: absolute;
+  bottom: 4px;
+  right: 4px;
+  width: 22px;
+  height: 18px;
+  background: rgba(0, 0, 0, 0.55);
+  border-radius: 4px;
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  color: rgba(255, 255, 255, 0.7);
+  font-size: 12px;
+  cursor: pointer;
+  opacity: 0;
+  transition: opacity var(--sbg-transition);
+  pointer-events: none;
+  letter-spacing: 1px;
+}
+
+.sbg-card:hover .sbg-card__more {
+  opacity: 1;
+  pointer-events: auto;
+}
+
+.sbg-card__more:hover {
+  background: rgba(0, 0, 0, 0.8);
+  color: #fff;
+}
+
+/* ── Context Menu ────────────────────────────────────────────────── */
+
+.sbg-ctx-menu {
+  position: fixed;
+  z-index: 1000000;
+  background: var(--sbg-surface, #1e1e2e);
+  border: 1px solid var(--sbg-border, rgba(255,255,255,0.1));
+  border-radius: 10px;
+  padding: 5px;
+  min-width: 180px;
+  box-shadow: 0 8px 30px rgba(0, 0, 0, 0.5);
+  display: none;
+}
+
+.sbg-ctx-menu__item {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  padding: 7px 12px;
+  border-radius: 6px;
+  cursor: pointer;
+  font-size: 12px;
+  color: var(--sbg-text, #e0e0e0);
+  transition: background 0.12s ease;
+}
+
+.sbg-ctx-menu__item:hover {
+  background: rgba(124, 106, 239, 0.18);
+}
+
+.sbg-ctx-menu__item--danger {
+  color: #f87171;
+}
+
+.sbg-ctx-menu__item--danger:hover {
+  background: rgba(248, 113, 113, 0.15);
+}
+
+.sbg-ctx-menu__icon {
+  font-size: 14px;
+  width: 20px;
+  text-align: center;
+  flex-shrink: 0;
+}
+
+.sbg-ctx-menu__label {
+  flex: 1;
+}
+
+.sbg-ctx-menu__sep {
+  height: 1px;
+  background: var(--sbg-border, rgba(255,255,255,0.08));
+  margin: 4px 8px;
+}
+
+/* ── Lightbox Audio Player ─────────────────────────────────────── */
+
+.sbg-lb__audio-wrap {
+  display: flex;
+  flex-direction: column;
+  align-items: center;
+  justify-content: center;
+  width: 100%;
+  height: 100%;
+  gap: 24px;
+}
+
+.sbg-lb__audio-icon {
+  opacity: 0.3;
+}
+
+.sbg-lb__audio-controls {
+  display: flex;
+  align-items: center;
+  gap: 12px;
+  padding: 12px 20px;
+  background: var(--sbg-surface, #1e1e2e);
+  border: 1px solid var(--sbg-border, rgba(255,255,255,0.08));
+  border-radius: 12px;
+  min-width: 320px;
+  max-width: 500px;
+}
+
+.sbg-lb__audio-play {
+  background: var(--sbg-accent, #7c6aef);
+  color: #fff;
+  border: none;
+  border-radius: 50%;
+  width: 36px;
+  height: 36px;
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  cursor: pointer;
+  font-size: 14px;
+  flex-shrink: 0;
+  transition: background 0.15s ease;
+}
+
+.sbg-lb__audio-play:hover {
+  background: #6d5ce8;
+}
+
+.sbg-lb__audio-time {
+  font-size: 12px;
+  color: var(--sbg-text-dim, rgba(224,224,224,0.5));
+  white-space: nowrap;
+  min-width: 80px;
+  text-align: center;
+  font-variant-numeric: tabular-nums;
+}
+
+.sbg-lb__audio-seek {
+  flex: 1;
+  height: 4px;
+  -webkit-appearance: none;
+  appearance: none;
+  background: rgba(255, 255, 255, 0.1);
+  border-radius: 2px;
+  outline: none;
+  cursor: pointer;
+}
+
+.sbg-lb__audio-seek::-webkit-slider-thumb {
+  -webkit-appearance: none;
+  width: 12px;
+  height: 12px;
+  border-radius: 50%;
+  background: var(--sbg-accent, #7c6aef);
+  cursor: pointer;
+}
+
+.sbg-lb__audio-vol {
+  background: transparent;
+  border: none;
+  color: var(--sbg-text-dim, rgba(224,224,224,0.5));
+  cursor: pointer;
+  font-size: 16px;
+  padding: 4px;
+  flex-shrink: 0;
+}
+
+.sbg-lb__audio-vol:hover {
+  color: var(--sbg-text, #e0e0e0);
+}
+
+/* ── Lightbox 3D Viewer ──────────────────────────────────────── */
+
+.sbg-lb__3d-wrap {
+  width: 100%;
+  height: 100%;
+  display: flex;
+  align-items: center;
+  justify-content: center;
+}
+
+.sbg-lb__3d-wrap model-viewer {
+  width: 100%;
+  height: 100%;
+  --poster-color: transparent;
+}
