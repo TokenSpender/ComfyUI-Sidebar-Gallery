@@ -288,8 +288,7 @@ export function initGallery(mountEl, config) {
     }
 
     // Kind filter
-    if (state.kind === "image") items = items.filter(it => it.kind === "image");
-    else if (state.kind === "video") items = items.filter(it => it.kind === "video");
+    if (state.kind) items = items.filter(it => it.kind === state.kind);
 
     // Search
     if (state.q && !state._searchMatches) {
@@ -1937,13 +1936,14 @@ export function initGallery(mountEl, config) {
 
   /* ── Kind + sort event listeners ────────────────────────────────── */
 
-  for (const btn of [kindBtnAll, kindBtnImg, kindBtnVid]) {
+  const allKindBtns = [kindBtnAll, kindBtnImg, kindBtnVid, kindBtnAud, kindBtnMesh];
+  for (const btn of allKindBtns) {
     btn.addEventListener("click", () => {
       _saveScrollPos(); // remember the outgoing view's position
       const newKind = btn.dataset.kind;
       state.kind = newKind;
       _dataCache.lastKind = newKind;
-      for (const b of [kindBtnAll, kindBtnImg, kindBtnVid]) b.classList.remove("sbg-kind-btn--active");
+      for (const b of allKindBtns) b.classList.remove("sbg-kind-btn--active");
       btn.classList.add("sbg-kind-btn--active");
       refilter();
     });
@@ -2010,7 +2010,7 @@ export function initGallery(mountEl, config) {
         }
 
         rebuildRoots();
-        for (const b of [kindBtnAll, kindBtnImg, kindBtnVid]) {
+        for (const b of allKindBtns) {
           b.classList.toggle("sbg-kind-btn--active", b.dataset.kind === state.kind);
         }
         sortSel.value = state.sort;

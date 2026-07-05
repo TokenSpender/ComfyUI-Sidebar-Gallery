@@ -68,9 +68,8 @@ export function showContextMenu(event, item, actions) {
     },
   });
 
-  // Insert as Node (upload to input + add LoadImage node)
-  if (!isAudio(item) && !is3D(item)) {
-    items.push({
+  // Insert as Node (upload to input + add appropriate node)
+  items.push({
       icon: "🧩",
       label: t("ctx.insert_node"),
       action: async () => {
@@ -91,25 +90,57 @@ export function showContextMenu(event, item, actions) {
           const data = await up.json();
           const uploaded = data.subfolder ? `${data.subfolder}/${data.name}` : data.name;
           const { app } = await import("../../scripts/app.js");
-          const node = app.graph?.addNode?.("LoadImage");
-          if (node) {
-            const widget = (node.widgets || []).find(w => w && w.name === "image");
-            if (widget) {
-              if (widget.options && Array.isArray(widget.options.values) && !widget.options.values.includes(uploaded)) {
-                widget.options.values.push(uploaded);
-              }
-              widget.value = uploaded;
-              try { widget.callback?.(uploaded); } catch { }
-            }
-            app.graph?.setDirtyCanvas?.(true, true);
+          
+          // Use LiteGraph API to create and add node
+          if (typeof LiteGraph === "undefined") {
+            throw new Error("LiteGraph not available");
           }
-          showToast(t("sidebar.loaded_into", { n: node?.title || "LoadImage" }));
+          
+          // Determine node type and widget name based on file type
+          let nodeType, widgetName;
+          if (isVideo(item)) {
+            nodeType = "LoadVideo";
+            widgetName = "file";
+          } else if (isAudio(item)) {
+            nodeType = "LoadAudio";
+            widgetName = "audio";
+          } else if (is3D(item)) {
+            nodeType = "Load3D";
+            widgetName = "model_file";
+          } else {
+            nodeType = "LoadImage";
+            widgetName = "image";
+          }
+          
+          const node = LiteGraph.createNode(nodeType);
+          if (!node) {
+            throw new Error(`Failed to create ${nodeType} node`);
+          }
+          
+          // Position at mouse location in graph coordinates
+          node.pos = [app.canvas.graph_mouse[0], app.canvas.graph_mouse[1]];
+          
+          // Add node to graph
+          app.canvas.graph.add(node, false);
+          
+          // Set the appropriate widget
+          const widget = (node.widgets || []).find(w => w && w.name === widgetName);
+          if (widget) {
+            if (widget.options && Array.isArray(widget.options.values) && !widget.options.values.includes(uploaded)) {
+              widget.options.values.push(uploaded);
+            }
+            widget.value = uploaded;
+            try { widget.callback?.(uploaded); } catch { }
+          }
+          
+          // Refresh canvas
+          app.canvas.setDirty(true, true);
+          showToast(t("sidebar.loaded_into", { n: node.title || nodeType }));
         } catch (err) {
           showToast(t("sidebar.load_failed", { e: err?.message || err }));
         }
       },
     });
-  }
 
   // Load Workflow (only for images with metadata)
   if (!isAudio(item) && !is3D(item)) {
