@@ -1,4 +1,4 @@
-/* ── Sidebar Gallery - Adaptive Theme ─────────────────────────── */
+/* Sidebar Gallery: Adaptive Theme */
 
 :root {
   /* Inherit ComfyUI's theme variables when available, or use neutral dark */
@@ -67,7 +67,7 @@
   --sbg-accent-glow: rgba(203, 75, 22, 0.3);
 }
 
-/* ── Root Container ───────────────────────────────────────────────── */
+/* Root Container */
 
 .sbg-root {
   display: flex;
@@ -81,7 +81,7 @@
   background: transparent;
 }
 
-/* ── Toolbar ──────────────────────────────────────────────────────── */
+/* Toolbar */
 
 .sbg-toolbar {
   display: flex;
@@ -98,7 +98,7 @@
   align-items: center;
 }
 
-/* ── Folder Navigation (breadcrumb + root picker) ────────────── */
+/* Folder Navigation (breadcrumb + root picker) */
 
 .sbg-folder-nav {
   display: flex;
@@ -213,7 +213,7 @@
 }
 
 
-/* ── Search Row (full-width, own row) ────────────────────────────── */
+/* Search Row (full-width, own row) */
 
 .sbg-search-wrap {
   display: flex;
@@ -226,10 +226,13 @@
   padding-left: 4px;
   gap: 2px;
   position: relative;
-  overflow-x: hidden;
+  /* No overflow clipping on this wrap: the autocomplete dropdown hangs below it
+     (position:absolute; top:100%), and hiding one overflow axis forces the other
+     to auto, which clips the dropdown out of view. Over-long tags are contained
+     by .sbg-search-tags instead. */
 }
 
-/* ── Search Prefix Autocomplete ──────────────────────────────────── */
+/* Search Prefix Autocomplete */
 
 .sbg-search-autocomplete {
   position: absolute;
@@ -321,7 +324,7 @@
 .sbg-search-clear:hover { color: var(--sbg-text); }
 .sbg-search-refresh:hover { color: var(--sbg-accent); filter: brightness(1.2); }
 
-/* ── Search Tag Pills ────────────────────────────────────────────── */
+/* Search Tag Pills */
 
 .sbg-search-tags {
   display: flex;
@@ -419,7 +422,7 @@
   outline: none;
 }
 
-/* ── Form Controls ────────────────────────────────────────────────── */
+/* Form Controls */
 
 .sbg-select,
 .sbg-input {
@@ -441,7 +444,7 @@
   border-color: var(--sbg-accent);
 }
 
-/* Subfolder dropdown - limit height so it doesn't cover the entire screen */
+/* Subfolder dropdown: limit height so it doesn't cover the entire screen */
 .sbg-select--subfolder {
   max-width: 150px;
 }
@@ -521,7 +524,7 @@
   }
 }
 
-/* ── Kind Toggle (All / Images / Videos) ─────────────────────────── */
+/* Kind Toggle (All / Images / Videos) */
 
 .sbg-kind-group {
   display: flex;
@@ -561,7 +564,7 @@
   filter: brightness(1.1);
 }
 
-/* ── Progress Bar ────────────────────────────────────────────────── */
+/* Progress Bar */
 
 .sbg-progress-wrap {
   flex-shrink: 0;
@@ -618,7 +621,7 @@
   }
 }
 
-/* ── Status Bar ───────────────────────────────────────────────────── */
+/* Status Bar */
 
 .sbg-status {
   display: flex;
@@ -644,7 +647,7 @@
   flex-shrink: 0;
 }
 
-/* ── Diagnostics Panel ───────────────────────────────────────────── */
+/* Diagnostics Panel */
 
 .sbg-diag-overlay {
   position: absolute;
@@ -779,7 +782,7 @@
   white-space: nowrap;
 }
 
-/* ── Scrollable Body ──────────────────────────────────────────────── */
+/* Scrollable Body */
 
 .sbg-body {
   flex: 1 1 0;
@@ -829,7 +832,7 @@
   pointer-events: auto;
 }
 
-/* ── Grid ─────────────────────────────────────────────────────────── */
+/* Grid */
 
 .sbg-grid {
   position: relative;
@@ -844,13 +847,13 @@
   gap: 5px;
 }
 
-/* Virtual scroll spacer - sets the total scrollable height */
+/* Virtual scroll spacer: sets the total scrollable height */
 .sbg-grid__spacer {
   width: 100%;
   pointer-events: none;
 }
 
-/* ── Card ─────────────────────────────────────────────────────────── */
+/* Card */
 
 .sbg-card {
   border: 1px solid var(--sbg-border);
@@ -862,7 +865,7 @@
   position: relative;
 }
 
-/* Virtual scroll cards - positioned absolutely by JS */
+/* Virtual scroll cards: positioned absolutely by JS */
 .sbg-card--virtual {
   position: absolute;
   box-sizing: border-box;
@@ -890,8 +893,8 @@
   flex-shrink: 0;
 }
 
-/* During an active search the metrics reserve an extra info row (infoH 42→60) so the
-   match badges sit INSIDE the card info area (below name/meta), not over the thumbnail. */
+/* During an active search the metrics reserve an extra info row (infoH 42 to 60) so the
+   match badges sit INSIDE the card info area (below name/meta) instead of over the thumbnail. */
 .sbg-grid--search .sbg-card--virtual .sbg-card__info {
   max-height: 60px;
 }
@@ -931,7 +934,7 @@
   aspect-ratio: 1/1;
 }
 
-/* AR thumbnails - height set by JS in masonry mode */
+/* AR thumbnails: height set by JS in masonry mode */
 .sbg-card__thumb-wrap--ar {
   aspect-ratio: auto;
   min-height: 60px;
@@ -1118,7 +1121,7 @@
   margin-top: 1px;
 }
 
-/* ── Loading Pulse ────────────────────────────────────────────────── */
+/* Loading Pulse */
 
 @keyframes sbg-pulse {
 
@@ -1136,7 +1139,7 @@
   animation: sbg-pulse 1.2s ease-in-out infinite;
 }
 
-/* ── Empty State ──────────────────────────────────────────────────── */
+/* Empty State */
 
 .sbg-empty {
   display: flex;
@@ -1154,7 +1157,7 @@
   opacity: 0.3;
 }
 
-/* ── Toast ────────────────────────────────────────────────────────── */
+/* Toast */
 
 .sbg-toast {
   position: fixed;
@@ -1178,9 +1181,7 @@
   transform: translateX(-50%) translateY(0);
 }
 
-/* ══════════════════════════════════════════════════════════════════════
-   LIGHTBOX OVERLAY
-   ══════════════════════════════════════════════════════════════════════ */
+/* LIGHTBOX OVERLAY */
 
 .sbg-lightbox {
   position: fixed;
@@ -1225,6 +1226,42 @@
 
 .sbg-lb__video {
   outline: none;
+}
+
+/* Lightbox zoom / pan */
+
+/* On the pane host (media container or compare half) while its media is
+   zoomed in: signal that the image can be dragged around. */
+.sbg-zoom--pannable {
+  cursor: grab;
+}
+
+/* On the media area during an active pan drag. */
+.sbg-zoom--panning,
+.sbg-zoom--panning * {
+  cursor: grabbing;
+}
+
+/* Transient zoom-percentage chip, top-center of the media area. */
+.sbg-lb__zoom-indicator {
+  position: absolute;
+  top: 14px;
+  left: 50%;
+  transform: translateX(-50%);
+  font-size: 12px;
+  font-weight: 600;
+  color: rgba(255, 255, 255, 0.9);
+  background: rgba(0, 0, 0, 0.6);
+  padding: 3px 10px;
+  border-radius: 4px;
+  pointer-events: none;
+  opacity: 0;
+  transition: opacity 0.2s ease;
+  z-index: 5;
+}
+
+.sbg-lb__zoom-indicator--visible {
+  opacity: 1;
 }
 
 /* Nav */
@@ -1511,7 +1548,7 @@
   overflow-y: auto;
   resize: vertical;
   min-height: 1.5em;
-  /* No max-height cap - JS applySize() handles smart shrink/scroll via user-saved preferences */
+  /* No max-height cap: JS applySize() handles smart shrink/scroll via user-saved preferences */
 }
 
 /* Wider gutter than a bare 4px so the resize corner (the ::-webkit-resizer below)
@@ -1618,7 +1655,7 @@
   padding: 30px 14px;
 }
 
-/* ── Metadata Panel - Redesigned Components ──────────────────────── */
+/* Metadata panel components */
 
 /* Group container */
 .sbg-meta-group {
@@ -1859,7 +1896,7 @@
   padding: 0 5px;
 }
 
-/* ── Source app badge ─────────────────────────────────────────────── */
+/* Source app badge */
 .sbg-source-app {
   display: inline-flex;
   align-items: center;
@@ -1945,7 +1982,7 @@
   overflow: hidden;
 }
 
-/* ── First-time reindex modal ─────────────────────────────────── */
+/* First-time reindex modal */
 
 .sbg-first-time-overlay {
   position: fixed;
@@ -2014,7 +2051,7 @@
   margin-left: 4px;
 }
 
-/* ── Diagnostics DB path value styling ── */
+/* Diagnostics DB path value styling */
 
 .sbg-diag-stat__value--path {
   font-family: monospace;
@@ -2026,7 +2063,7 @@
   text-overflow: ellipsis;
 }
 
-/* ── Prompt section colored backgrounds ── */
+/* Prompt section colored backgrounds */
 
 .sbg-section[data-section-title="Positive Prompt"] .sbg-section__body {
   background: rgba(74, 222, 128, 0.06);
@@ -2038,7 +2075,7 @@
   border-radius: 0 0 var(--sbg-radius-sm) var(--sbg-radius-sm);
 }
 
-/* ── Textbox resize ceiling (prompt text auto-shrink + scroll at max) ── */
+/* Textbox resize ceiling (prompt text auto-shrink + scroll at max) */
 /* Main styles defined above; JS applySize() handles height management */
 textarea.sbg-prompt-text {
   width: 100%;
@@ -2050,7 +2087,7 @@ textarea.sbg-prompt-text {
   box-sizing: border-box;
 }
 
-/* ── Rebuild button text overflow fix ── */
+/* Rebuild button text overflow fix */
 
 .sbg-btn--accent {
   white-space: nowrap;
@@ -2059,9 +2096,7 @@ textarea.sbg-prompt-text {
   max-width: 100%;
 }
 
-/* ══════════════════════════════════════════════════════════════════════
-   GALLERY SETTINGS PANEL
-   ══════════════════════════════════════════════════════════════════════ */
+/* GALLERY SETTINGS PANEL */
 
 .sbg-gs-overlay {
   position: fixed;
@@ -2369,7 +2404,7 @@ textarea.sbg-prompt-text {
   font-size: 10px;
 }
 
-/* ── Eye toggle for visibility ── */
+/* Eye toggle for visibility */
 .sbg-eye-toggle {
   cursor: pointer;
   font-size: 13px;
@@ -2398,7 +2433,7 @@ textarea.sbg-prompt-text {
   pointer-events: none;
 }
 
-/* ── Layout Editor: Render Override Controls ───────────────────── */
+/* Layout Editor: Render Override Controls */
 
 .sbg-gs-render-bar {
   display: none;
@@ -2477,11 +2512,9 @@ textarea.sbg-prompt-text {
   flex-shrink: 0;
 }
 
-/* ══════════════════════════════════════════════════════════════════
-   DRAG GHOST (smooth real-time drag-and-drop)
-   ══════════════════════════════════════════════════════════════════ */
+/* DRAG GHOST (smooth real-time drag-and-drop) */
 
-/* Sortable placeholder - shows where the dragged item will land */
+/* Sortable placeholder: shows where the dragged item will land */
 .sbg-sortable-placeholder {
   border: 2px dashed var(--sbg-accent, #7c6aef);
   border-radius: 6px;
@@ -2496,9 +2529,7 @@ textarea.sbg-prompt-text {
   background: var(--sbg-surface, #1e1e2e) !important;
 }
 
-/* ══════════════════════════════════════════════════════════════════
-   METADATA PANEL TABS (Generated / Initial Image)
-   ══════════════════════════════════════════════════════════════════ */
+/* METADATA PANEL TABS (Generated / Initial Image) */
 
 .sbg-lb__meta-tabs {
   display: flex;
@@ -2542,23 +2573,11 @@ textarea.sbg-prompt-text {
   overflow: hidden;
 }
 
-/* Left image (direct child img/video) - constrain to exactly half minus divider */
-.sbg-compare--active > img,
-.sbg-compare--active > video {
-  flex: 0 0 calc(50% - 2px);
-  max-width: calc(50% - 2px) !important;
-  width: calc(50% - 2px);
-  max-height: 92vh;
-  object-fit: contain;
-  /* Override any inline position:absolute from navigation transitions */
-  position: relative !important;
-  opacity: 1 !important;
-  box-shadow: none !important;
-  border-radius: 0 !important;
-}
-
-/* Right panel - exactly half minus divider to match left */
-.sbg-compare__right {
+/* Each half: a fixed 50% cell that centers its figure. Both sides use the
+   same structure so their overlays always line up. Positioned because the
+   nav arrows anchor to the half's outer edges (screen edge / divider /
+   divider / metadata panel) rather than to the image. */
+.sbg-compare__half {
   flex: 0 0 calc(50% - 2px);
   max-width: calc(50% - 2px);
   width: calc(50% - 2px);
@@ -2568,15 +2587,40 @@ textarea.sbg-prompt-text {
   align-items: center;
   justify-content: center;
   min-width: 0;
+  /* Zoomed (transformed) media must clip at its own half rather than spill
+     over the divider onto the other image. */
+  overflow: hidden;
 }
 
-.sbg-compare__right-img {
+/* The figure shrink-wraps the rendered image, so the label and filename
+   anchored to it sit on the image itself, whatever its aspect ratio. */
+.sbg-compare__fig {
+  position: relative;
+  display: flex;
+  max-width: 100%;
+  max-height: 92vh;
+}
+
+.sbg-compare__fig > img,
+.sbg-compare__fig > video {
   max-width: 100%;
   max-height: 92vh;
   object-fit: contain;
+  border-radius: 0;
+  box-shadow: none;
 }
 
-.sbg-compare__left-label {
+/* While the figure has no displayable media (an outgoing video is released
+   immediately; the incoming element stays hidden until it can paint), keep a
+   placeholder footprint so the overlay chips don't collapse onto a
+   zero-size point. */
+.sbg-compare__fig:not(:has(> img:not([data-sbg-pending]), > video:not([data-sbg-pending]))) {
+  min-width: min(320px, 90%);
+  min-height: 40vh;
+}
+
+/* CURRENT / COMPARED chip at the top-left of each image */
+.sbg-compare__label {
   position: absolute;
   top: 8px;
   left: 8px;
@@ -2594,33 +2638,42 @@ textarea.sbg-prompt-text {
 .sbg-compare__nav {
   position: absolute;
   z-index: 3;
-  opacity: 0.5;
+  opacity: 0.85;
   font-size: 24px;
+  /* Dark chip like the labels: the pale default is invisible on the image */
+  background: rgba(0, 0, 0, 0.55);
+  border-color: rgba(255, 255, 255, 0.25);
+}
+
+/* During compare each figure carries its own arrow pair, anchored to the
+   image edges; the media-area's main arrows would float in dead space and
+   duplicate them, so they hide. Direct child only: the figure arrows reuse
+   the .sbg-lb__nav classes and must keep their positions. */
+.sbg-lb__media-area--compare > .sbg-lb__nav--prev,
+.sbg-lb__media-area--compare > .sbg-lb__nav--next {
+  display: none;
+}
+
+/* The filename chips on the images already say what is shown; the bottom
+   bar's "name (n / total)" text would repeat it, so it hides in compare.
+   visibility (not display): the name is the flex-1 spacer that keeps the
+   action buttons pinned to the bottom-right. */
+.sbg-lb__media-area--compare .sbg-lb__bottom-name {
+  visibility: hidden;
 }
 
 .sbg-compare__nav:hover {
   opacity: 1;
+  background: rgba(0, 0, 0, 0.75);
 }
 
+/* Same look as the metadata panel's left edge */
 .sbg-compare__divider {
-  width: 3px;
-  background: linear-gradient(180deg, rgba(124,106,239,0.4), rgba(255,255,255,0.1), rgba(124,106,239,0.4));
+  width: 1px;
+  align-self: stretch;
+  background: var(--sbg-border);
   flex-shrink: 0;
   cursor: default;
-}
-
-.sbg-compare__counter {
-  position: absolute;
-  top: 8px;
-  right: 8px;
-  font-size: 9px;
-  font-weight: 600;
-  letter-spacing: 0.5px;
-  color: rgba(255,255,255,0.7);
-  background: rgba(0,0,0,0.6);
-  padding: 2px 8px;
-  border-radius: 4px;
-  z-index: 2;
 }
 
 .sbg-compare__filename {
@@ -2640,9 +2693,6 @@ textarea.sbg-prompt-text {
   text-overflow: ellipsis;
 }
 
-.sbg-compare__filename--left {
-  left: 25%;
-}
 
 .sbg-btn--active {
   background: rgba(239, 68, 68, 0.2) !important;
@@ -2669,67 +2719,25 @@ textarea.sbg-prompt-text {
   padding-left: 6px;
 }
 
-/* Compare mode header */
+/* Compare mode header (metadata panel) */
 .sbg-compare-header {
-  padding: 6px 8px;
-  border-bottom: 1px solid rgba(255,255,255,0.08);
-  margin-bottom: 4px;
+  padding: 8px 10px;
+  background: rgba(124, 106, 239, 0.12);
+  border-radius: 8px;
+  margin-bottom: 8px;
 }
 
 .sbg-compare-header__title {
-  font-size: 11px;
-  font-weight: 600;
-  color: var(--sbg-accent, #7c6aef);
+  font-weight: 700;
+  font-size: 12px;
   margin-bottom: 4px;
+  color: var(--sbg-text, #eee);
 }
 
 .sbg-compare-header__legend {
   display: flex;
-  gap: 10px;
-  font-size: 9px;
-  opacity: 0.7;
-}
-
-/* Compare section diff indicators */
-.sbg-compare-section--changed {
-  border-left: 2px solid rgba(250, 204, 21, 0.4);
-}
-
-/* Side-by-side columns for diff sections */
-.sbg-compare-cols {
-  display: flex;
-  gap: 0;
-}
-
-.sbg-compare-col {
-  flex: 1;
-  min-width: 0;
-  padding: 4px;
-  overflow: hidden;
-}
-
-.sbg-compare-col--left {
-  border-right: none;
-}
-
-.sbg-compare-col--right {
-  border-left: none;
-}
-
-.sbg-compare-col__label {
-  font-size: 9px;
-  font-weight: 600;
-  text-transform: uppercase;
-  letter-spacing: 0.5px;
-  color: rgba(255,255,255,0.4);
-  margin-bottom: 4px;
-  padding: 0 2px;
-}
-
-.sbg-compare-col__divider {
-  width: 1px;
-  background: rgba(255,255,255,0.08);
-  flex-shrink: 0;
+  gap: 12px;
+  font-size: 11px;
 }
 
 /* Initial image preview in tab */
@@ -2742,7 +2750,7 @@ textarea.sbg-prompt-text {
   margin-bottom: 8px;
 }
 
-/* ── Two-pane Layout Editor (sbg-ly3) ─────────────────────────────── */
+/* Two-pane Layout Editor (sbg-ly3) */
 .sbg-ly3 { display: flex; flex-direction: column; height: 100%; min-height: 0; }
 .sbg-ly3-top { display: flex; flex-wrap: wrap; align-items: center; gap: 8px; margin-bottom: 8px; }
 .sbg-ly3-tabs { display: flex; gap: 4px; flex-wrap: wrap; }
@@ -2781,7 +2789,7 @@ textarea.sbg-prompt-text {
 .sbg-iconbtn--danger:hover { background: rgba(239,68,68,0.25); }
 
 /* "Hidden" eye toggle: greyed out with a diagonal strike. */
-/* Tabs editor (any section) - stacked rows mirroring the section-row pattern */
+/* Tabs editor (any section): stacked rows mirroring the section-row pattern */
 .sbg-ly3-tabsed { margin-top: 6px; padding-top: 6px; border-top: 1px dashed var(--sbg-border, #444); }
 .sbg-ly3-tabsed-head { display: flex; align-items: center; justify-content: space-between; margin-bottom: 4px; }
 .sbg-ly3-tabsed-label { font-size: 11px; color: var(--sbg-text-dim, #aaa); cursor: help; }
@@ -2800,6 +2808,66 @@ body.sbg-dragging-tab .sbg-ly3-tablist--empty {
   border: 1px dashed rgba(124, 106, 239, 0.5);
   border-radius: var(--sbg-radius-sm, 5px);
 }
+
+/* Drag conversions: a section card highlighted as a drop-INTO target, and the
+   placeholder variant shown while a tab or field hovers between section cards
+   (dropping there promotes it to its own section). */
+.sbg-ly3-sec--droptarget,
+.sbg-sortable-dropinto {
+  outline: 2px solid var(--sbg-accent, #7c6aef);
+  outline-offset: 1px;
+  background: rgba(124, 106, 239, 0.12);
+}
+.sbg-sortable-placeholder--promote {
+  display: flex; align-items: center; justify-content: center;
+  min-height: 26px;
+}
+.sbg-sortable-placeholder--promote::after {
+  content: "Drops here as its own section";
+  font-size: 10.5px;
+  color: var(--sbg-accent, #7c6aef);
+}
+
+/* Copy between layouts dialog */
+.sbg-ly3-xfer-overlay {
+  position: fixed; inset: 0; z-index: 100002;
+  background: rgba(0, 0, 0, 0.6);
+  display: flex; align-items: center; justify-content: center;
+}
+.sbg-ly3-xfer {
+  background: var(--sbg-surface, #1a1a2e);
+  border: 1px solid var(--sbg-border);
+  border-radius: 10px;
+  padding: 14px 16px;
+  width: min(540px, 92vw);
+  max-height: 82vh;
+  display: flex; flex-direction: column; gap: 10px;
+  box-shadow: 0 12px 40px rgba(0, 0, 0, 0.6);
+  font-size: 12px; color: var(--sbg-text);
+}
+.sbg-ly3-xfer-head { display: flex; align-items: center; gap: 8px; }
+.sbg-ly3-xfer-title { font-weight: 600; font-size: 13px; flex: 1; }
+.sbg-ly3-xfer-row { display: flex; align-items: center; gap: 8px; flex-wrap: wrap; }
+/* The layout pickers hold full profile names; the base 80px cap on this
+   select class truncates them, so the dialog raises it to fit. */
+.sbg-ly3-xfer-row .sbg-gs-select--xs { max-width: 220px; }
+.sbg-ly3-xfer-list {
+  overflow-y: auto;
+  border: 1px solid var(--sbg-border);
+  border-radius: 8px;
+  padding: 6px;
+  display: flex; flex-direction: column; gap: 2px;
+  min-height: 100px;
+}
+.sbg-ly3-xfer-item {
+  display: flex; align-items: center; gap: 8px;
+  padding: 3px 6px; border-radius: 5px; cursor: pointer;
+}
+.sbg-ly3-xfer-item:hover { background: rgba(255, 255, 255, 0.05); }
+.sbg-ly3-xfer-item--tab { margin-left: 26px; }
+.sbg-ly3-xfer-dim { color: var(--sbg-text-dim); font-size: 10.5px; }
+.sbg-ly3-xfer-radio { display: inline-flex; align-items: center; gap: 4px; cursor: pointer; }
+.sbg-ly3-xfer-foot { display: flex; justify-content: flex-end; gap: 8px; }
 
 /* Opacity slider in the shared colour picker */
 .sbg-cp-opacity {

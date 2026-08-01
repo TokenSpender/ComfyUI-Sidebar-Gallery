@@ -1,13 +1,10 @@
 /**
- * sbg-color-picker.js — Reusable HSL + opacity color picker component
+ * sbg-color-picker.js: Reusable HSL + opacity color picker component
  *
- * Provides createColorPicker() for a consistent color-picker UI *with an alpha
- * channel*. Used by both Appearance settings and the Layout Editor pickers, so
- * colours behave identically everywhere. Depends only on sbg-core.js.
- *
- * Colours round-trip through the canonical model in sbg-core (parseColor /
- * formatColor): plain hex when fully opaque, rgba() when translucent — so the
- * picker can finally show and edit the subtle translucent defaults.
+ * Provides createColorPicker() with an alpha channel, shared by Appearance
+ * settings and the Layout Editor so colours behave identically. Depends only
+ * on sbg-core.js. Colours round-trip through sbg-core's canonical model
+ * (parseColor / formatColor, always rgba), so translucent values edit cleanly.
  */
 
 import {
@@ -46,9 +43,9 @@ export function createColorPicker(options) {
   let cH, cS, cL, cA;
   { const pc = parseColor(initialColor) || parseColor("#7c6aef"); [cH, cS, cL] = rgbToHsl(pc.r, pc.g, pc.b); cA = pc.a; }
   const curStr = () => { const [r, g, b] = hslToRgb(cH, cS, cL); return formatColor(r, g, b, cA); };
-  // Always-rgba string for the text field DISPLAY only. The committed value stays
-  // canonical via curStr/formatColor (hex when opaque); the user asked the input
-  // to always read as rgba(...).
+  // curStr builds the committed value and curRgbaStr feeds the text field.
+  // Both emit rgba(), since formatColor stores every colour as rgba, so the
+  // displayed string always matches what gets committed.
   const curRgbaStr = () => { const [r, g, b] = hslToRgb(cH, cS, cL); return formatRgba(r, g, b, cA); };
   let currentColor = curStr();
 
@@ -58,7 +55,7 @@ export function createColorPicker(options) {
   const col = h("div", { class: "sbg-cp-main", style: "display:flex;flex-direction:column;" });
   panel.appendChild(col);
 
-  // ── Saturation / Lightness canvas ──
+  // Saturation / Lightness canvas
   const slCanvas = document.createElement("canvas");
   slCanvas.width = SL_W; slCanvas.height = SL_H;
   slCanvas.style.cssText = `width:${SL_W}px;height:${SL_H}px;border-radius:6px;cursor:crosshair;display:block;margin-bottom:8px;`;
@@ -95,7 +92,7 @@ export function createColorPicker(options) {
   document.addEventListener("mousemove", onSlMove);
   document.addEventListener("mouseup", onSlUp);
 
-  // ── Hue bar ──
+  // Hue bar
   const HUE_W = SL_W;
   const hueCanvas = document.createElement("canvas");
   hueCanvas.width = HUE_W; hueCanvas.height = HUE_H;
@@ -126,7 +123,7 @@ export function createColorPicker(options) {
   document.addEventListener("mousemove", onHueMove);
   document.addEventListener("mouseup", onHueUp);
 
-  // ── Opacity slider ──
+  // Opacity slider
   const opRow = h("div", { style: `display:flex;align-items:center;gap:8px;width:${SL_W}px;margin-bottom:10px;` });
   const opRange = h("input", { type: "range", min: "0", max: "100", value: String(Math.round(cA * 100)), class: "sbg-cp-opacity", style: "flex:1;" });
   const opVal = h("span", { style: "font-size:10px;opacity:0.7;min-width:30px;text-align:right;", text: Math.round(cA * 100) + "%" });
@@ -135,11 +132,11 @@ export function createColorPicker(options) {
   opRange.addEventListener("input", () => { cA = (parseInt(opRange.value, 10) || 0) / 100; _apply(); });
   col.appendChild(opRow);
 
-  // ── Preview + colour input ──
+  // Preview + colour input
   let preview = null, hexInp = null;
   // Commit the typed hex value. Declared at picker scope (not only inside the
   // showPreview block) so the returned `commit` can flush a pending edit when the
-  // host tears the picker down — layout-editor popovers are *removed* on
+  // host tears the picker down: layout-editor popovers are *removed* on
   // outside-click, which can pre-empt the input's own change/blur event.
   let _hexDirty = false;       // user has typed since the last apply
   let commitHex = () => {};    // real impl assigned below once the input exists
@@ -149,7 +146,7 @@ export function createColorPicker(options) {
     preview.style.background = withChecker(currentColor);
     hexInp = h("input", { type: "text", class: "sbg-gs-input sbg-gs-input--sm", value: curRgbaStr(), style: "flex:1;font-family:monospace;font-size:12px;" });
     commitHex = () => {
-      if (!_hexDirty) return;  // nothing typed — don't re-apply on a plain teardown
+      if (!_hexDirty) return;  // nothing typed, so don't re-apply on a plain teardown
       _hexDirty = false;
       const pc = parseColor(hexInp.value.trim());
       if (pc) { [cH, cS, cL] = rgbToHsl(pc.r, pc.g, pc.b); cA = pc.a; drawSL(); drawHue(); _apply(); }
@@ -163,7 +160,7 @@ export function createColorPicker(options) {
     col.appendChild(previewRow);
   }
 
-  // ── Saved colours (right column, fills the space beside the palette) ──
+  // Saved colours (right column, fills the space beside the palette)
   if (showSaved) {
     const savedCol = h("div", { class: "sbg-cp-saved", style: "display:flex;flex-direction:column;align-items:center;gap:5px;max-height:230px;overflow-y:auto;overflow-x:hidden;padding:2px;" });
     const savedLabel = h("div", { style: "font-size:10px;opacity:0.5;text-align:center;", text: "Saved" });
@@ -194,11 +191,11 @@ export function createColorPicker(options) {
     panel._renderSaved = renderSaved;
   }
 
-  // ── Apply colour everywhere ──
+  // Apply colour everywhere
   function _apply() {
     currentColor = curStr();
     if (preview) preview.style.background = withChecker(currentColor);
-    // Programmatic value set — not a user edit, so clear the dirty flag. Display
+    // Programmatic value set rather than a user edit, so clear the dirty flag. Display
     // is always rgba(...); the committed value (currentColor) stays canonical.
     if (hexInp) { hexInp.value = curRgbaStr(); _hexDirty = false; }
     opRange.value = String(Math.round(cA * 100));

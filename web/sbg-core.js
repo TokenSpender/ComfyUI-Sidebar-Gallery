@@ -1,12 +1,12 @@
 /**
- * sbg-core.js - Shared utilities, caches, IndexedDB, settings, icons
- * 
+ * sbg-core.js: Shared utilities, caches, IndexedDB, settings, icons
+ *
  * This module contains all shared infrastructure used by the gallery,
  * lightbox, settings, and entry point modules. It has no side effects
  * (no DOM mutations, no event listeners, no app.registerExtension).
  */
 
-/* ── Constants ────────────────────────────────────────────────────── */
+/* Constants */
 
 export const EXT_NAME = "ComfyUI-sidebar-gallery.Sidebar";
 // Resolve the stylesheet relative to this module's own served URL, so it loads
@@ -14,12 +14,12 @@ export const EXT_NAME = "ComfyUI-sidebar-gallery.Sidebar";
 // different folder than the git-clone instructions).
 export const CSS_URL = new URL("./sidebar_gallery.css", import.meta.url).href;
 
-/* ── Module-level data cache (persists across sidebar open/close) ── */
+/* Module-level data cache (persists across sidebar open/close) */
 
 export const _dataCache = {
   roots: null,        // [{id, label}, ...]
-  items: {},          // rootId -> [item, ...]
-  subfolders: {},     // rootId -> [subfolder, ...]
+  items: {},          // item arrays, keyed by rootId
+  subfolders: {},     // subfolder lists, keyed by rootId
   stale: false,       // set true when a new generation completes
   lastRootId: "output",
   lastSubfolder: "",
@@ -28,22 +28,19 @@ export const _dataCache = {
   // Per-response bookkeeping is keyed per root so a response for one root can't
   // stamp values that another root's logic then trusts (since timestamps,
   // version-gate decisions).
-  itemsVersion: {},      // rootId -> db_version the cached items reflect
-  serverTime: {},        // rootId -> server timestamp of last response (delta `since`)
-  _persistedVersion: {}, // rootId -> db_version last written to IndexedDB
+  itemsVersion: {},      // per-root db_version the cached items reflect
+  serverTime: {},        // per-root server timestamp of last response (delta `since`)
+  _persistedVersion: {}, // per-root db_version last written to IndexedDB
   _pendingFiles: [],  // files from executed events, waiting to be sent to backend
 };
 
-/* ── Mutable shared state (used by gallery + lightbox) ───────────── */
+/* Mutable shared state (used by gallery + lightbox) */
 
 export const searchState = {
   query: "",       // current search term for metadata highlighting (_activeSearchQuery)
-  scopes: null,    // Set of canonical section names that were searched, or null = global
 };
 
-export const _sectionOrderKey = "SBG.MetaSectionOrder";
-
-/* ── Module-level caches ──────────────────────────────────────────── */
+/* Module-level caches */
 
 // Bounded Map (FIFO eviction) so the metadata cache can't grow without limit
 // over a long browsing session. Entries are small, so the cap is generous; an
@@ -57,10 +54,25 @@ class _LruMap extends Map {
     return this;
   }
 }
-export const _metaCache = new _LruMap(5000); // "root_id:relpath" -> metadata object
+export const _metaCache = new _LruMap(5000); // metadata objects, keyed by "root_id:relpath"
 export const _mediaState = { volume: 1, muted: false, loop: true };
 
-/* ── IndexedDB persistence (instant load across reboots) ─────────── */
+/* In-flight request dedup */
+// Concurrent callers asking for the same thing (e.g. compare mode resolving the
+// same source image for both sides in one tick) share ONE promise instead of
+// firing duplicate network chains. The entry clears when the promise settles,
+// so a retry after failure starts fresh.
+const _inflightByKey = new Map();
+export function singleFlight(key, fn) {
+  const cur = _inflightByKey.get(key);
+  if (cur) return cur;
+  const p = Promise.resolve().then(fn);
+  _inflightByKey.set(key, p);
+  p.finally(() => _inflightByKey.delete(key)).catch(() => { });
+  return p;
+}
+
+/* IndexedDB persistence (instant load across reboots) */
 const _IDB_NAME = "sbg-gallery-cache";
 const _IDB_VERSION = 1;
 const _IDB_STORE = "items";
@@ -79,16 +91,19 @@ function _openIDB() {
   });
 }
 
-export async function _persistItems(rootId, items, dbVersion = null) {
+export async function _persistItems(rootId, items, dbVersion = null, serverTime = null) {
   try {
     const db = await _openIDB();
     const tx = db.transaction(_IDB_STORE, "readwrite");
     const store = tx.objectStore(_IDB_STORE);
     // Store dbVersion with the items in one put so the reopen version-gate can
     // trust that the saved version matches exactly the saved item set.
-    store.put({ items, ts: Date.now(), dbVersion }, rootId);
+    // serverTime rides along so a browser refresh keeps the delta `since`
+    // cursor: without it the first post-refresh reconcile can't use list_new
+    // and falls back to a full-library rescan + full list_all download every time.
+    store.put({ items, ts: Date.now(), dbVersion, serverTime }, rootId);
     db.close();
-  } catch (e) { /* IndexedDB not available - silently fail */ }
+  } catch (e) { /* no IndexedDB available, so fail silently */ }
 }
 
 export async function _loadPersistedItems(rootId) {
@@ -102,7 +117,11 @@ export async function _loadPersistedItems(rootId) {
         db.close();
         const data = req.result;
         if (data && Array.isArray(data.items) && data.items.length > 0) {
-          resolve({ items: data.items, dbVersion: data.dbVersion ?? null });
+          resolve({
+            items: data.items,
+            dbVersion: data.dbVersion ?? null,
+            serverTime: data.serverTime ?? null,
+          });
         } else {
           resolve(null);
         }
@@ -112,7 +131,7 @@ export async function _loadPersistedItems(rootId) {
   } catch (e) { return null; }
 }
 
-/* ── Helpers ──────────────────────────────────────────────────────── */
+/* Helpers */
 
 export function ensureCss() {
   if (document.querySelector(`link[data-sbg-css="1"]`)) return;
@@ -121,6 +140,16 @@ export function ensureCss() {
   link.href = CSS_URL;
   link.dataset.sbgCss = "1";
   document.head.appendChild(link);
+}
+
+// The render-affecting properties a section and a tab share. Copied as a unit
+// whenever a section becomes a tab (or the reverse), so a conversion keeps its
+// source binding, visibility gate, colour, and high/low pairing. Held in one
+// place so adding a property does not have to be mirrored across the converters.
+export const RENDER_PROP_KEYS = ["source", "sourceMatch", "showWhen", "color", "highlow"];
+export function copyRenderProps(src, dst) {
+  for (const k of RENDER_PROP_KEYS) if (src[k] != null) dst[k] = src[k];
+  return dst;
 }
 
 export function h(tag, attrs = {}, children = []) {
@@ -223,7 +252,7 @@ export function fileUrl(it) {
 
 export function isVideo(it) { return it.kind === "video"; }
 
-/* ── Persistent IndexedDB cache (thumbnails + metadata) ──────────── */
+/* Persistent IndexedDB cache (thumbnails + metadata) */
 
 let _idbCachedPromise = null;
 const _idbPromise = () => {
@@ -250,14 +279,26 @@ export function _resetIdb() {
   }
   _idbCachedPromise = null;
 }
-// L1 synchronous memory cache: url → blobUrl (with LRU eviction)
+// L1 synchronous memory cache mapping url to blobUrl (with LRU eviction)
 const MAX_MEM_CACHE = 500;  // Max blob URLs kept in memory
 export const _thumbMemCache = new Map();
 
 /** Insert into L1 cache with LRU eviction */
 function _thumbMemSet(url, blobUrl) {
-  // Move to end (most recently used)
-  if (_thumbMemCache.has(url)) _thumbMemCache.delete(url);
+  // Move to end (most recently used). A replaced entry's object URL is
+  // revoked unless a visible card still shows it, or every replacement
+  // leaks a blob for the page's life.
+  const prev = _thumbMemCache.get(url);
+  if (prev !== undefined) {
+    _thumbMemCache.delete(url);
+    if (prev !== blobUrl) {
+      try {
+        if (!document.querySelector(`img.sbg-card__thumb[src="${prev}"]`)) {
+          URL.revokeObjectURL(prev);
+        }
+      } catch { }
+    }
+  }
   _thumbMemCache.set(url, blobUrl);
   // Evict oldest 25% when over limit
   if (_thumbMemCache.size > MAX_MEM_CACHE) {
@@ -304,47 +345,59 @@ export const _thumbCacheAPI = {
     return _thumbMemCache.get(url) || null;
   },
 
-  /** Load a thumbnail URL from memory/IndexedDB cache or network. Returns an object URL. */
+  /** Load a thumbnail URL from memory/IndexedDB cache or network. Returns an object URL.
+   *  Deduped: concurrent callers for one URL share one promise, so a pair of
+   *  simultaneous misses cannot mint two blob URLs for the same thumb. */
   async getOrFetch(url) {
     // L1: synchronous memory check
     const mem = _thumbMemCache.get(url);
     if (mem) return mem;
-    try {
-      // L2: IndexedDB
-      const cached = await this._get(url);
-      if (cached) {
-        const blobUrl = URL.createObjectURL(cached);
-        _thumbMemSet(url, blobUrl);
-        return blobUrl;
-      }
-      // L3: Network fetch
-      const resp = await fetch(url);
-      if (resp.ok) {
-        const blob = await resp.blob();
-        await this._put(url, blob);
-        const blobUrl = URL.createObjectURL(blob);
-        _thumbMemSet(url, blobUrl);
-        return blobUrl;
-      }
-    } catch { /* IndexedDB not available - fall through */ }
-    return url;
+    return singleFlight("thumbFetch:" + url, async () => {
+      const again = _thumbMemCache.get(url);
+      if (again) return again;
+      try {
+        // L2: IndexedDB
+        const cached = await this._get(url);
+        if (cached) {
+          const blobUrl = URL.createObjectURL(cached);
+          _thumbMemSet(url, blobUrl);
+          return blobUrl;
+        }
+        // L3: Network fetch
+        const resp = await fetch(url);
+        if (resp.ok) {
+          const blob = await resp.blob();
+          await this._put(url, blob);
+          const blobUrl = URL.createObjectURL(blob);
+          _thumbMemSet(url, blobUrl);
+          return blobUrl;
+        }
+      } catch { /* no IndexedDB available, so fall through */ }
+      return url;
+    });
   },
 
-  /** Check if a URL is already cached (without fetching). Returns blob URL or null. */
+  /** Check if a URL is already cached (without fetching). Returns blob URL or null.
+   *  Deduped like getOrFetch, under its own key so a fetch never joins a
+   *  cache-only check and inherits its null. */
   async tryGet(url) {
     // L1: synchronous memory check
     const mem = _thumbMemCache.get(url);
     if (mem) return mem;
-    try {
-      // L2: IndexedDB
-      const cached = await this._get(url);
-      if (cached) {
-        const blobUrl = URL.createObjectURL(cached);
-        _thumbMemSet(url, blobUrl);
-        return blobUrl;
-      }
-    } catch { }
-    return null;
+    return singleFlight("thumbTry:" + url, async () => {
+      const again = _thumbMemCache.get(url);
+      if (again) return again;
+      try {
+        // L2: IndexedDB
+        const cached = await this._get(url);
+        if (cached) {
+          const blobUrl = URL.createObjectURL(cached);
+          _thumbMemSet(url, blobUrl);
+          return blobUrl;
+        }
+      } catch { }
+      return null;
+    });
   },
 
   /** Get cache stats including total size. */
@@ -400,7 +453,7 @@ export const _thumbCacheAPI = {
         const store = tx.objectStore('thumbs');
         const countReq = store.count();
         countReq.onsuccess = () => {
-          if ((countReq.result || 0) <= maxCount) return;  // under cap → no-op
+          if ((countReq.result || 0) <= maxCount) return;  // under cap, nothing to trim
           let toDelete = countReq.result - target;
           const curReq = store.openKeyCursor();
           curReq.onsuccess = (e) => {
@@ -500,7 +553,7 @@ export const _metaCacheAPI = {
   },
 };
 
-/* ── Lazy thumbnail loading via IntersectionObserver ──────────────── */
+/* Lazy thumbnail loading via IntersectionObserver */
 
 let _thumbObserver = null;
 const _thumbFailedUrls = new Set(); // Track URLs that have already failed
@@ -580,7 +633,7 @@ export function resetFailedThumbs() {
   _thumbFailedUrls.clear();
 }
 
-/* ── SVG Icons ────────────────────────────────────────────────────── */
+/* SVG Icons */
 
 export const PLAY_SVG = `<svg viewBox="0 0 24 24" width="16" height="16" fill="white"><polygon points="8,5 19,12 8,19"/></svg>`;
 export const VIDEO_ICON = `<svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.5"><polygon points="23 7 16 12 23 17 23 7"/><rect x="1" y="5" width="15" height="14" rx="2" ry="2"/></svg>`;
@@ -589,7 +642,7 @@ export const IMG_FILTER_ICON = `<svg viewBox="0 0 24 24" width="14" height="14" 
 export const SEARCH_SVG = `<svg viewBox="0 0 24 24" width="14" height="14" fill="none" stroke="currentColor" stroke-width="2"><circle cx="11" cy="11" r="7"/><line x1="16.65" y1="16.65" x2="21" y2="21"/></svg>`;
 export const GEAR_SVG = `<svg viewBox="0 0 24 24" width="14" height="14" fill="none" stroke="currentColor" stroke-width="2"><circle cx="12" cy="12" r="3"/><path d="M19.4 15a1.65 1.65 0 0 0 .33 1.82l.06.06a2 2 0 0 1-2.83 2.83l-.06-.06a1.65 1.65 0 0 0-1.82-.33 1.65 1.65 0 0 0-1 1.51V21a2 2 0 0 1-4 0v-.09A1.65 1.65 0 0 0 9 19.4a1.65 1.65 0 0 0-1.82.33l-.06.06a2 2 0 0 1-2.83-2.83l.06-.06A1.65 1.65 0 0 0 4.68 15a1.65 1.65 0 0 0-1.51-1H3a2 2 0 0 1 0-4h.09A1.65 1.65 0 0 0 4.6 9a1.65 1.65 0 0 0-.33-1.82l-.06-.06a2 2 0 0 1 2.83-2.83l.06.06A1.65 1.65 0 0 0 9 4.68a1.65 1.65 0 0 0 1-1.51V3a2 2 0 0 1 4 0v.09a1.65 1.65 0 0 0 1 1.51 1.65 1.65 0 0 0 1.82-.33l.06-.06a2 2 0 0 1 2.83 2.83l-.06.06A1.65 1.65 0 0 0 19.4 9a1.65 1.65 0 0 0 1.51 1H21a2 2 0 0 1 0 4h-.09a1.65 1.65 0 0 0-1.51 1z"/></svg>`;
 
-/* ── Setting IDs ──────────────────────────────────────────────────── */
+/* Setting IDs */
 
 export const S = {
   THUMB_SIZE: "SBG.ThumbSize",
@@ -607,6 +660,15 @@ export const S = {
   KEY_COPY_PROMPT: "SBG.KeyCopyPrompt",
   KEY_COPY_WF: "SBG.KeyCopyWF",
   KEY_LOAD_WF: "SBG.KeyLoadWF",
+  KEY_COMPARE: "SBG.KeyCompare",
+  KEY_RESET_ZOOM: "SBG.KeyResetZoom",
+  KEY_ZOOM_IN: "SBG.KeyZoomIn",
+  KEY_ZOOM_OUT: "SBG.KeyZoomOut",
+  KEY_MUTE: "SBG.KeyMute",
+  KEY_FRAME_PREV: "SBG.KeyFramePrev",
+  KEY_FRAME_NEXT: "SBG.KeyFrameNext",
+  KEY_CMP_CUR_PREV: "SBG.KeyCompareCurPrev",
+  KEY_CMP_CUR_NEXT: "SBG.KeyCompareCurNext",
   TOOLTIP_NAME: "SBG.TooltipName",
   TOOLTIP_SIZE: "SBG.TooltipSize",
   TOOLTIP_DATE: "SBG.TooltipDate",
@@ -642,9 +704,15 @@ export const S = {
   MODEL_NAME_STYLE: "SBG.ModelNameStyle",
   VSCROLL_BUFFER: "SBG.VScrollBuffer",
   META_TAB_PERSIST: "SBG.MetaTabPersist",
+  // Lightbox zoom
+  LB_ZOOM_SCROLL_MODE: "SBG.LbZoomScrollMode",
+  LB_ZOOM_ANCHOR: "SBG.LbZoomAnchor",
+  LB_ZOOM_SENSITIVITY: "SBG.LbZoomSensitivity",
+  LB_COMPARE_ZOOM: "SBG.LbCompareZoom",
+  LB_ZOOM_KEEP_ON_NAV: "SBG.LbZoomKeepOnNav",
 };
 
-/* ── Source-app registry ──────────────────────────────────────────── */
+/* Source-app registry */
 // The single table of supported source apps. Everything per-app derives from
 // it: APPS/APP_LABELS (translation layer + layout-editor profiles), the
 // settings rows, the boot-time CSS variable application, and the lightbox
@@ -660,7 +728,7 @@ export const APP_REGISTRY = [
   { id: "civitai", label: "CivitAI", settingKey: S.APP_BADGE_CIVITAI, cssVar: "--sbg-app-civitai", defaultColor: "#3b82f6" },
 ];
 
-/* ── Shared scan/reindex progress poller ─────────────────────────── */
+/* Shared scan/reindex progress poller */
 // One timer and one fetch of /sidebar_gallery/reindex_progress, fanned out to
 // every UI that shows indexing progress (status bar, new-folder flow,
 // first-time modal), so the phase copy can never drift between them.
@@ -697,14 +765,19 @@ export const progressPoller = {
       stops entirely once the last subscriber leaves. */
   subscribe(cb) {
     _ppSubs.add(cb);
-    if (_ppTimer == null) { _ppIdleTicks = 0; _ppTimer = setTimeout(_ppTick, 0); }
+    // Reset the idle count on EVERY subscribe: a consumer joining a poller
+    // another subscriber kept alive must not inherit its accumulated idle
+    // ticks and see settled on its first callback, before the operation it
+    // just started has begun reporting.
+    _ppIdleTicks = 0;
+    if (_ppTimer == null) { _ppTimer = setTimeout(_ppTick, 0); }
     return () => { _ppSubs.delete(cb); };
   },
 };
 
-/** The single formatter for a progress entry → {text, pct, error?}; pct -1 =
-    indeterminate. Every progress UI renders from this so phases can never
-    drift between them. */
+/** The single formatter turning a progress entry into {text, pct, error?};
+    pct -1 = indeterminate. Every progress UI renders from this so phases can
+    never drift between them. */
 export function formatProgress(entry) {
   if (!entry) return null;
   if (entry.phase === "error") {
@@ -719,17 +792,14 @@ export function formatProgress(entry) {
   return { text: `${done.toLocaleString()} / ${total.toLocaleString()} (${pct}%)`, pct };
 }
 
-/* ═══════════════════════════════════════════════════════════════════════
-   DISK-BACKED SETTINGS API
+/* DISK-BACKED SETTINGS API
 
-   All user preferences are persisted to a server-side JSON file via
-   GET/POST /sidebar_gallery/settings. An in-memory cache makes
-   reads synchronous (fast). Writes are debounced to avoid hammering
-   the server during rapid UI changes.
-
-   On first load (no disk settings file), settings auto-migrate from
-   localStorage so existing users don't lose them.
-   ═══════════════════════════════════════════════════════════════════════ */
+   Preferences saved through saveSetting are persisted to a server-side JSON
+   file via GET/POST /sidebar_gallery/settings, so they follow the install
+   across browsers. An in-memory cache makes reads synchronous. Writes are
+   debounced and sent as per-key updates, so rapid changes to a control
+   collapse into one write. Purely per-browser state (panel widths, collapse
+   memory, saved picker colours, presets) stays in localStorage. */
 
 /** In-memory settings cache. Populated by loadSettings(). */
 let _diskSettings = {};
@@ -785,9 +855,9 @@ export function flushSettingsNow() {
   const keys = Object.keys(pending);
   if (!keys.length) return;
   _pendingChanges = {};
-  // Send one per-key update each (the server merges per key), never the whole
-  // settings object, which would replace the file and clobber keys another tab
-  // or browser wrote since load.
+  // Send one per-key update each (the server merges per key). Sending the whole
+  // settings object would replace the file and clobber keys another tab or
+  // browser wrote since load.
   for (const key of keys) {
     const payload = JSON.stringify({ key, value: pending[key] });
     let sent = false;
@@ -806,7 +876,7 @@ function _installFlushHooks() {
   if (_flushHooksInstalled || typeof window === "undefined") return;
   _flushHooksInstalled = true;
   // pagehide covers tab close / navigation; visibilitychange covers tab switch /
-  // minimize - both flush any debounced changes so nothing is lost.
+  // minimize. Both flush any debounced changes so nothing is lost.
   window.addEventListener("pagehide", flushSettingsNow);
   document.addEventListener("visibilitychange", () => { if (document.visibilityState === "hidden") flushSettingsNow(); });
 }
@@ -825,27 +895,41 @@ export function saveSetting(key, value) {
 }
 
 /**
- * Flush all pending setting changes to the server.
+ * Flush all pending setting changes to the server. One drain runs at a time so
+ * two concurrent drains can't post a stale value over a newer one; keys are
+ * claimed one at a time (so unposted keys stay visible to the unload beacon)
+ * and each post carries keepalive so a nav-interrupted drain still delivers.
  */
+let _flushInFlight = false;
 async function _flushSettings() {
   _saveDebounceTimer = null;
-  const toSave = { ..._pendingChanges };
-  _pendingChanges = {};
-
-  // Persist each changed key with a per-key update. The server merges per key,
-  // so the whole settings file is never replaced; replacing it would clobber
-  // keys another tab/browser saved since load (cross-client data loss).
-  // Sequential awaits avoid a read-modify-write race between these writes.
-  for (const key of Object.keys(toSave)) {
-    try {
-      await fetch("/sidebar_gallery/settings", {
-        method: "POST",
-        headers: { "Content-Type": "application/json" },
-        body: JSON.stringify({ key, value: toSave[key] }),
-      });
-    } catch (e) {
-      console.warn("[SBG] Failed to save setting", key, e);
+  if (_flushInFlight) return;  // the running drain empties the pending map itself
+  _flushInFlight = true;
+  try {
+    // Persist each changed key with a per-key update. The server merges per
+    // key, so the whole settings file is never replaced; replacing it would
+    // clobber keys another tab/browser saved since load (cross-client data
+    // loss). A key re-saved while its older value is in flight simply lands
+    // back in the pending map and is posted again afterwards, newest last.
+    for (;;) {
+      const keys = Object.keys(_pendingChanges);
+      if (!keys.length) break;
+      const key = keys[0];
+      const value = _pendingChanges[key];
+      delete _pendingChanges[key];
+      try {
+        await fetch("/sidebar_gallery/settings", {
+          method: "POST",
+          headers: { "Content-Type": "application/json" },
+          body: JSON.stringify({ key, value }),
+          keepalive: true,
+        });
+      } catch (e) {
+        console.warn("[SBG] Failed to save setting", key, e);
+      }
     }
+  } finally {
+    _flushInFlight = false;
   }
 }
 
@@ -860,27 +944,12 @@ export function getSetting(id, fallback) {
   return fallback;
 }
 
-/* ── Layout config reader (single source of truth) ──────────────── */
-
-/**
- * Read the current layout config from the disk-settings cache.
- */
-export function getLayout() {
-  if (_diskSettingsLoaded && _diskSettings["SBG.Layout"]) {
-    const layout = _diskSettings["SBG.Layout"];
-    if (typeof layout === "object") return layout;
-  }
-  return {};
-}
-
-
-/* ── KV Row helper ──────────────────────────────────────────────── */
+/* KV Row helper */
 
 /**
  * Build a key-value metadata row.
  * @param {string} label - The label to display
  * @param {*} value - The value to display
- * @param {Object} [layout] - Layout config for label renames. If omitted, reads from getLayout().
  * @returns {HTMLElement|null} The row element, or null if value is empty
  */
 /** For a long filename-ish value, return a DocumentFragment with <wbr> break
@@ -903,17 +972,14 @@ export function breakable(value) {
   return frag;
 }
 
-export function kvRow(label, value, layout) {
+export function kvRow(label, value) {
   if (value === undefined || value === null || value === "") return null;
-  const _ly = layout || getLayout();
-  const _lyRenames = _ly.renames || {};
   const _lbl = label == null ? "" : String(label);
-  const displayLabel = _lyRenames[_lbl] || _lyRenames[_lbl.toLowerCase()] || _lbl;
   const row = h("div", { class: "sbg-meta-row" });
   // A blank label (the user cleared the field name) shows just the value, with no
   // empty "Label:" column in front of it.
-  if (String(displayLabel).trim() !== "") {
-    row.appendChild(h("span", { class: "sbg-meta-label", text: displayLabel }));
+  if (_lbl.trim() !== "") {
+    row.appendChild(h("span", { class: "sbg-meta-label", text: _lbl }));
   } else {
     row.classList.add("sbg-meta-row--nolabel");
   }
@@ -923,12 +989,13 @@ export function kvRow(label, value, layout) {
   return row;
 }
 
-/* ── Alpha-aware colour model ───────────────────────────────────────
+/* Alpha-aware colour model
  * One canonical representation so the pickers, swatches and rendering never
- * disagree. parseColor() understands hex (#rgb/#rgba/#rrggbb/#rrggbbaa), rgb()
- * and rgba(); formatColor() emits plain hex when fully opaque and rgba() when
- * translucent, so opaque colours stay untouched while transparency is preserved
- * end-to-end. (named colours / var() return null, caller keeps raw.) */
+ * disagree. parseColor() reads any hex/rgb/rgba string into {r,g,b,a}, and both
+ * formatColor() and formatRgba() emit rgba(). Storing rgba everywhere means a
+ * saved colour reads back exactly as the pickers show it, and parseColor() still
+ * accepts existing hex values so older saved colours keep working. (named
+ * colours / var() return null, caller keeps raw.) */
 
 /** Parse any hex / rgb / rgba string to {r,g,b,a} (a in 0..1), or null. */
 export function parseColor(str) {
@@ -957,15 +1024,9 @@ export function parseColor(str) {
   return null;
 }
 
-/** Format r,g,b (0..255) + a (0..1) as a CSS string: hex when opaque, rgba when not. */
+/** Format r,g,b (0..255) + a (0..1) as a CSS string. Always rgba, so a stored
+ *  colour reads back the same way the pickers show it (no hex/rgba split). */
 export function formatColor(r, g, b, a = 1) {
-  const c = (n, hi) => Math.max(0, Math.min(hi, Math.round(n)));
-  r = c(r, 255); g = c(g, 255); b = c(b, 255);
-  a = Math.max(0, Math.min(1, a));
-  if (a >= 1) {
-    const hx = n => n.toString(16).padStart(2, "0");
-    return "#" + hx(r) + hx(g) + hx(b);
-  }
   return formatRgba(r, g, b, a);
 }
 
@@ -979,7 +1040,7 @@ export function formatRgba(r, g, b, a = 1) {
   return `rgba(${c(r)}, ${c(g)}, ${c(b)}, ${Math.round(a * 1000) / 1000})`;
 }
 
-/** RGB (0..255) → [h(0..360), s(0..100), l(0..100)]. */
+/** RGB (0..255) to [h(0..360), s(0..100), l(0..100)]. */
 export function rgbToHsl(r, g, b) {
   r /= 255; g /= 255; b /= 255;
   const max = Math.max(r, g, b), min = Math.min(r, g, b), d = max - min;
@@ -988,7 +1049,7 @@ export function rgbToHsl(r, g, b) {
   return [Math.round(h), Math.round(s * 100), Math.round(l * 100)];
 }
 
-/** HSL (h 0..360, s/l 0..100) → [r,g,b] (0..255). */
+/** HSL (h 0..360, s/l 0..100) to [r,g,b] (0..255). */
 export function hslToRgb(h, s, l) {
   s /= 100; l /= 100;
   const a = s * Math.min(l, 1 - l);
@@ -1001,7 +1062,7 @@ export function hslToRgb(h, s, l) {
 const _CHECKER = "repeating-conic-gradient(#6b6b6b 0% 25%, #9a9a9a 0% 50%) 50% / 12px 12px";
 export function checkerBg(color) { return color ? `linear-gradient(${color}, ${color}), ${_CHECKER}` : _CHECKER; }
 
-/* ── Saved colors palette ───────────────────────────────────────── */
+/* Saved colors palette */
 
 const _SAVED_COLORS_KEY = "SBG.SavedColors";
 
@@ -1014,7 +1075,7 @@ export function saveSavedColors(arr) {
   localStorage.setItem(_SAVED_COLORS_KEY, JSON.stringify(arr.slice(0, 12)));
 }
 
-/* ── Search highlight ───────────────────────────────────────────── */
+/* Search highlight */
 
 /**
  * Walk all text nodes in container and wrap query matches in <mark>.

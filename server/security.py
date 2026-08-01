@@ -16,7 +16,7 @@ def _norm_abs(p: str) -> str:
 
 
 def make_root_id(prefix: str, path: str) -> str:
-    # Short stable-ish ID; used only as a lookup key, not as a secret.
+    # Short stable-ish ID; used only as a lookup key and carries no secrecy.
     import hashlib
 
     h = hashlib.sha1(path.encode("utf-8", errors="ignore")).hexdigest()[:10]
@@ -37,14 +37,14 @@ def safe_join(root_path: str, relpath: str) -> str:
     # Symlink-aware check: resolve real targets so a symlink INSIDE the root that
     # points outside it can't be used to escape (the lexical check above does not
     # follow links). Compared against realpath(root) so a legitimately symlinked
-    # root (e.g. StabilityMatrix junctions) still validates. We still RETURN the
+    # root (e.g. a launcher-created junction) still validates. We still RETURN the
     # lexical `full`, so thumbnail cache keys and displayed filenames are unchanged.
     #
     # IMPORTANT: os.path.realpath() can RAISE on Windows when a path crosses a
     # junction/mount point that the Redirection Guard mitigation deems "untrusted"
     # (WinError 448). That trust is per-process and can be absent on a fresh start
     # or lapse intermittently, which would otherwise turn EVERY file request into
-    # an unhandled OSError -> HTTP 500 (and hit HEVC playback hardest, since it
+    # an unhandled OSError surfacing as HTTP 500 (and hit HEVC playback hardest, since it
     # fires far more range requests). The lexical commonpath check above has
     # already proven the path doesn't escape the root textually, so if realpath is
     # unavailable we fall back to trusting that (the pre-hardening behaviour)

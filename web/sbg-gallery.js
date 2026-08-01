@@ -1,15 +1,15 @@
 /**
- * sbg-gallery.js - Gallery grid, search, virtual scrolling, and data management
+ * sbg-gallery.js: Gallery grid, search, virtual scrolling, and data management
  *
  * This module owns:
- *   - Gallery grid rendering (virtual scroll with card recycling)
+ *   - Gallery grid rendering (virtual scroll)
  *   - Search bar, tags, autocomplete, server/client search
  *   - Folder navigation (root picker, subfolder tree)
  *   - Sort/filter controls
  *   - Data fetching (list_all, list_new, delta refresh)
  *   - First-time indexing modal
  *
- * Entry point: initGallery(mountEl, config) → { state, fetchAllItems, ... }
+ * Entry point: initGallery(mountEl, config) returns { state, fetchAllItems, ... }
  */
 
 import {
@@ -20,41 +20,34 @@ import {
   _thumbMemCache, _thumbCacheAPI, _metaCacheAPI, _resetIdb,
   initThumbObserver, getThumbObserver, resetThumbObserver, resetFailedThumbs,
   PLAY_SVG, VIDEO_ICON, IMG_ICON, IMG_FILTER_ICON, SEARCH_SVG, GEAR_SVG,
-  S, getSetting, getLayout,
+  S, getSetting,
   progressPoller, formatProgress,
 } from "./sbg-core.js";
 
 import { SectionRegistry } from "./sbg-section-registry.js";
+import { getSectionRenames, getCustomSectionSearchMap, setCatalogTitles } from "./sbg-translation-layer.js";
 
-/* ═══════════════════════════════════════════════════════════════════════
-   SEARCH PREFIXES
-   ═══════════════════════════════════════════════════════════════════════ */
+/* SEARCH PREFIXES */
 
 const SEARCH_PREFIXES = [
-  "name:", "model:", "lora:", "sampler:", "controlnet:", "prompt:", "keyword:", "app:",
+  "name:", "model:", "vae:", "clip:", "lora:", "sampler:", "controlnet:", "prompt:", "keyword:", "app:",
   "mmaudio:", "sampling:", "adetailer:", "upscaling:", "interpolation:",
   "fileinfo:", "file info:", "extra:", "workflow_nodes:", "workflow nodes:",
 ];
 
-/* ═══════════════════════════════════════════════════════════════════════
-   VIRTUAL SCROLL ENGINE
-   ═══════════════════════════════════════════════════════════════════════
+/* VIRTUAL SCROLL ENGINE
 
-   Instead of creating DOM nodes for every image in the library, we
-   maintain a POOL of reusable card elements and position them absolutely
-   inside the grid container. Only cards within the visible viewport
-   (plus a buffer) exist in the DOM at any time.
+   Instead of creating DOM nodes for every image in the library, cards are
+   positioned absolutely inside the grid container and only those within
+   the visible viewport (plus a buffer) exist in the DOM at any time.
 
    Key pieces:
-     _pool[]           - reusable card DOM elements
      _cardMap           - Map<itemIndex, cardEl>  (currently mounted cards)
      _visRange          - { first, last } item indices currently mounted
      _metrics           - { colCount, rowH, colW } computed from container
-     _scrollRafId       - rAF id for throttled scroll handler
-   ═══════════════════════════════════════════════════════════════════════ */
+     _scrollRafId       - rAF id for throttled scroll handler */
 
 const DEFAULT_BUFFER_ROWS = 12; // extra rows rendered above/below viewport
-const MAX_POOL = 120;  // max pooled (off-screen) cards before GC
 
 /**
  * Compute grid layout metrics from container dimensions and thumb size.
@@ -75,19 +68,18 @@ function _computeMetrics(container, thumbSize, gap, searchActive, perRow = 0) {
 }
 
 /**
- * Compute masonry layout positions for all items.
- * Each item gets a pre-computed { x, y, w, h } based on its aspect ratio.
- * Items are placed in the shortest column (standard masonry algorithm).
+ * Compute layout positions for all items in aspect-ratio ("masonry") mode.
+ * Despite the historical name, this is a justified-rows layout: items flow
+ * left-to-right, top-to-bottom in strict reading order, and each row is
+ * scaled to fill the container width while every card keeps its true aspect
+ * ratio. Supports mixed portrait/landscape without cropping to squares.
+ * Each item gets a pre-computed { x, y, w, h }.
  *
  * @param {Array} items - filtered items array
  * @param {object} metrics - { colCount, colW, gap, infoH }
  * @returns {{ positions: Array<{x,y,w,h}>, totalHeight: number }}
  */
 function _computeMasonryLayout(items, metrics, fixedPerRow = 0) {
-  // Justified-rows layout (Google-Photos style): items are placed left-to-right,
-  // top-to-bottom in strict reading order, each row scaled to fill the container
-  // width while every card keeps its true aspect ratio. Supports mixed
-  // portrait/landscape without cropping to squares.
   // fixedPerRow > 0: every row holds EXACTLY that many cards (user setting);
   // row height comes purely from the cards' aspect ratios.
   const { colCount, colW, gap, infoH } = metrics;
@@ -179,9 +171,7 @@ function _masonryVisibleRange(positions, topEdge, bottomEdge) {
 }
 
 
-/* ═══════════════════════════════════════════════════════════════════════
-   GALLERY INIT
-   ═══════════════════════════════════════════════════════════════════════ */
+/* GALLERY INIT */
 
 /**
  * Initialize the gallery inside the given mount element.
@@ -212,7 +202,7 @@ export function initGallery(mountEl, config) {
   // files change and IndexedDB has no LRU). Fire-and-forget on mount.
   _thumbCacheAPI.pruneIfOver(50000);
 
-  /* ── Read settings ──────────────────────────────────────────────── */
+  /* Read settings */
 
   const thumbSize = Math.max(64, Math.min(256, Number(getSetting(S.THUMB_SIZE, 110)) || 110));
   // Fixed items-per-row (0 = auto: fit by thumbnail size).
@@ -236,7 +226,7 @@ export function initGallery(mountEl, config) {
   const vidBadgeColor = getSetting(S.VIDEO_BADGE_COLOR, "#facc15");
   mountEl.style.setProperty("--sbg-badge-vid", vidBadgeColor);
 
-  /* ── Gallery state ──────────────────────────────────────────────── */
+  /* Gallery state */
 
   const state = {
     roots: [],
@@ -257,7 +247,7 @@ export function initGallery(mountEl, config) {
     _searchMatches: null,
   };
 
-  /* ── Sorting ────────────────────────────────────────────────────── */
+  /* Sorting */
 
   // Created time = ctime (falls back to mtime); Modified time = mtime_real
   // (falls back to ctime/mtime). "newest"/"oldest" are creation-time aliases
@@ -290,10 +280,7 @@ export function initGallery(mountEl, config) {
     else if (state.kind === "video") items = items.filter(it => it.kind === "video");
 
     // Search
-    if (state.q && !state._searchMatches) {
-      const lq = state.q.toLowerCase();
-      items = items.filter(it => it.relpath.toLowerCase().includes(lq));
-    } else if (state._searchMatches) {
+    if (state._searchMatches) {
       items = items.filter(it => {
         const rp = it.relpath.replace(/\\/g, "/");
         if (state._searchMatches.has(rp)) {
@@ -311,18 +298,54 @@ export function initGallery(mountEl, config) {
     state.displayedCount = 0;
   }
 
-  /* ── Search state sync ──────────────────────────────────────────── */
+  /* Search state sync */
 
   function _setSearchQuery(val) {
     searchState.query = val;
   }
-  function _setSearchScopes(val) {
-    searchState.scopes = val;
-  }
 
-  /* ── DOM: Toolbar ───────────────────────────────────────────────── */
+  /* DOM: Toolbar */
 
   const folderNav = h("div", { class: "sbg-folder-nav" });
+
+  // The two crumb dropdowns (roots, folders) share one open-popup slot with a
+  // click toggle. The outside-mousedown dismiss ignores the anchor button, so
+  // the button's own click handler decides between closing the open popup and
+  // building a fresh one; without that exclusion the dismiss removes the popup
+  // first and the click instantly rebuilds it, so a second click on the button
+  // could never close the dropdown. Keys are stable strings because the
+  // buttons themselves are rebuilt on every renderFolderNav.
+  let _crumbPopup = null; // { anchorKey, popup, close }
+  function _closeCrumbPopup() {
+    if (!_crumbPopup) return;
+    _crumbPopup.close();
+    _crumbPopup = null;
+  }
+  function _toggleCrumbPopup(anchorKey, btn, build, onClose) {
+    if (_crumbPopup && _crumbPopup.anchorKey === anchorKey) { _closeCrumbPopup(); return null; }
+    _closeCrumbPopup();
+    const popup = build();
+    document.body.appendChild(popup);
+    const rect = btn.getBoundingClientRect();
+    popup.style.position = "fixed";
+    popup.style.left = rect.left + "px";
+    popup.style.top = (rect.bottom + 2) + "px";
+    popup.style.zIndex = "100000";
+    const dismiss = (ev) => {
+      // Self-guard: a popup removed behind our back must not close its successor.
+      if (!popup.isConnected) { document.removeEventListener("mousedown", dismiss); return; }
+      if (popup.contains(ev.target) || ev.target === btn || btn.contains(ev.target)) return;
+      _closeCrumbPopup();
+    };
+    const close = () => {
+      if (onClose) onClose(popup);
+      popup.remove();
+      document.removeEventListener("mousedown", dismiss);
+    };
+    _crumbPopup = { anchorKey, popup, close };
+    setTimeout(() => document.addEventListener("mousedown", dismiss), 0);
+    return popup;
+  }
 
   function renderFolderNav() {
     folderNav.innerHTML = "";
@@ -332,26 +355,21 @@ export function initGallery(mountEl, config) {
     if (state.roots.length > 1) {
       const rootBtn = h("button", { class: "sbg-crumb sbg-crumb--root", text: rootLabel, title: "Click to change root" });
       rootBtn.addEventListener("click", () => {
-        const popup = h("div", { class: "sbg-crumb-popup" });
-        for (const r of state.roots) {
-          const item = h("div", {
-            class: `sbg-crumb-popup__item${r.id === state.rootId ? " sbg-crumb-popup__item--active" : ""}`,
-            text: r.label,
-          });
-          item.addEventListener("click", () => {
-            popup.remove();
-            switchRoot(r.id);
-          });
-          popup.appendChild(item);
-        }
-        document.body.appendChild(popup);
-        const rect = rootBtn.getBoundingClientRect();
-        popup.style.position = "fixed";
-        popup.style.left = rect.left + "px";
-        popup.style.top = (rect.bottom + 2) + "px";
-        popup.style.zIndex = "100000";
-        const dismiss = (ev) => { if (!popup.contains(ev.target)) { popup.remove(); document.removeEventListener("mousedown", dismiss); } };
-        setTimeout(() => document.addEventListener("mousedown", dismiss), 0);
+        _toggleCrumbPopup("root", rootBtn, () => {
+          const popup = h("div", { class: "sbg-crumb-popup" });
+          for (const r of state.roots) {
+            const item = h("div", {
+              class: `sbg-crumb-popup__item${r.id === state.rootId ? " sbg-crumb-popup__item--active" : ""}`,
+              text: r.label,
+            });
+            item.addEventListener("click", () => {
+              _closeCrumbPopup();
+              switchRoot(r.id);
+            });
+            popup.appendChild(item);
+          }
+          return popup;
+        });
       });
       folderNav.appendChild(rootBtn);
     }
@@ -361,40 +379,38 @@ export function initGallery(mountEl, config) {
       const currentLabel = state.subfolder || "All folders";
       const pickBtn = h("button", { class: "sbg-crumb sbg-crumb--pick", text: "📂 " + currentLabel, title: "Browse folders" });
       pickBtn.addEventListener("click", () => {
-        const popup = h("div", { class: "sbg-crumb-popup sbg-crumb-popup--folders" });
-        const allItem = h("div", { class: `sbg-crumb-popup__item${!state.subfolder ? " sbg-crumb-popup__item--active" : ""}`, text: "📁 All folders" });
-        allItem.addEventListener("click", () => {
-          _dataCache.folderScrollTop = popup.scrollTop;
-          popup.remove();
-          state.subfolder = "";
-          _dataCache.lastSubfolder = "";
-          refilter();
-          renderFolderNav();
-        });
-        popup.appendChild(allItem);
-        for (const sf of state.subfolders) {
-          const item = h("div", {
-            class: `sbg-crumb-popup__item${sf === state.subfolder ? " sbg-crumb-popup__item--active" : ""}`,
-            text: "📁 " + sf,
-          });
-          item.addEventListener("click", () => {
-            _dataCache.folderScrollTop = popup.scrollTop;
-            popup.remove();
-            state.subfolder = sf;
-            _dataCache.lastSubfolder = sf;
+        // Scroll position persists through every close path (dismiss, toggle,
+        // pick) via the toggle helper's onClose hook.
+        const popup = _toggleCrumbPopup("folders", pickBtn, () => {
+          const p = h("div", { class: "sbg-crumb-popup sbg-crumb-popup--folders" });
+          const allItem = h("div", { class: `sbg-crumb-popup__item${!state.subfolder ? " sbg-crumb-popup__item--active" : ""}`, text: "📁 All folders" });
+          allItem.addEventListener("click", () => {
+            _closeCrumbPopup();
+            state.subfolder = "";
+            _dataCache.lastSubfolder = "";
             refilter();
             renderFolderNav();
           });
-          popup.appendChild(item);
-        }
-        document.body.appendChild(popup);
-        const rect = pickBtn.getBoundingClientRect();
-        popup.style.position = "fixed";
-        popup.style.left = rect.left + "px";
-        popup.style.top = (rect.bottom + 2) + "px";
-        popup.style.zIndex = "100000";
-        popup.style.maxHeight = "300px";
-        popup.style.overflowY = "auto";
+          p.appendChild(allItem);
+          for (const sf of state.subfolders) {
+            const item = h("div", {
+              class: `sbg-crumb-popup__item${sf === state.subfolder ? " sbg-crumb-popup__item--active" : ""}`,
+              text: "📁 " + sf,
+            });
+            item.addEventListener("click", () => {
+              _closeCrumbPopup();
+              state.subfolder = sf;
+              _dataCache.lastSubfolder = sf;
+              refilter();
+              renderFolderNav();
+            });
+            p.appendChild(item);
+          }
+          p.style.maxHeight = "300px";
+          p.style.overflowY = "auto";
+          return p;
+        }, (p) => { _dataCache.folderScrollTop = p.scrollTop; });
+        if (!popup) return; // second click on the button; the dropdown closed
         requestAnimationFrame(() => {
           requestAnimationFrame(() => {
             const savedScroll = _dataCache.folderScrollTop || 0;
@@ -406,14 +422,6 @@ export function initGallery(mountEl, config) {
             }
           });
         });
-        const dismiss = (ev) => {
-          if (!popup.contains(ev.target)) {
-            _dataCache.folderScrollTop = popup.scrollTop;
-            popup.remove();
-            document.removeEventListener("mousedown", dismiss);
-          }
-        };
-        setTimeout(() => document.addEventListener("mousedown", dismiss), 0);
       });
       folderNav.appendChild(pickBtn);
     }
@@ -439,7 +447,7 @@ export function initGallery(mountEl, config) {
   sortSel.value = state.sort;
   const diagBtn = h("button", { class: "sbg-btn", html: GEAR_SVG, title: "Gallery Settings" });
 
-  /* ── Search bar ─────────────────────────────────────────────────── */
+  /* Search bar */
 
   const qInput = h("input", { class: "sbg-input", placeholder: "Search all fields… (name: for filename only)", title: "Search across all metadata fields. Press Enter to add as a tag. Use name: for filename-only, model: lora: prompt: keyword: sampler: controlnet: for specific fields" });
   const searchClear = h("button", { class: "sbg-search-clear", text: "✕", title: "Clear search" });
@@ -471,13 +479,74 @@ export function initGallery(mountEl, config) {
   autoCompleteDropdown.style.display = "none";
   let _acSelectedIdx = -1;
 
+  // Resolve a user-typed search field name. Canonical sections come first
+  // (built-in names, aliases, layout-editor retitles); then custom sections
+  // and tab labels, which resolve to the backend field their params read (a
+  // workflow_nodes search scoped by node classes, or a data bucket like
+  // adetailer), so a user-made tab like "LLava" is searchable under its name.
+  function _resolveSearchField(typed) {
+    const canonical = SectionRegistry.getCanonicalName(typed, getSectionRenames());
+    if (canonical) return { field: SectionRegistry.getSearchField(canonical) };
+    const custom = getCustomSectionSearchMap()[String(typed).trim().toLowerCase()];
+    if (custom) return { field: custom.field, nodeClasses: custom.classes || null };
+    return null;
+  }
+
+  // One home for turning a typed search string into a tag object: the leading
+  // minus (exclusion), the field:value split, the field-name resolution and
+  // the bare-term section scope all live here, so the create path and the
+  // chip-edit path can never drift apart. `raw` keeps the typed casing with
+  // the minus stripped; the pill prepends the minus glyph from `exclude`.
+  // Returns null when nothing searchable remains.
+  function parseSearchTag(input) {
+    let raw = String(input).trim();
+    if (!raw) return null;
+    let exclude = false;
+    if (raw.startsWith("-")) {
+      exclude = true;
+      raw = raw.replace(/^-\s*/, "");
+      if (!raw) return null;
+    }
+    const lc = raw.toLowerCase();
+    let field = "any", value = lc, nodeClasses = null;
+    const ci = lc.indexOf(":");
+    if (ci > 0 && ci < 30) {
+      field = lc.slice(0, ci).trim();
+      value = lc.slice(ci + 1).trim();
+      const r = _resolveSearchField(field);
+      if (r) { field = r.field; nodeClasses = r.nodeClasses || null; }
+    } else {
+      // No colon: a bare term naming a known section (built-in, renamed or
+      // custom) scopes to that section and lists every item that has it;
+      // anything else stays a free-text "any" search.
+      const r = _resolveSearchField(lc);
+      if (r) { field = r.field; nodeClasses = r.nodeClasses || null; value = ""; }
+    }
+    return { field, value, raw, exclude, ...(nodeClasses ? { node_classes: nodeClasses } : {}) };
+  }
+
   function _updateAutocomplete() {
     const val = qInput.value.toLowerCase().trim();
     autoCompleteDropdown.innerHTML = "";
     _acSelectedIdx = -1;
-    // Only suggest once the user has typed something, never on empty focus/scroll.
+    // Suggest only after the user has typed something: this also runs on
+    // focus, and focusing the empty box must not pop the dropdown open.
     if (val.length === 0 || val.includes(":")) { autoCompleteDropdown.style.display = "none"; return; }
-    const matches = SEARCH_PREFIXES.filter(p => p.startsWith(val));
+    // Sections retitled in the layout editor are offered under their new names
+    // as well (lowercased, matching the built-in prefixes). The built-in names
+    // keep resolving, so both spellings work. User-made sections and tab
+    // labels are offered too; they resolve to the field their params read.
+    const candidates = [...SEARCH_PREFIXES];
+    for (const [canonical, renamed] of Object.entries(getSectionRenames())) {
+      if (!SectionRegistry.sectionDefs[canonical]?.searchField) continue;
+      const p = renamed.toLowerCase() + ":";
+      if (!candidates.includes(p)) candidates.push(p);
+    }
+    for (const key of Object.keys(getCustomSectionSearchMap())) {
+      const p = key + ":";
+      if (!candidates.includes(p)) candidates.push(p);
+    }
+    const matches = candidates.filter(p => p.startsWith(val));
     if (matches.length === 0 || (matches.length === 1 && matches[0] === val + ":")) {
       autoCompleteDropdown.style.display = "none";
       return;
@@ -509,11 +578,13 @@ export function initGallery(mountEl, config) {
     if (_acSelectedIdx >= 0 && _acSelectedIdx < items.length) {
       qInput.value = items[_acSelectedIdx].textContent;
       autoCompleteDropdown.style.display = "none";
+      _acSelectedIdx = -1; // the highlight is consumed; a later Enter commits
       return true;
     }
     if (items.length > 0 && autoCompleteDropdown.style.display !== "none") {
       qInput.value = items[0].textContent;
       autoCompleteDropdown.style.display = "none";
+      _acSelectedIdx = -1;
       return true;
     }
     return false;
@@ -533,9 +604,9 @@ export function initGallery(mountEl, config) {
     searchClear,
     autoCompleteDropdown,
   ]);
-  _syncSearchBtns(); // empty query -> show the refresh button
+  _syncSearchBtns(); // an empty query shows the refresh button
 
-  /* ── Progress bar ───────────────────────────────────────────────── */
+  /* Progress bar */
 
   const progressFill = h("div", { class: "sbg-progress__fill" });
   const progressText = h("span", { class: "sbg-progress__text" });
@@ -569,7 +640,7 @@ export function initGallery(mountEl, config) {
 
   diagBtn.addEventListener("click", () => openGallerySettings("layout"));
 
-  /* ── Status bar ─────────────────────────────────────────────────── */
+  /* Status bar */
 
   const statusLeft = h("span", { class: "sbg-status__left", text: "Ready" });
   const statusRight = h("span", { class: "sbg-status__right" });
@@ -586,6 +657,13 @@ export function initGallery(mountEl, config) {
   // full rebuild if one runs, else any root's first index. Subscribes at mount
   // and unsubscribes once everything settles.
   function watchReindexProgress() {
+    // Runs at the end of the async boot, which can finish AFTER this gallery
+    // instance was replaced by a remount. A stale instance must not subscribe
+    // (its status element is detached) and must not overwrite the live
+    // instance's published unsubscribe handle. Clearing any current occupant
+    // before publishing keeps exactly one subscription alive.
+    if (!statusReindex.isConnected) return;
+    if (window._sbgProgressUnsub) { try { window._sbgProgressUnsub(); } catch { } }
     let sawRunning = false;
     const unsub = progressPoller.subscribe((data, meta) => {
       let e = null;
@@ -618,7 +696,7 @@ export function initGallery(mountEl, config) {
 
   const statusBar = h("div", { class: "sbg-status" }, [statusLeft, statusReindex, statusRight]);
 
-  /* ── Grid container ─────────────────────────────────────────────── */
+  /* Grid container */
 
   const grid = h("div", { class: "sbg-grid sbg-grid--virtual" });
   const spacer = h("div", { class: "sbg-grid__spacer" });
@@ -632,25 +710,14 @@ export function initGallery(mountEl, config) {
 
   grid.style.setProperty("--sbg-thumb-size", `${thumbSize}px`);
 
-  /* ── Virtual scroll state ───────────────────────────────────────── */
+  /* Virtual scroll state */
 
   const GAP = 8;
   let _metrics = null;
-  let _cardMap = new Map();   // itemIndex → card element
-  let _pool = [];             // recycled off-screen card elements
+  let _cardMap = new Map();   // card elements, keyed by item index
   let _scrollRafId = null;
   let _resizeObserver = null;
   let _emptyMsg = null;       // empty state placeholder
-
-  function _recycleCard(cardEl) {
-    cardEl.style.display = "none";
-    cardEl.removeAttribute("data-idx");
-    if (_pool.length < MAX_POOL) {
-      _pool.push(cardEl);
-    } else {
-      cardEl.remove();
-    }
-  }
 
   /**
    * Build a tooltip string for a card.
@@ -664,12 +731,11 @@ export function initGallery(mountEl, config) {
   }
 
   /**
-   * Create a brand-new card element for an item, OR recycle one from pool.
-   * For virtual scrolling, cards are positioned absolutely.
+   * Create the card element for an item. For virtual scrolling, cards are
+   * positioned absolutely. Always builds a fresh card; reusing unmounted
+   * card elements would need careful src/event cleanup.
    */
-  function _createOrRecycleCard(it, index) {
-    // Always create fresh for now (recycling requires careful src/event cleanup).
-    // TODO: implement proper card recycling for even better perf
+  function _createCard(it, index) {
     const shapeClass = thumbShape === "ar" ? "sbg-card__thumb-wrap--ar" : "sbg-card__thumb-wrap--square";
     const thumbWrap = h("div", { class: `sbg-card__thumb-wrap ${shapeClass}` });
 
@@ -678,7 +744,7 @@ export function initGallery(mountEl, config) {
         class: "sbg-card__thumb",
         loading: "lazy",
         // Non-draggable so the blob: thumbnail never leaks into the card's drag
-        // payload (ComfyUI's native drop would try to upload it → 500).
+        // payload (ComfyUI's native drop would try to upload it and get a 500).
         draggable: "false",
         onerror: function () {
           // Show a placeholder icon on any thumbnail load failure, but keep the
@@ -701,6 +767,9 @@ export function initGallery(mountEl, config) {
       } else {
         // L2+: async IDB then network
         _thumbCacheAPI.tryGet(it.thumb_url).then(blobUrl => {
+          // Liveness guard, mirroring the observer path: after a re-render
+          // this continuation must not write into a detached card.
+          if (!thumbWrap.isConnected) return;
           if (blobUrl) {
             thumbImg.src = blobUrl;
             thumbWrap.appendChild(thumbImg);
@@ -733,7 +802,7 @@ export function initGallery(mountEl, config) {
     const card = h("div", {
       class: "sbg-card sbg-card--virtual",
       title: buildTooltip(it),
-      onclick: () => openLightbox(state.filteredItems, it),
+      onclick: (e) => openLightbox(state.filteredItems, it, e),
     }, [
       thumbWrap,
       h("div", { class: "sbg-card__info" }, [
@@ -744,7 +813,7 @@ export function initGallery(mountEl, config) {
 
     // Search match badges
     if (it._matchedFields && state._searchMatches) {
-      const _layout = getLayout();
+      const _renames = getSectionRenames();
       const _BADGE_FALLBACK = { pos_prompt: "POSITIVE", neg_prompt: "NEGATIVE", filename: "FILENAME", keyword: "KEYWORD", app: "APP", any: "ANY" };
       const _searchToCanonical = {};
       for (const [name, def] of Object.entries(SectionRegistry.sectionDefs)) {
@@ -756,7 +825,7 @@ export function initGallery(mountEl, config) {
         const field = typeof mf === "string" ? mf : mf.field;
         const count = typeof mf === "object" ? (mf.count || 1) : 1;
         const canonical = _searchToCanonical[field.toLowerCase()];
-        const displayName = canonical ? SectionRegistry.getDisplayName(canonical, _layout) : null;
+        const displayName = canonical ? SectionRegistry.getDisplayName(canonical, _renames) : null;
         const label = displayName ? displayName.toUpperCase() : (_BADGE_FALLBACK[field] || field.toUpperCase());
         const text = count > 1 ? `${label}(${count})` : label;
         infoEl.appendChild(
@@ -774,10 +843,10 @@ export function initGallery(mountEl, config) {
     });
 
     card.dataset.idx = String(index);
-    card.dataset.relpath = it.relpath;  // bind card → item so we can detect stale reuse
+    card.dataset.relpath = it.relpath;  // bind the card to its item so stale reuse is detectable
     // Identity includes mtime: a file overwritten in place keeps its relpath but
     // needs a rebuilt card (fresh ?v= thumb URL), which relpath alone can't detect.
-    card.dataset.key = `${it.relpath} ${it.mtime_real ?? it.mtime ?? 0}`;
+    card.dataset.key = `${it.relpath}\x00${it.mtime_real ?? it.mtime ?? 0}`;
     return card;
   }
 
@@ -831,7 +900,7 @@ export function initGallery(mountEl, config) {
     let firstIdx, lastIdx;
 
     if (_masonryData) {
-      // ── Masonry (justified-rows) mode ──
+      // Masonry (justified-rows) mode
       // Items are placed in strict top-to-bottom, left-to-right reading order
       // (see _computeMasonryLayout), so positions are sorted by Y and the visible
       // items form a CONTIGUOUS index range. Binary-search it (O(log n)) instead
@@ -840,10 +909,10 @@ export function initGallery(mountEl, config) {
       const bottomEdge = scrollTop + viewH + bufferPx;
       const [first, last] = _masonryVisibleRange(_masonryData.positions, topEdge, bottomEdge);
 
-      // Recycle cards now outside the visible range.
+      // Unmount cards now outside the visible range.
       for (const [idx, card] of _cardMap) {
         if (idx < first || idx >= last) {
-          _recycleCard(card);
+          card.remove();
           _cardMap.delete(idx);
         }
       }
@@ -854,13 +923,13 @@ export function initGallery(mountEl, config) {
         const existing = _cardMap.get(i);
         if (existing) {
           // If the list shifted (e.g. a delta refresh prepended items), index i may
-          // now point to a different item, or the same item modified in place (new
-          // mtime → new thumb URL). Rebuild when the bound identity no longer matches
+          // now point to a different item, or the same item modified in place (a new
+          // mtime and thus a new thumb URL). Rebuild when the bound identity no longer matches
           // so a card never shows another item's or a stale thumbnail.
-          if (existing.dataset.key === `${it.relpath} ${it.mtime_real ?? it.mtime ?? 0}`) continue;
+          if (existing.dataset.key === `${it.relpath}\x00${it.mtime_real ?? it.mtime ?? 0}`) continue;
           existing.remove(); _cardMap.delete(i);
         }
-        const card = _createOrRecycleCard(it, i);
+        const card = _createCard(it, i);
         _positionCard(card, i);
         grid.appendChild(card);
         _cardMap.set(i, card);
@@ -870,7 +939,7 @@ export function initGallery(mountEl, config) {
       updateStatus();
       return;
     } else {
-      // ── Grid mode: uniform row-based calculation ──
+      // Grid mode: uniform row-based calculation
       const { colCount, rowH } = _metrics;
       const bufferRows = Math.max(2, Math.min(30, Number(getSetting(S.VSCROLL_BUFFER, DEFAULT_BUFFER_ROWS)) || DEFAULT_BUFFER_ROWS));
       const firstRow = Math.max(0, Math.floor(scrollTop / rowH) - bufferRows);
@@ -880,10 +949,10 @@ export function initGallery(mountEl, config) {
       lastIdx = Math.min((Math.min(lastRow, totalRows)) * colCount, state.filteredItems.length);
     }
 
-    // Recycle cards outside the new range
+    // Unmount cards outside the new range
     for (const [idx, card] of _cardMap) {
       if (idx < firstIdx || idx >= lastIdx) {
-        _recycleCard(card);
+        card.remove();
         _cardMap.delete(idx);
       }
     }
@@ -895,12 +964,12 @@ export function initGallery(mountEl, config) {
       const existing = _cardMap.get(i);
       if (existing) {
         // Rebuild if index i now maps to a different item (list shifted) or the
-        // same item modified in place (new mtime → new thumb URL), so a card
+        // same item modified in place (a new mtime and thus a new thumb URL), so a card
         // never displays a stale or wrong thumbnail (image/video mismatch).
-        if (existing.dataset.key === `${it.relpath} ${it.mtime_real ?? it.mtime ?? 0}`) continue;
+        if (existing.dataset.key === `${it.relpath}\x00${it.mtime_real ?? it.mtime ?? 0}`) continue;
         existing.remove(); _cardMap.delete(i);
       }
-      const card = _createOrRecycleCard(it, i);
+      const card = _createCard(it, i);
       _positionCard(card, i);
       grid.appendChild(card);
       _cardMap.set(i, card);
@@ -928,15 +997,13 @@ export function initGallery(mountEl, config) {
     // Reserve the extra info row (for match badges) only while a search is active.
     grid.classList.toggle("sbg-grid--search", !!state._searchMatches);
 
-    // Clear all cards, and sweep any strays: _recycleCard() hides pooled cards
-    // (display:none) without removing them, so without this an old filter's cards
-    // could linger in the DOM and show stale/wrong thumbnails.
+    // Clear all cards, then sweep any strays as a defensive backstop: a card
+    // that survived a previous render would show a stale or wrong thumbnail.
     for (const [, card] of _cardMap) {
       card.remove();
     }
     _cardMap.clear();
     for (const stray of grid.querySelectorAll(".sbg-card")) stray.remove();
-    _pool = [];
     _masonryData = null;
 
     // Remove empty message if present
@@ -956,11 +1023,11 @@ export function initGallery(mountEl, config) {
     }
 
     if (thumbShape === "ar") {
-      // ── Masonry mode: pre-compute all positions ──
+      // Masonry mode: pre-compute all positions
       _masonryData = _computeMasonryLayout(state.filteredItems, _metrics, thumbPerRow);
       spacer.style.height = `${_masonryData.totalHeight}px`;
     } else {
-      // ── Grid mode: uniform rows ──
+      // Grid mode: uniform rows
       const { colCount, rowH } = _metrics;
       const totalRows = Math.ceil(state.filteredItems.length / colCount);
       spacer.style.height = `${totalRows * rowH}px`;
@@ -974,7 +1041,7 @@ export function initGallery(mountEl, config) {
     statusRight.textContent = `${Math.min(state.displayedCount, state.filteredItems.length)} / ${state.filteredItems.length}`;
   }
 
-  /* ── Scroll + Resize handlers ───────────────────────────────────── */
+  /* Scroll + Resize handlers */
 
   body.addEventListener("scroll", () => { _saveScrollPos(); _scheduleVirtualRender(); }, { passive: true });
 
@@ -1066,7 +1133,7 @@ export function initGallery(mountEl, config) {
   _resizeObserver.observe(grid);
   window._sbgResizeObserver = _resizeObserver;
 
-  /* ── Helpers ─────────────────────────────────────────────────────── */
+  /* Helpers */
 
   function setLoading(v) {
     state.loading = v;
@@ -1090,6 +1157,9 @@ export function initGallery(mountEl, config) {
 
   async function refreshConfig() {
     const cfg = await api("/sidebar_gallery/config");
+    // Catalog default titles: the reference the rename bridge diffs saved
+    // profiles against (TL.getSectionRenames).
+    if (cfg.section_titles) setCatalogTitles(cfg.section_titles);
     state.roots = cfg.roots || [];
     if (!state.roots.find(r => r.id === "output")) state.roots.unshift({ id: "output", label: "Output" });
     _dataCache.roots = state.roots;
@@ -1117,6 +1187,13 @@ export function initGallery(mountEl, config) {
     _dataCache.lastRootId = newRootId;
     state.subfolder = "";
     _dataCache.lastSubfolder = "";
+    // An active search's match set is keyed by the OLD root's relpaths; drop
+    // it so the new root paints unfiltered while the search re-runs below
+    // (or in fetchAllItems for a root that still needs indexing).
+    if (state.searchTags.length > 0) {
+      state._searchMatches = null;
+      _dataCache.lastSearchMatches = null;
+    }
     renderFolderNav();
     loadSubfolders();
     const known = Array.isArray(_dataCache.items[newRootId]) && _dataCache.items[newRootId].length > 0;
@@ -1126,6 +1203,7 @@ export function initGallery(mountEl, config) {
       renderFromScratch();
       // Paint from the in-memory cache, then version-gated poll.
       _pollAndReconcile();
+      if (state.searchTags.length > 0) _triggerMultiSearch();
     } else {
       state.allItems = [];
       applyFilters();
@@ -1150,13 +1228,13 @@ export function initGallery(mountEl, config) {
     }
   }
 
-  /* ── Data fetching ──────────────────────────────────────────────── */
+  /* Data fetching */
 
   // Debounced snapshot persistence for the delta path (fetchNewItems), so freshly
   // generated files are included in the IDB snapshot that drives the instant first
   // paint after a reboot/refresh. Coalesced, since a burst generation fires several
   // deltas. fetchAllItems persists inline; this is the delta-path equivalent.
-  const _persistTimers = new Map(); // rootId -> debounce timer
+  const _persistTimers = new Map(); // debounce timers, keyed by rootId
 
   // Single write path for the IndexedDB snapshot: always the per-root cached
   // items with the per-root version they reflect, and a record of what was
@@ -1165,7 +1243,7 @@ export function initGallery(mountEl, config) {
     const items = _dataCache.items[rid];
     if (!items) return;
     const ver = _dataCache.itemsVersion[rid];
-    _persistItems(rid, items, ver);
+    _persistItems(rid, items, ver, _dataCache.serverTime[rid] ?? null);
     _dataCache._persistedVersion[rid] = ver;
   }
 
@@ -1181,10 +1259,25 @@ export function initGallery(mountEl, config) {
     }, 1500));
   }
 
+  // A full reindex re-extracts metadata without changing file mtimes, so the
+  // lightbox's per-item mtime check can't detect it. A meta_epoch bump on reindex
+  // completion drops cached metadata only (L1 _metaCache + the IndexedDB "meta"
+  // store, which also holds the initmeta:* source-image entries); thumbnails are
+  // left intact. Generation (db_version) bumps don't trigger this. Carried by
+  // list_all, poll AND list_new so the delta-first reconcile (which rarely runs
+  // a full list_all) still delivers the drop.
+  function _checkMetaEpoch(epoch) {
+    if (epoch === undefined) return;
+    if (localStorage.getItem("SBG._metaEpoch") === String(epoch)) return;
+    _metaCache.clear();
+    _metaCacheAPI.clear().catch(() => { });
+    localStorage.setItem("SBG._metaEpoch", String(epoch));
+  }
+
   async function fetchAllItems({ rescan = false, rootId = state.rootId } = {}) {
     // Capture the root once. Every cache write below is keyed by the captured
-    // value, so a slow response for root A landing after a switch to root B stores
-    // A's items and version under A, not B. View updates additionally require the
+    // value, so a slow response for root A landing after a switch to root B still
+    // stores A's items and version under A. View updates additionally require the
     // root to still be on screen.
     const rid = rootId;
     // Status/spinner belong to the on-screen root only: a background refetch for a
@@ -1223,16 +1316,7 @@ export function initGallery(mountEl, config) {
         localStorage.setItem("SBG._cacheEpoch", CACHE_EPOCH);
         cacheReset = true; // data-shape change: force a fresh repaint below
       }
-      // A full reindex re-extracts metadata without changing file mtimes, so the
-      // lightbox's per-item mtime check can't detect it. meta_epoch bumps on reindex
-      // completion → drop cached metadata only (L1 _metaCache + the IndexedDB "meta"
-      // store); thumbnails are left intact. Generation (db_version) bumps don't
-      // trigger this.
-      if (data.meta_epoch !== undefined && localStorage.getItem("SBG._metaEpoch") !== String(data.meta_epoch)) {
-        _metaCache.clear();
-        _metaCacheAPI.clear().catch(() => { });
-        localStorage.setItem("SBG._metaEpoch", String(data.meta_epoch));
-      }
+      _checkMetaEpoch(data.meta_epoch);
 
       const newItems = data.items || [];
 
@@ -1242,9 +1326,9 @@ export function initGallery(mountEl, config) {
 
       // Diff update: when the returned set is identical to what's already cached
       // there is nothing to persist or repaint, which stops the gallery visibly
-      // "refreshing" on startup. The diff compares (relpath, mtime) pairs, not just
-      // relpaths, so a file overwritten in place (same relpath, new mtime and thumb
-      // URL) is detected. A cache reset above still forces a repaint.
+      // "refreshing" on startup. The diff compares (relpath, mtime) pairs instead
+      // of bare relpaths, so a file overwritten in place (same relpath, new mtime
+      // and thumb URL) is detected. A cache reset above still forces a repaint.
       const prevItems = _dataCache.items[rid] || [];
       const oldMap = new Map(prevItems.map(x => [x.relpath, x.mtime_real ?? x.mtime ?? 0]));
       const newSet = new Set(newItems.map(x => x.relpath));
@@ -1258,9 +1342,11 @@ export function initGallery(mountEl, config) {
       _dataCache.items[rid] = newItems;
       // Persist items + the DB version they reflect (drives the reopen version
       // gate), but skip the multi-MB IndexedDB rewrite when neither the items nor
-      // the version changed since the last write (the common startup case).
+      // the version changed since the last write (the common startup case). The
+      // debounced path keeps the multi-MB structured-clone put off this render's
+      // critical path (it also coalesces a burst of refetches into one write).
       if (!noChange || _dataCache._persistedVersion[rid] !== _dataCache.itemsVersion[rid]) {
-        _persistSnapshot(rid);
+        _schedulePersist(rid);
       }
 
       if (isCurrent) {
@@ -1268,6 +1354,10 @@ export function initGallery(mountEl, config) {
         statusLeft.textContent = "Ready";
         applyFilters();
         if (!noChange || cacheReset) renderFromScratch();
+        // An active search's match set may predate this refetch (root switch,
+        // manual rescan, count-invariant escalation): re-run it against the
+        // fresh items so new files aren't silently missing from results.
+        if (state.searchTags.length > 0 && !noChange) _triggerMultiSearch();
       }
     } catch (e) {
       if (rid === state.rootId) statusLeft.textContent = `Error: ${e.message || e}`;
@@ -1285,7 +1375,7 @@ export function initGallery(mountEl, config) {
     const overlay = h("div", { class: "sbg-first-time-overlay" });
     const modal = h("div", { class: "sbg-first-time-modal" });
     const title = h("h3", { text: "🗂️ Building Index for the First Time" });
-    const desc = h("p", { text: "This will scan all media files and parse their metadata. This may take 2-10 minutes depending on library size." });
+    const desc = h("p", { text: "This will scan all media files and parse their metadata. This may take a couple minutes depending on library size." });
     const progressBar = h("div", { class: "sbg-progress__bar" });
     const progressFillM = h("div", { class: "sbg-progress__fill" });
     progressBar.appendChild(progressFillM);
@@ -1311,6 +1401,9 @@ export function initGallery(mountEl, config) {
       let sawRunning = false; // ignore early polls before the worker spins up
       let modalActive = true;
       const unsub = progressPoller.subscribe((data, meta) => {
+        // A sidebar unmount destroys the modal without any close handler
+        // running; drop the subscription instead of polling into detached DOM.
+        if (!overlay.isConnected) { modalActive = false; unsub(); return; }
         if (!modalActive || !data) return;
         const e = data.full;
         if (data.running) sawRunning = true;
@@ -1380,7 +1473,7 @@ export function initGallery(mountEl, config) {
   // also reconciles external deletes/renames that the add-only delta path can't see.
   let _pollInflight = null;
   let _pollInflightRid = null;
-  function _pollAndReconcile() {
+  function _pollAndReconcile(eager = false) {
     // Single-flight: focus + visibilitychange + the interval tick can all fire in
     // the same instant (returning to the tab); without this guard each would run its
     // own full refetch. Root-aware: a poll for the previous root must not swallow the
@@ -1388,21 +1481,34 @@ export function initGallery(mountEl, config) {
     // it after the in-flight one instead.
     if (_pollInflight) {
       if (_pollInflightRid === state.rootId) return _pollInflight;
-      return _pollInflight.then(() => _pollAndReconcile());
+      return _pollInflight.then(() => _pollAndReconcile(eager));
     }
     _pollInflightRid = state.rootId;
     _pollInflight = (async () => {
       try {
         const rid = state.rootId; // captured: all decisions below are for THIS root
         const known = _dataCache.itemsVersion[rid];
-        const p = await api("/sidebar_gallery/poll", { root_id: rid });
+        // eager=1 (focus return) makes the server await a snappy-cooldown scan so
+        // external changes reconcile in one round trip; the periodic tick lets the
+        // scan run in the background and just reads the current version.
+        const p = await api("/sidebar_gallery/poll",
+          eager ? { root_id: rid, eager: "1" } : { root_id: rid });
         if (p.reindexing) return; // full rebuild churning versions; the timer retries
-        // Refetch when the version moved, or when the version matches but the item
-        // count doesn't (self-healing: a version stamp recorded against a view that
-        // missed an add/delete heals here instead of suppressing refetches forever).
+        _checkMetaEpoch(p.meta_epoch);
         const haveCount = (_dataCache.items[rid] || []).length;
         const countMismatch = typeof p.count === "number" && p.count !== haveCount;
-        if (known == null || p.db_version !== known || countMismatch) {
+        if (known == null) {
+          // No stamped version (cold cache): only the full fetch can seed it.
+          await fetchAllItems({ rescan: false, rootId: rid });
+        } else if (p.db_version !== known) {
+          // Delta-first: fetch only what changed since our stamp. list_new's
+          // since-form carries adds, in-place changes and removals; its count
+          // backstop and the stale flag escalate to a full refetch in the rare
+          // states a delta can't reconcile.
+          await fetchNewItems();
+        } else if (countMismatch) {
+          // Version matches but the count doesn't: a stamp was recorded against
+          // a view that missed an add/delete. Self-heal with a full refetch.
           await fetchAllItems({ rescan: false, rootId: rid });
         }
       } catch (e) { /* offline or endpoint missing: keep the cached view */ }
@@ -1425,21 +1531,23 @@ export function initGallery(mountEl, config) {
     const interval = Number.isFinite(secs) ? secs : 15;
     const ac = new AbortController();
     window._sbgRefreshAbort = ac;
-    const maybePoll = () => {
+    const maybePoll = (eager = false) => {
       if (document.visibilityState !== "visible") return;      // don't scan while hidden
       if (!(_dataCache._mountEl && _dataCache._mountEl.isConnected)) return;
-      _pollAndReconcile();
+      _pollAndReconcile(eager);
     };
     // The return-to-tab listeners are installed even when the interval is 0: "off"
-    // disables the periodic timer, not the one cheap reconcile when the user comes
-    // back to look.
-    window.addEventListener("focus", maybePoll, { signal: ac.signal });
+    // disables only the periodic timer and keeps the one cheap reconcile when the
+    // user comes back to look. Focus returns poll eagerly (server awaits a snappy scan) so
+    // external changes appear in one round trip; periodic ticks stay cheap and
+    // let the scan run in the background instead.
+    window.addEventListener("focus", () => maybePoll(true), { signal: ac.signal });
     document.addEventListener("visibilitychange", () => {
-      if (document.visibilityState === "visible") maybePoll();  // poll immediately on return
+      if (document.visibilityState === "visible") maybePoll(true);
     }, { signal: ac.signal });
     if (!interval || interval <= 0) return; // 0 = no periodic polling
     const ms = Math.max(5, interval) * 1000;
-    window._sbgPollTimer = setInterval(maybePoll, ms);
+    window._sbgPollTimer = setInterval(() => maybePoll(false), ms);
   }
 
   async function fetchNewItems() {
@@ -1450,7 +1558,12 @@ export function initGallery(mountEl, config) {
     const rid = state.rootId;
 
     if (!files.length && (!_dataCache.serverTime[rid] || (_dataCache.items[rid] || []).length === 0)) {
-      return fetchAllItems({ rescan: true, rootId: rid });
+      // No `since` cursor (pre-serverTime snapshot) or nothing cached: a plain
+      // list_all reconciles fully from the DB. rescan:true here would make the
+      // server walk the whole library BEFORE answering. The poll that routed
+      // us here already scheduled that scan, so forcing a second, awaited one
+      // only turns every cold-cache reconcile into a long stall.
+      return fetchAllItems({ rescan: false, rootId: rid });
     }
 
     try {
@@ -1463,6 +1576,10 @@ export function initGallery(mountEl, config) {
         body_payload.files = files;
       } else {
         body_payload.since = _dataCache.serverTime[rid];
+        // Lets the server answer "what was deleted since my version" from its
+        // removals buffer instead of walking the disk.
+        const kv = _dataCache.itemsVersion[rid];
+        if (typeof kv === "number") body_payload.known_version = kv;
       }
 
       const resp = await fetch("/sidebar_gallery/list_new", {
@@ -1473,6 +1590,14 @@ export function initGallery(mountEl, config) {
       if (!resp.ok) throw new Error(resp.statusText);
       const data = await resp.json();
       const isCurrent = rid === state.rootId;
+
+      _checkMetaEpoch(data.meta_epoch);
+      // The server couldn't determine removals for our version (predates its
+      // process life): this delta may be missing deletions, so do a full
+      // refetch instead of stamping its version.
+      if (data.stale) {
+        return fetchAllItems({ rescan: false, rootId: rid });
+      }
 
       if (data.server_time) _dataCache.serverTime[rid] = data.server_time;
       // Stamping the post-scan version is sound only because the merge below applies
@@ -1533,10 +1658,11 @@ export function initGallery(mountEl, config) {
       _dataCache.items[rid] = items;
 
       // Count invariant (files[]-form has no removed[]): if the server's row count
-      // disagrees with what we now hold, schedule a reconcile rather than trusting
-      // the stamp.
+      // disagrees with what we now hold, go straight to the full refetch. This must
+      // NOT route through _pollAndReconcile, because the poll path escalates version
+      // moves to THIS function and bouncing back would loop.
       if (typeof data.count === "number" && data.count !== items.length) {
-        _pollAndReconcile();
+        fetchAllItems({ rescan: false, rootId: rid });
       }
 
       if (!changedAny) return;
@@ -1553,7 +1679,7 @@ export function initGallery(mountEl, config) {
             headers: { "Content-Type": "application/json" },
             body: JSON.stringify({
               root_id: state.rootId,
-              tags: state.searchTags.map(t => ({ field: t.field, value: t.value, exclude: t.exclude || false })),
+              tags: state.searchTags.map(t => ({ field: t.field, value: t.value, exclude: t.exclude || false, ...(t.node_classes ? { node_classes: t.node_classes } : {}) })),
               mode: state.searchMode,
               relpaths: newRelpaths,
             }),
@@ -1569,22 +1695,6 @@ export function initGallery(mountEl, config) {
             _dataCache.lastSearchMatches = state._searchMatches;
           }
         } catch { /* delta search failed: non-critical */ }
-        const nameTags = state.searchTags.filter(t => t.field === "name");
-        if (nameTags.length > 0) {
-          for (const it of added) {
-            const name = it.filename.toLowerCase();
-            let nameMatch;
-            if (state.searchMode === "AND") {
-              nameMatch = nameTags.every(t => name.includes(t.value));
-            } else {
-              nameMatch = nameTags.some(t => name.includes(t.value));
-            }
-            if (nameMatch && !state._searchMatches.has(it.relpath)) {
-              state._searchMatches.set(it.relpath, [{ field: "name", count: 1 }]);
-            }
-          }
-          _dataCache.lastSearchMatches = state._searchMatches;
-        }
       }
 
       applyFilters();
@@ -1597,7 +1707,7 @@ export function initGallery(mountEl, config) {
     }
   }
 
-  /* ── Search logic ───────────────────────────────────────────────── */
+  /* Search logic */
 
   let qTimer = null;
   let _searchAbort = null;
@@ -1624,32 +1734,32 @@ export function initGallery(mountEl, config) {
       });
       text.addEventListener("click", (e) => {
         e.stopPropagation();
-        const inp = h("input", { type: "text", class: "sbg-search-tag__edit", value: tag.raw });
-        inp.style.cssText = "background:transparent;border:none;color:inherit;font:inherit;width:" + Math.max(40, Math.min(tag.raw.length * 7, 200)) + "px;outline:none;padding:0;";
+        // Seed with the minus restored: `raw` stores the term without it, so
+        // an exclusion edited without the seed would silently flip into an
+        // inclusion on commit.
+        const seeded = (isNeg ? "-" : "") + tag.raw;
+        const inp = h("input", { type: "text", class: "sbg-search-tag__edit", value: seeded });
+        inp.style.cssText = "background:transparent;border:none;color:inherit;font:inherit;width:" + Math.max(40, Math.min(seeded.length * 7, 200)) + "px;outline:none;padding:0;";
         text.replaceWith(inp);
         inp.focus();
         inp.select();
+        // The commit runs at most once: Enter's rerender detaches the input,
+        // which fires blur, and Escape's cancel must not be overridden by the
+        // blur that follows it.
+        let done = false;
         const commit = () => {
-          let newVal = inp.value.trim();
-          if (newVal && newVal !== tag.raw) {
-            let exclude = false;
-            if (newVal.startsWith("-")) {
-              exclude = true;
-              newVal = newVal.slice(1).trim();
+          if (done) return;
+          done = true;
+          const newVal = inp.value.trim();
+          if (newVal && newVal !== seeded) {
+            const parsed = parseSearchTag(newVal);
+            if (parsed) {
+              state.searchTags[i] = parsed;
+              renderSearchTags();
+              _triggerMultiSearch();
+            } else {
+              inp.replaceWith(text); // only a minus remained; keep the chip
             }
-            const lc = newVal.toLowerCase();
-            let field = "any", value = lc;
-            const ci = lc.indexOf(":");
-            if (ci > 0 && ci < 30) {
-              field = lc.slice(0, ci).trim();
-              value = lc.slice(ci + 1).trim();
-              const _layout = getLayout();
-              const canonical = SectionRegistry.getCanonicalName(field, _layout);
-              if (canonical) field = SectionRegistry.getSearchField(canonical);
-            }
-            state.searchTags[i] = { field, value, raw: newVal, exclude };
-            renderSearchTags();
-            _triggerMultiSearch();
           } else if (!newVal) {
             state.searchTags.splice(i, 1);
             renderSearchTags();
@@ -1660,7 +1770,7 @@ export function initGallery(mountEl, config) {
         };
         inp.addEventListener("keydown", (ke) => {
           if (ke.key === "Enter") { ke.preventDefault(); commit(); }
-          else if (ke.key === "Escape") { ke.preventDefault(); inp.replaceWith(text); }
+          else if (ke.key === "Escape") { ke.preventDefault(); done = true; inp.replaceWith(text); }
         });
         inp.addEventListener("blur", commit);
       });
@@ -1672,31 +1782,13 @@ export function initGallery(mountEl, config) {
     _syncSearchBtns();
   }
 
-  function _computeSearchScopes(tags) {
-    if (tags.every(t => t.field === "any" || t.field === "name")) return null;
-    const _searchFieldToCanonical = {};
-    for (const [name, def] of Object.entries(SectionRegistry.sectionDefs)) {
-      if (def.searchField) _searchFieldToCanonical[def.searchField] = name;
-    }
-    const scopes = new Set();
-    for (const t of tags) {
-      if (t.field === "any" || t.field === "name") continue;
-      const canonical = _searchFieldToCanonical[t.field];
-      if (canonical) scopes.add(canonical);
-      else scopes.add(t.field);
-    }
-    return scopes.size > 0 ? scopes : null;
-  }
-
   async function _triggerMultiSearch() {
     clearTimeout(qTimer);
     if (_searchAbort) { _searchAbort.abort(); _searchAbort = null; }
 
     if (state.searchTags.length === 0) {
-      state.q = "";
       state._searchMatches = null;
       _setSearchQuery("");
-      _setSearchScopes(null);
       _dataCache.searchTags = [];
       _dataCache.lastSearchMode = state.searchMode;
       _dataCache.lastSearchMatches = null;
@@ -1714,19 +1806,16 @@ export function initGallery(mountEl, config) {
       const matchMap = new Map();
       for (const it of state.allItems) {
         const name = it.filename.toLowerCase();
-        let matches;
-        if (state.searchMode === "AND") {
-          matches = state.searchTags.every(t => name.includes(t.value));
-        } else {
-          matches = state.searchTags.some(t => name.includes(t.value));
-        }
+        // Honour the exclude flag: "-name:draft" must HIDE matching files.
+        const tagHit = (t) => t.exclude ? !name.includes(t.value) : name.includes(t.value);
+        const matches = state.searchMode === "AND"
+          ? state.searchTags.every(tagHit)
+          : state.searchTags.some(tagHit);
         if (matches) matchMap.set(it.relpath, [{ field: "name", count: 1 }]);
       }
-      state.q = "";
       state._searchMatches = matchMap;
       _dataCache.lastSearchMatches = matchMap;
       _setSearchQuery(state.searchTags.map(t => t.value).join("\x00"));
-      _setSearchScopes(_computeSearchScopes(state.searchTags));
       refilter();
       statusLeft.textContent = `Found ${matchMap.size} matches (filename)`;
       showToast(`Found ${matchMap.size} matches`);
@@ -1746,7 +1835,7 @@ export function initGallery(mountEl, config) {
           headers: { "Content-Type": "application/json" },
           body: JSON.stringify({
             root_id: state.rootId,
-            tags: state.searchTags.map(t => ({ field: t.field, value: t.value, exclude: t.exclude || false })),
+            tags: state.searchTags.map(t => ({ field: t.field, value: t.value, exclude: t.exclude || false, ...(t.node_classes ? { node_classes: t.node_classes } : {}) })),
             mode: state.searchMode
           }),
           signal: ctrl.signal,
@@ -1758,7 +1847,6 @@ export function initGallery(mountEl, config) {
 
         const rawMatches = data.matches || [];
         const matchMap = new Map();
-        state.q = "";
 
         for (const m of rawMatches) {
           if (typeof m === "object" && m.relpath) {
@@ -1768,33 +1856,12 @@ export function initGallery(mountEl, config) {
           }
         }
 
-        const nameTags = state.searchTags.filter(t => t.field === "name");
-        if (nameTags.length > 0) {
-          const virtualMap = new Map();
-          for (const it of state.allItems) {
-            const name = it.filename.toLowerCase();
-            let matchesPattern = false;
-            if (state.searchMode === "AND") {
-              matchesPattern = nameTags.every(t => name.includes(t.value));
-            } else {
-              matchesPattern = nameTags.some(t => name.includes(t.value));
-            }
-            const inBackend = matchMap.has(it.relpath);
-            if (state.searchMode === "AND") {
-              if (matchesPattern && (state.searchTags.length === nameTags.length || inBackend)) virtualMap.set(it.relpath, [{ field: "name", count: 1 }]);
-            } else {
-              if (matchesPattern || inBackend) virtualMap.set(it.relpath, [{ field: "name", count: 1 }]);
-            }
-          }
-          state._searchMatches = virtualMap;
-          _dataCache.lastSearchMatches = virtualMap;
-        } else {
-          state._searchMatches = matchMap;
-          _dataCache.lastSearchMatches = matchMap;
-        }
+        // The server evaluates name: tags against filenames itself, so its
+        // match set is complete (and keeps per-field badges for mixed searches).
+        state._searchMatches = matchMap;
+        _dataCache.lastSearchMatches = matchMap;
 
         _setSearchQuery(state.searchTags.map(t => t.value).join("\x00"));
-        _setSearchScopes(_computeSearchScopes(state.searchTags));
         refilter();
 
         const total = data.scanned || 0;
@@ -1813,7 +1880,7 @@ export function initGallery(mountEl, config) {
     }, 400);
   }
 
-  /* ── Search event listeners ─────────────────────────────────────── */
+  /* Search event listeners */
 
   qInput.addEventListener("keydown", (e) => {
     if (e.key === "Tab" && autoCompleteDropdown.style.display !== "none") {
@@ -1829,35 +1896,18 @@ export function initGallery(mountEl, config) {
       autoCompleteDropdown.style.display = "none";
     } else if (e.key === "Enter") {
       e.preventDefault();
+      // An arrow-highlighted suggestion behaves like clicking it: fill the
+      // input with the prefix and let the user type the value. Enter with no
+      // highlight commits the typed text as a tag. The take-the-first
+      // fallback stays Tab-only.
+      if (autoCompleteDropdown.style.display !== "none" && _acSelectedIdx >= 0) {
+        _acAccept();
+        return;
+      }
       autoCompleteDropdown.style.display = "none";
-      const val = qInput.value.trim().toLowerCase();
-      if (val) {
-        let exclude = false;
-        let rawInput = String(qInput.value).trim();
-        let processVal = val;
-        if (processVal.startsWith("-")) {
-          exclude = true;
-          processVal = processVal.slice(1).trim();
-          rawInput = rawInput.replace(/^-\s*/, "");
-        }
-        let field = "any";
-        let value = processVal;
-        const colonIdx = processVal.indexOf(":");
-        if (colonIdx > 0 && colonIdx < 30) {
-          field = processVal.slice(0, colonIdx).trim();
-          value = processVal.slice(colonIdx + 1).trim();
-          const _layout = getLayout();
-          const canonical = SectionRegistry.getCanonicalName(field, _layout);
-          if (canonical) field = SectionRegistry.getSearchField(canonical);
-        } else {
-          // No colon: if the bare term names a known section (e.g. "adetailer",
-          // "lora", "controlnet"), scope to that section so it lists every item that
-          // has it. Otherwise fall back to a free-text "any" search.
-          const _layout = getLayout();
-          const canonical = SectionRegistry.getCanonicalName(processVal, _layout);
-          if (canonical) { field = SectionRegistry.getSearchField(canonical); value = ""; }
-        }
-        state.searchTags.push({ field, value, raw: rawInput, exclude });
+      const parsed = parseSearchTag(qInput.value);
+      if (parsed) {
+        state.searchTags.push(parsed);
         qInput.value = "";
         renderSearchTags();
         _triggerMultiSearch();
@@ -1878,10 +1928,8 @@ export function initGallery(mountEl, config) {
     state.searchTags = [];
     clearTimeout(qTimer);
     if (_searchAbort) { _searchAbort.abort(); _searchAbort = null; }
-    state.q = "";
     state._searchMatches = null;
     _setSearchQuery("");
-    _setSearchScopes(null);
     _dataCache.searchTags = [];
     renderSearchTags();
     hideProgress();
@@ -1911,7 +1959,7 @@ export function initGallery(mountEl, config) {
   };
   document.addEventListener("sbg-search-submit", window._sbgSearchSubmitHandler);
 
-  /* ── Kind + sort event listeners ────────────────────────────────── */
+  /* Kind + sort event listeners */
 
   for (const btn of [kindBtnAll, kindBtnImg, kindBtnVid]) {
     btn.addEventListener("click", () => {
@@ -1926,20 +1974,18 @@ export function initGallery(mountEl, config) {
   }
   sortSel.addEventListener("change", () => { state.sort = sortSel.value; _dataCache.lastSort = state.sort; refilter(); });
 
-  /* ── Assemble DOM ───────────────────────────────────────────────── */
+  /* Assemble DOM */
 
   const root = h("div", { class: "sbg-root" }, [toolbar, statusBar, bodyWrap]);
   if (theme !== "comfyui") root.setAttribute("data-theme", theme);
 
   function _applyCustomThemeVars(r, t) {
-    const readSetting = (id, fallback) => getSetting(id, fallback);
-
     if (t === "custom") {
-      r.style.setProperty("--sbg-bg", readSetting("CUSTOM_BG", "#1a1a1a"));
-      r.style.setProperty("--sbg-surface", readSetting("CUSTOM_SURFACE", "#222222"));
-      r.style.setProperty("--sbg-border", readSetting("CUSTOM_BORDER", "#444444"));
-      r.style.setProperty("--sbg-text", readSetting("CUSTOM_TEXT", "#e0e0e0"));
-      r.style.setProperty("--sbg-accent", readSetting("CUSTOM_ACCENT", "#7c6aef"));
+      r.style.setProperty("--sbg-bg", getSetting("CUSTOM_BG", "#1a1a1a"));
+      r.style.setProperty("--sbg-surface", getSetting("CUSTOM_SURFACE", "#222222"));
+      r.style.setProperty("--sbg-border", getSetting("CUSTOM_BORDER", "#444444"));
+      r.style.setProperty("--sbg-text", getSetting("CUSTOM_TEXT", "#e0e0e0"));
+      r.style.setProperty("--sbg-accent", getSetting("CUSTOM_ACCENT", "#7c6aef"));
     } else {
       r.style.removeProperty("--sbg-bg");
       r.style.removeProperty("--sbg-surface");
@@ -1952,7 +1998,7 @@ export function initGallery(mountEl, config) {
 
   mountEl.appendChild(root);
 
-  /* ── Init ────────────────────────────────────────────────────────── */
+  /* Init */
 
   _dataCache._mountEl = mountEl;
   _dataCache._fetchAllItems = fetchAllItems;
@@ -2000,32 +2046,45 @@ export function initGallery(mountEl, config) {
         // Warm remount always reconciles once: the in-memory paint can hide external
         // deletions/renames made while the panel was closed. If a generation finished
         // while closed, run the targeted delta first (fast path for the new files),
-        // then the cheap version-gated poll.
+        // then the eager form of the version-gated poll, so the server answers
+        // after a snappy-cooldown scan instead of from a DB that hasn't looked
+        // at the disk since the panel was last open.
         if (_dataCache.stale) {
           _dataCache.stale = false;
-          fetchNewItems().finally(() => _pollAndReconcile());
+          fetchNewItems().finally(() => _pollAndReconcile(true));
         } else {
-          _pollAndReconcile();
+          _pollAndReconcile(true);
         }
       } else {
-        _dataCache.stale = false;
         const persisted = await _loadPersistedItems(state.rootId);
         if (persisted && persisted.items.length > 0) {
           state.allItems = persisted.items;
           _dataCache.items[state.rootId] = persisted.items;
           _dataCache.itemsVersion[state.rootId] = persisted.dbVersion;
           _dataCache._persistedVersion[state.rootId] = persisted.dbVersion;
+          // Restore the delta `since` cursor with the snapshot it belongs to,
+          // so the first post-refresh reconcile is a tiny list_new instead of
+          // escalating to a full list_all.
+          if (persisted.serverTime) _dataCache.serverTime[state.rootId] = persisted.serverTime;
           statusLeft.textContent = "Ready";
           applyFilters();
           await new Promise(r => requestAnimationFrame(r));
           renderFromScratch();
           Promise.all([refreshConfig(), loadSubfolders()]).catch(() => { });
-          // Paint from the snapshot, then version-gated poll: the backend runs a
-          // guarded scan and returns the root's version + row count; we only
-          // re-download the (gzipped) list when either differs from what this
-          // snapshot reflects. A no-change reopen is one tiny poll.
-          _pollAndReconcile();
+          // Paint from the snapshot, then reconcile by the same rules as the
+          // warm remount above: generations that finished BEFORE this first
+          // mount are sitting in _pendingFiles (the executed listener is
+          // module-level), so drain them; either way poll eagerly, since only
+          // an awaited scan can reveal files that appeared while no open panel
+          // was around to trigger one.
+          if (_dataCache.stale) {
+            _dataCache.stale = false;
+            fetchNewItems().finally(() => _pollAndReconcile(true));
+          } else {
+            _pollAndReconcile(true);
+          }
         } else {
+          _dataCache.stale = false;
           await Promise.all([refreshConfig(), loadSubfolders(), fetchAllItems({ rescan: true })]);
         }
       }
@@ -2035,7 +2094,7 @@ export function initGallery(mountEl, config) {
     watchReindexProgress();
   })();
 
-  /* ── Public API ──────────────────────────────────────────────────── */
+  /* Public API */
 
   return {
     state,

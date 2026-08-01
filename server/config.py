@@ -14,6 +14,11 @@ def _package_root() -> Path:
 CONFIG_FILENAME = "sidebar_gallery_config.json"
 
 
+def config_path() -> Path:
+    """The config file's location, for callers that watch it for changes."""
+    return _package_root() / CONFIG_FILENAME
+
+
 @dataclass(frozen=True)
 class SidebarGalleryConfig:
     extra_roots: list[str]
@@ -113,8 +118,8 @@ def save_config(data: dict[str, Any]) -> SidebarGalleryConfig:
 
     # extra_roots: only NEW entries must pass the isdir check; keep already-saved
     # roots even when their drive is momentarily offline, and preserve the saved
-    # list when the key is absent or malformed - editing other settings (e.g. the
-    # excluded list) must never silently drop a configured folder.
+    # list when the key is absent or malformed, since editing other settings (e.g.
+    # the excluded list) must never silently drop a configured folder.
     extra_roots_in = data.get("extra_roots")
     if isinstance(extra_roots_in, list):
         existing = set(cfg.extra_roots)
@@ -134,8 +139,9 @@ def save_config(data: dict[str, Any]) -> SidebarGalleryConfig:
     else:
         extra_roots = list(cfg.extra_roots)
 
-    # Excluded dirs are plain folder NAMES, not paths - no normalisation or isdir
-    # check. Lowercased + de-duplicated; saved list preserved if absent/malformed.
+    # Excluded dirs are plain folder NAMES (never paths), so there is no
+    # normalisation or isdir check. Lowercased + de-duplicated; saved list
+    # preserved if absent/malformed.
     excluded_in = data.get("excluded_dirs")
     if isinstance(excluded_in, list):
         excluded_dirs = _clean_str_list(excluded_in, lower=True, dedupe=True)

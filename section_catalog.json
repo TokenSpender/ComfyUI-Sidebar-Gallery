@@ -1,8 +1,10 @@
 {
-  "_comment": "SBG section catalog: the single declarative source of truth for the metadata-section schema. The Python backend (server/schema.py) and the frontend (web/sbg-schema-data.js, generated from this file) both derive from it.",
+  "_comment": "SBG section catalog: the single declarative source of truth for the metadata-section schema. The Python backend derives its tables from it via server/schema.py; the frontend receives derived values through the API (meta_keys, layouts).",
   "version": 1,
 
-  "flags": ["source_app", "initial_image", "has_workflow", "has_prompt", "prompt_enhanced"],
+  "flags": ["source_app", "initial_image", "initial_images", "has_workflow", "has_prompt", "prompt_enhanced"],
+  "non_bindable_flags": ["initial_images", "has_workflow", "has_prompt", "prompt_enhanced"],
+  "non_bindable_element_keys": { "samplers": ["stage", "role", "label"], "loras": ["loader", "role"] },
 
   "sections": [
     {
@@ -37,13 +39,16 @@
     {
       "key": "model", "section_id": "models", "title": "Models", "kind": "scalar",
       "search_field": "model", "search_aliases": ["models"],
-      "summary_keys": ["model", "vae", "clip_skip", "clip_models"],
+      "summary_keys": ["model", "vae", "clip_skip", "clip_models", "text_projection", "audio_vae"],
       "media": ["image", "video"],
       "default": {
         "style": "flat", "open": true,
         "params": [
           { "path": "model", "label": "Model" },
+          { "path": "clip_models", "label": "CLIP" },
+          { "path": "text_projection", "label": "Text Projection" },
           { "path": "vae", "label": "VAE" },
+          { "path": "audio_vae", "label": "Audio VAE" },
           { "path": "clip_skip", "label": "Clip Skip" }
         ]
       }

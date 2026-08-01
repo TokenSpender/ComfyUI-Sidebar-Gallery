@@ -3,12 +3,12 @@
 This module loads ``section_catalog.json`` and derives the tables that
 would otherwise be hardcoded in six separate places:
 
-  - metadata.py  ``_KNOWN_SUMMARY_KEYS``       -> ``known_summary_keys()``
-  - routes.py    ``_match_summary`` field set  -> ``search_fields()``
-  - db.py        ``get_all_meta_keys`` buckets -> ``meta_key_buckets()``
-  - sbg-translation-layer.js default layout    -> ``default_layout()``
-  - sbg-section-registry.js search-name map    -> ``search_alias_map()``
-  - sbg-layout-editor.js PATH_GROUPS           -> (derived from ids)
+  - ``known_summary_keys()`` feeds ``_KNOWN_SUMMARY_KEYS`` in metadata.py
+  - ``search_fields()`` feeds the ``_match_summary`` field set in routes.py
+  - ``meta_key_buckets()`` feeds the ``get_all_meta_keys`` buckets in db.py
+  - ``default_layout()`` feeds the sbg-translation-layer.js default layout
+  - ``search_alias_map()`` feeds the sbg-section-registry.js search-name map
+  - the section ids feed PATH_GROUPS in sbg-layout-editor.js
 
 The catalog is the single definition; each consumer derives its tables
 from here instead of keeping a hardcoded copy.
@@ -52,12 +52,34 @@ def known_summary_keys() -> set[str]:
 
 
 def meta_key_buckets() -> dict[str, str]:
-    """Map each section's primary summary key -> its kind.
+    """Map each section's primary summary key to its kind.
 
     Used to drive ``db.get_all_meta_keys`` bucketing (array-of-dict
     sections collect item param keys; object sections collect dict keys).
     """
     return {e["key"]: e["kind"] for e in sections()}
+
+
+def non_bindable_summary_keys() -> set[str]:
+    """Top-level summary keys the layout editor must NOT offer as bindable
+    field paths: list/object-shaped section keys (their per-item params are
+    offered instead) plus the catalog's non_bindable_flags (list- or
+    boolean-valued flags that render as noise in a kv field). Served through
+    meta_keys so a future list-shaped key only needs a catalog entry, leaving
+    no room for the silent [object Object] fields that appear when a hardcoded
+    frontend skip is forgotten."""
+    keys = {k for k, kind in meta_key_buckets().items() if kind in ("array", "object", "nodes")}
+    keys.update(load_catalog().get("non_bindable_flags", []))
+    return keys
+
+
+def non_bindable_element_keys() -> dict[str, list[str]]:
+    """Per-element keys inside array sections that the layout editor must not
+    offer as bindable fields. These are the internal markers the parser stamps
+    on a sampler or lora item for scoping and pairing (stage, role, the node
+    label, the loader id), which render as noise or nothing in the panel.
+    Served through meta_keys next to non_bindable_summary_keys."""
+    return load_catalog().get("non_bindable_element_keys", {})
 
 
 def search_fields() -> set[str]:
@@ -69,7 +91,7 @@ def search_fields() -> set[str]:
 
 
 def search_alias_map() -> dict[str, str]:
-    """Map user-typed names (id, title, aliases) -> backend search field.
+    """Map user-typed names (id, title, aliases) to the backend search field.
 
     Replacement for the registry's ``SEARCH_FIELD_ALIASES`` +
     ``getSearchField`` chain.
@@ -85,6 +107,17 @@ def search_alias_map() -> dict[str, str]:
         for alias in e.get("search_aliases", []):
             out[alias.lower()] = sf
     return out
+
+
+def section_titles() -> dict[str, str]:
+    """Default (catalog) section titles, keyed by section_id.
+
+    Served through /config so the frontend can tell a layout-editor retitle
+    apart from a section's shipped name (TL.getSectionRenames). The shipped
+    default layouts cannot serve this purpose: they are a curated profile
+    snapshot and omit sections that only appear in other apps' profiles.
+    """
+    return {e["section_id"]: e["title"] for e in sections()}
 
 
 def default_layout(media: str = "image") -> list[dict[str, Any]]:

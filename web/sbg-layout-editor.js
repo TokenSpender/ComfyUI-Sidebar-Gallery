@@ -1,5 +1,5 @@
 /**
- * sbg-layout-editor.js — Two-pane Layout Editor
+ * sbg-layout-editor.js: Two-pane Layout Editor
  *
  *   ┌─ left: editable section/field list ─┬─ right: live WYSIWYG preview ─┐
  *   │  • drag ⋮⋮ to reorder sections      │  renders the WHOLE panel the   │
@@ -9,13 +9,13 @@
  *   └─────────────────────────────────────┴────────────────────────────────┘
  *
  * The bottom "All Fields / Nodes" tray lists every metadata path the server knows
- * about, grouped with friendly names — drag one onto a section to add it.
+ * about, grouped with friendly names. Drag one onto a section to add it.
  *
  * Per-app (ComfyUI/A1111/…) × per-media (image/video) profiles, persisted
  * server-side via the translation layer.
  */
 
-import { h, showToast, parseColor, formatColor, checkerBg } from "./sbg-core.js";
+import { h, showToast, parseColor, formatColor, checkerBg, copyRenderProps } from "./sbg-core.js";
 import * as TL from "./sbg-translation-layer.js";
 import { initSortable } from "./sbg-sortable.js";
 import { createColorPicker } from "./sbg-color-picker.js";
@@ -34,7 +34,7 @@ const labelize = (s) => String(s).split(".").pop()
 // Friendlier grouping for the field tray / picker.
 const PATH_GROUPS = [
   { key: "file", label: "File Info", test: p => ["filename", "path", "filesize", "resolution", "generation_resolution", "width", "height", "modified", "duration", "codec", "fps", "total_frames"].includes(p) },
-  { key: "models", label: "Models", test: p => ["model", "vae", "clip_skip", "clip_models", "model_hash"].includes(p) },
+  { key: "models", label: "Models", test: p => ["model", "vae", "clip_skip", "clip_models", "model_hash", "text_projection", "audio_vae"].includes(p) },
   { key: "prompts", label: "Prompts", test: p => /prompt/i.test(p) },
   { key: "samplers", label: "Sampling", test: p => p.startsWith("samplers.") },
   { key: "loras", label: "LoRAs", test: p => p.startsWith("loras.") },
@@ -47,10 +47,10 @@ const PATH_GROUPS = [
   { key: "nodes", label: "Workflow Nodes", test: p => p.startsWith("workflow_nodes.") },
 ];
 
-// class_type → human node title (e.g. "easy showAnything" → "JoyCaption Output"),
-// populated from /meta_keys so the tray is searchable/readable by node title.
+// Human node titles keyed by class_type, from /meta_keys, so the tray reads
+// and searches by node title.
 let _nodeTitles = {};
-// class_type → [{title?, from?, index, params:[…]}, …] — per-instance info for
+// Per-instance info keyed by class_type ([{title?, from?, index, params:[…]}, …]) for
 // node types that appear multiple times (or with distinguishing context), from
 // /meta_keys. Lets the tray/picker offer each instance separately.
 let _nodeInstances = {};
@@ -67,9 +67,9 @@ function prettyPathLabel(path, inst) {
   return labelize(path);
 }
 
-/** Human label for one node instance: title → upstream context → #N. */
+/** Human label for one node instance: title, else upstream context, else #N. */
 function instanceLabel(ct, inst) {
-  if (inst.title) return `${ct} — “${inst.title}”`;
+  if (inst.title) return `${ct}: “${inst.title}”`;
   if (inst.from) return `${ct} (from ${inst.from})`;
   return `${ct} #${(inst.index || 0) + 1}`;
 }
@@ -128,7 +128,6 @@ function matchChipText(match) {
   return `#${(match.index || 0) + 1}`;
 }
 
-/** "rgb(34,197,94)" / "rgba(…, a)" → "#rrggbb". Returns null for fully transparent. */
 // Normalise a CSS colour (rgb/rgba/hex) to the canonical model, PRESERVING alpha
 // so a translucent default (e.g. the rgba section tints) shows its real value in
 // the swatch + picker instead of being flattened to an opaque hex.
@@ -136,25 +135,24 @@ function _normColor(c) {
   if (!c) return null;
   const pc = parseColor(c);
   if (!pc) return (typeof c === "string" && c[0] === "#") ? c : null;
-  // Fully transparent is a REAL colour state (0% opacity) — keep it, so the
+  // Fully transparent is a REAL colour state (0% opacity). Keep it, so the
   // picker opens at the element's true 0% instead of an invented opaque colour.
   return formatColor(pc.r, pc.g, pc.b, pc.a);
 }
 
-// Paint a colour-button as THREE sub-swatches (background / text / border) so all
-// three channels are visible at a glance — not just the background (the old single
-// swatch hid text/border edits, which read as "the button didn't change"). Each
-// channel falls back to the element's computed default when unset; translucent
-// colours render over a checkerboard so transparency reads correctly.
+// Paint a colour-button as three sub-swatches (background / text / border) so all
+// three channels are visible at a glance. Each channel falls back to the
+// element's computed default when unset; translucent colours render over a
+// checkerboard so transparency reads correctly.
 function _paintSwatch(el, colorObj, defaults) {
   const co = (colorObj && typeof colorObj === "object") ? colorObj : {};
   const d = defaults || {};
   const chan = (k) => co[k] || d[k] || "";
-  el.textContent = "";          // drop the emoji — the stripes are the indicator now
+  el.textContent = "";          // the stripes are the indicator, not an emoji
   el.style.background = "";
-  // Fixed-size inner swatch. The button has NO intrinsic size (it used to size to
-  // its emoji), so a 100%-height inner box collapsed the whole button to ~2px and
-  // it vanished. A bordered 22×14 box keeps it visible even when channels are unset.
+  // Fixed 22x14 inner swatch: the button has no intrinsic size, so a
+  // percentage-height box would collapse it. A bordered box stays visible
+  // even when channels are unset.
   const stripe = (c) => h("span", { style: `flex:1;min-width:0;background:${c ? checkerBg(c) : "transparent"};` });
   el.appendChild(h("span", { style: "display:flex;width:22px;height:14px;border-radius:3px;overflow:hidden;border:1px solid rgba(255,255,255,0.25);vertical-align:middle;" },
     [stripe(chan("bg")), stripe(chan("text")), stripe(chan("border"))]));
@@ -167,7 +165,7 @@ function _paintSwatch(el, colorObj, defaults) {
 // Attach the gallery-style options popup (.sbg-crumb-popup) to a text input:
 // click/focus opens it under the input, picking an option fills the input and
 // fires its change handler, typing custom values still works. Native datalist
-// dropdowns are NOT used — they render as out-of-place browser UI.
+// dropdowns are NOT used, because they render as out-of-place browser UI.
 function _attachOptionsPopup(inp, getOptions) {
   let popup = null;
   const close = () => { if (popup) { popup.remove(); popup = null; } };
@@ -202,13 +200,13 @@ function _attachOptionsPopup(inp, getOptions) {
 }
 
 function _buildCardSourceUI(obj, body, onChange, extraEl) {
-  const help = "What each card represents. Choose a list → one card per entry (e.g. loras = one card per LoRA), and the fields below are read from each entry. Leave EMPTY for a single card built from the whole image. You can also type workflow_nodes.<NodeType> (e.g. workflow_nodes.KSampler).";
+  const help = "What each card represents. Choose a list to get one card per entry (e.g. loras = one card per LoRA), and the fields below are read from each entry. Leave EMPTY for a single card built from the whole image. You can also type workflow_nodes.<NodeType> (e.g. workflow_nodes.KSampler).";
   const wrap = h("div", { class: "sbg-ly3-src" });
   wrap.appendChild(h("span", { text: "Cards from:", title: help }));
   const inp = h("input", { type: "text", class: "sbg-gs-input sbg-gs-input--sm", placeholder: "(empty = whole image) · loras · samplers …", value: obj.source || "", title: help });
   inp.addEventListener("change", () => { obj.source = inp.value.trim() || undefined; onChange(); });
   _attachOptionsPopup(inp, () => [
-    { value: "", label: "(empty — one card from the whole image)" },
+    { value: "", label: "(empty: one card from the whole image)" },
     ..._CARD_SOURCES.map(s => ({ value: s, label: s })),
   ]);
   wrap.appendChild(inp);
@@ -218,7 +216,7 @@ function _buildCardSourceUI(obj, body, onChange, extraEl) {
 
 // Build the "Show when:" row for a tab/section: controls when it appears in the
 // metadata panel. Empty = Auto (show only when the data most of its fields read
-// from exists — e.g. a tab of mostly controlnet.* fields hides on images without
+// from exists, so e.g. a tab of mostly controlnet.* fields hides on images without
 // ControlNet). "always" disables the gate; any summary path (e.g. upscaling, or
 // workflow_nodes.SeedVR2LoadDiTModel) shows the tab only when that path has data.
 function _buildShowWhenUI(obj, body, onChange) {
@@ -242,21 +240,25 @@ function _buildShowWhenUI(obj, body, onChange) {
 }
 
 // Effective DEFAULT colours for an uncustomised target, read from the actual
-// rendered CSS (so the picker shows the real current colour — incl. theme / global
-// pill overrides — instead of arbitrary placeholders). Cached per kind+title.
-// The probe element must MATCH what the renderer really emits for that kind —
-// probing a stand-in class lies to the picker (kv/detail/title used to probe
-// .sbg-prompt-text, so the picker opened on its 12%-opacity background even
-// though those rows render with none; tab pills/bodies probed .sbg-badge /
-// .sbg-section instead of .sbg-prompt-pill / .sbg-tab-body).
+// rendered CSS so the picker shows the real current colour (theme and global
+// pill overrides included). Cached per kind+title+ancestor colours. The probe
+// element must MATCH the class the renderer emits for that kind, and sit in the
+// same section/tab ancestry: a target with no stored colour inherits from its
+// section and tab, so the probe nests inside wrappers carrying those colours,
+// or an inherited colour previews wrong.
 const _swatchCache = {};
-/** Drop cached swatch defaults so the next probe re-reads the LIVE CSS vars —
- *  call after the Appearance tab changes a global pill/badge/accent colour, else
+/** Drop cached swatch defaults so the next probe re-reads the LIVE CSS vars.
+ *  Call after the Appearance tab changes a global pill/badge/accent colour, else
  *  the param colour pickers keep showing the colour from when they were first
  *  opened while the preview/panel render the new one. */
 export function clearSwatchCache() { for (const k in _swatchCache) delete _swatchCache[k]; }
-function _swatchDefaults(kind, sec) {
-  const key = kind + "|" + (kind === "section" && sec ? (sec.title || "") : "");
+function _swatchDefaults(kind, sec, tab) {
+  const key = [
+    kind,
+    sec ? (sec.title || "") : "",
+    (kind !== "section" && sec && sec.color) ? JSON.stringify(sec.color) : "",
+    (tab && tab.color) ? JSON.stringify(tab.color) : "",
+  ].join("|");
   if (_swatchCache[key]) return _swatchCache[key];
   let el, textEl = null;
   if (kind === "pill") el = h("span", { class: "sbg-badge", text: "x" });
@@ -264,7 +266,7 @@ function _swatchDefaults(kind, sec) {
   else if (kind === "tabbody") el = h("div", { class: "sbg-tab-body", text: "x" });
   else if (kind === "section") { el = h("div", { class: "sbg-section" }); if (sec && sec.title) el.dataset.sectionTitle = sec.title; }
   else if (kind === "kv") {
-    // kv rows colour the VALUE span, not the row — read text colour from it.
+    // kv rows colour the VALUE span rather than the row, so read the text colour from it.
     el = h("div", { class: "sbg-meta-row" });
     el.appendChild(h("span", { class: "sbg-meta-label", text: "L" }));
     textEl = h("span", { class: "sbg-meta-value", text: "x" });
@@ -274,13 +276,31 @@ function _swatchDefaults(kind, sec) {
   else if (kind === "title") el = h("div", { class: "sbg-meta-card__title", text: "x" });
   else if (kind === "text-neg") el = h("div", { class: "sbg-prompt-text sbg-prompt-text--neg", text: "x" });
   else el = h("div", { class: "sbg-prompt-text", text: "x" });
-  const probe = h("div", { style: "position:fixed;left:-9999px;top:-9999px;visibility:hidden;pointer-events:none" }, [el]);
+  // Nest the probe the way the panel nests the real element: section (with its
+  // stored colour and title-keyed CSS) around section body, around tab body
+  // (with the tab's stored colour) for fields that live inside a tab. The
+  // section kind itself probes bare, since its defaults are the uncustomised
+  // section look.
+  let outer = el;
+  if (kind !== "section") {
+    if (tab) {
+      const tb = h("div", { class: "sbg-tab-body" }, [outer]);
+      if (tab.color) TL.applyColor(tb, tab.color);
+      outer = tb;
+    }
+    const secBody = h("div", { class: "sbg-section__body" }, [outer]);
+    const secEl = h("div", { class: "sbg-section sbg-section--open" }, [secBody]);
+    if (sec && sec.title) secEl.dataset.sectionTitle = sec.title;
+    if (sec && sec.color) TL.applyColor(secEl, sec.color);
+    outer = secEl;
+  }
+  const probe = h("div", { style: "position:fixed;left:-9999px;top:-9999px;visibility:hidden;pointer-events:none" }, [outer]);
   (document.querySelector(".sbg-gs-overlay") || document.body).appendChild(probe);
   let out;
   try {
     const cs = getComputedStyle(el);
     // A 0-width/none border still COMPUTES a borderTopColor (the text colour,
-    // opaque) — treat it as "no border" (transparent) instead.
+    // opaque), so treat it as "no border" (transparent) instead.
     const hasBorder = parseFloat(cs.borderTopWidth) > 0 && cs.borderTopStyle !== "none";
     out = {
       bg: _normColor(cs.backgroundColor),
@@ -314,18 +334,392 @@ export function renderLayout(content, galleryCtx, closeGS) {
   let trayOpen = _viewMemory.trayOpen;
 
   function activeKey() { return TL.profileKey(activeApp, activeMedia === "video"); }
-  function activeLayout() {
-    const k = activeKey();
+  // Materialise (and return) the stored section array for an (app, media). A
+  // profile touched for the first time is seeded from its current effective
+  // layout, so it keeps every inherited section plus whatever gets added.
+  function layoutFor(app, isVideo) {
+    const k = TL.profileKey(app, isVideo);
     if (!Array.isArray(profiles[k]) || !profiles[k].length) {
-      profiles[k] = JSON.parse(JSON.stringify(TL.getActiveProfile(activeApp, activeMedia === "video")));
+      profiles[k] = JSON.parse(JSON.stringify(TL.getActiveProfile(app, isVideo)));
     }
     return profiles[k];
   }
+  function activeLayout() { return layoutFor(activeApp, activeMedia === "video"); }
   function persist() { TL.saveProfiles(profiles); }
   function mock() { return mockByMedia[activeMedia]; }
   function secById(id) { return activeLayout().find(s => s.id === id); }
 
-  // ── Scaffold ────────────────────────────────────────────────────────
+  const _titleKey = (s) => String(s || "").trim().toLowerCase();
+
+  // Structure converters shared by the copy dialog and the drag conversions.
+  function cloneSectionForCopy(sec) {
+    const c = JSON.parse(JSON.stringify(sec));
+    c.id = TL.uid();
+    for (const t of (c.tabs || [])) t.id = TL.uid("tab");
+    return c;
+  }
+  function cloneTabForCopy(t) {
+    const c = JSON.parse(JSON.stringify(t));
+    c.id = TL.uid("tab");
+    return c;
+  }
+  // Build the tab that wraps a tabless section's loose fields when it gains its
+  // first tab, so those fields are not orphaned under the tab UI. Reads sec.params
+  // by reference; the caller clears sec.params afterwards.
+  function makeAbsorbTab(sec, label) {
+    const t = { id: TL.uid("tab"), label: label || sec.title || "Tab", style: sec.style || "flat", source: sec.source, params: sec.params };
+    expanded.add(t.id);
+    return t;
+  }
+  // Append a tab to a section. A section gaining its FIRST tab may still hold
+  // loose fields; wrap them into a leading tab so they stay visible (same
+  // behaviour as "+ Tab" and cross-section tab drags).
+  function appendTabToSection(sec, tab) {
+    if (!Array.isArray(sec.tabs)) sec.tabs = [];
+    if (!sec.tabs.length && (sec.params || []).length) {
+      sec.tabs.push(makeAbsorbTab(sec));
+      sec.params = [];
+    }
+    sec.tabs.push(tab);
+  }
+  // Carry the shared render properties across a section/tab conversion so a merge
+  // or promote looks the same afterwards (source, instance match, visibility gate,
+  // colour, high/low pairing). `hidden` is deliberately NOT among them: a tab has
+  // no hide control, so a hidden section merged in surfaces as a visible tab
+  // rather than an invisible, unrecoverable one.
+  function tabFromSection(sec) {
+    return copyRenderProps(sec, { id: TL.uid("tab"), label: sec.title || "Tab", style: sec.style || "flat", params: sec.params || [] });
+  }
+  function sectionFromTab(tab) {
+    return copyRenderProps(tab, { id: TL.uid(), title: tab.label || "New Section", style: tab.style || "flat", open: true, params: tab.params || [] });
+  }
+
+  // Drag-conversion drop handlers
+  // A drop onto a section card converts the dragged thing into that section's
+  // content; a drop between cards promotes it to its own section. These mutate
+  // the model directly and re-render, bypassing the DOM sync paths (the dragged
+  // element landed in a container those functions are not built to read).
+
+  // Whether a section card can host dropped content. The sortable already
+  // excludes the dragged item's own card before calling accepts, so this only
+  // has to reject nodes/raw sections (which cannot hold tabs or fields) and
+  // hidden sections, where dropped content would stop rendering in the panel
+  // and the preview. The copy dialog's canHost applies the same three tests.
+  function _canDropIntoCard(el) {
+    const s = el._section;
+    return !!(s && s.style !== "nodes" && s.style !== "raw" && !s.hidden);
+  }
+  // Remove a tab from its section, dropping the emptied tabs array so the section
+  // renders as a plain field section again. Shared by every tab-move path.
+  function detachTab(sec, tab) {
+    const i = (sec.tabs || []).indexOf(tab);
+    if (i >= 0) sec.tabs.splice(i, 1);
+    if (sec.tabs && !sec.tabs.length) delete sec.tabs;
+  }
+  function detachParam(owner, p) {
+    const i = (owner.params || []).indexOf(p);
+    if (i >= 0) owner.params.splice(i, 1);
+  }
+  // Shared drag-conversion options for the three sortable call sites (section /
+  // tab / field), so the selector, highlight class, and promote zone stay in one
+  // place instead of being re-typed per site. Only the band differs by kind.
+  const secConvertTargets = (band) => ({ selector: ".sbg-ly3-sec", accepts: _canDropIntoCard, band, className: "sbg-ly3-sec--droptarget" });
+  const SEC_PROMOTE = { containerSelector: ".sbg-ly3-seclist", itemSelector: ".sbg-ly3-sec" };
+
+  function mergeSectionIntoSection(src, tgt) {
+    const l = activeLayout();
+    const i = l.indexOf(src);
+    if (i >= 0) l.splice(i, 1);
+    const srcTabs = Array.isArray(src.tabs) ? src.tabs : [];
+    // Loose fields (or a tabless section) become one tab; its own tabs follow.
+    if ((src.params || []).length || !srcTabs.length) appendTabToSection(tgt, tabFromSection(src));
+    for (const t of srcTabs) appendTabToSection(tgt, t);
+    expanded.delete(src.id);
+    expanded.add(tgt.id);
+    persist(); render();
+    showToast("Merged “" + (src.title || "section") + "” into “" + (tgt.title || "section") + "” as tabs");
+  }
+
+  function moveTabIntoSection(srcSec, tab, tgt) {
+    detachTab(srcSec, tab);
+    appendTabToSection(tgt, tab);
+    expanded.add(tgt.id);
+    persist(); render();
+    showToast("Moved tab “" + (tab.label || "tab") + "” into “" + (tgt.title || "section") + "”");
+  }
+
+  function promoteTabToSection(srcSec, tab, index) {
+    detachTab(srcSec, tab);
+    const ns = sectionFromTab(tab);
+    const l = activeLayout();
+    l.splice(index, 0, ns);
+    expanded.add(ns.id);
+    persist(); render();
+    showToast("“" + ns.title + "” is now its own section");
+  }
+
+  function moveFieldIntoSection(owner, p, tgt) {
+    detachParam(owner, p);
+    if (!tgt.params) tgt.params = [];
+    tgt.params.push(p);
+    expanded.add(tgt.id);
+    persist(); render();
+    showToast("Moved field to “" + (tgt.title || "section") + "”");
+  }
+
+  function promoteFieldToSection(owner, p, index) {
+    detachParam(owner, p);
+    const ns = { id: TL.uid(), title: p.label || labelize(p.path), style: "flat", open: true, params: [p] };
+    const l = activeLayout();
+    l.splice(index, 0, ns);
+    expanded.add(ns.id);
+    persist(); render();
+    showToast("“" + ns.title + "” is now its own section");
+  }
+
+  // "Copy between layouts" dialog
+  // Copies whole sections, sections with a subset of their tabs, or lone tabs
+  // from one (app × media) layout into another. Lone tabs land in the target's
+  // section with the same name as their source section, created when missing.
+  function openTransferDialog() {
+    if (document.querySelector(".sbg-ly3-xfer-overlay")) return;  // already open: never stack a second dialog
+    closePopovers();
+    // One descriptor per (app × media) layout, so the dialog never re-parses a
+    // profile key back into its app/media (TL.profileKey owns that format).
+    const LAYOUTS = [];
+    for (const app of TL.APPS) for (const med of MEDIA) {
+      const isVideo = med === "video";
+      LAYOUTS.push({ app, isVideo, key: TL.profileKey(app, isVideo), label: `${TL.APP_LABELS[app] || app} · ${isVideo ? "Videos" : "Images"}` });
+    }
+    const keys = LAYOUTS.map(d => d.key);
+    const byKey = new Map(LAYOUTS.map(d => [d.key, d]));
+    const layoutLabel = (key) => (byKey.get(key) || {}).label || key;
+    // Source sections read WITHOUT materialising the profile (getActiveProfile
+    // returns the stored array when present, a fallback copy otherwise).
+    const sourceSections = (key) => { const d = byKey.get(key); return d ? TL.getActiveProfile(d.app, d.isVideo) : []; };
+    let fromKey = activeKey();
+    let toKey = TL.profileKey(activeApp, activeMedia !== "video");
+
+    const overlay = h("div", { class: "sbg-ly3-xfer-overlay" });
+    const dlg = h("div", { class: "sbg-ly3-xfer" });
+    overlay.appendChild(dlg);
+    const close = () => { document.removeEventListener("keydown", onKey, true); overlay.remove(); };
+    // Escape closes the dialog. Handled on the capture phase and stopped there so
+    // it reaches this dialog ahead of the settings overlay behind it (which listens
+    // on the bubble phase). A native select consumes its own Escape while its
+    // dropdown is open, so this never fires out from under an open dropdown.
+    const onKey = (e) => { if (e.key === "Escape") { e.stopPropagation(); e.preventDefault(); close(); } };
+    document.addEventListener("keydown", onKey, true);
+    overlay.addEventListener("mousedown", (e) => { if (e.target === overlay) close(); });
+
+    const head = h("div", { class: "sbg-ly3-xfer-head" });
+    head.appendChild(h("span", { class: "sbg-ly3-xfer-title", text: "Copy between layouts" }));
+    const closeBtn = h("button", { class: "sbg-iconbtn", title: "Close", text: "✕" });
+    closeBtn.addEventListener("click", close);
+    head.appendChild(closeBtn);
+    dlg.appendChild(head);
+
+    const fromRow = h("div", { class: "sbg-ly3-xfer-row" });
+    fromRow.appendChild(h("span", { text: "From" }));
+    fromRow.appendChild(mkSelect(keys, fromKey, (v) => { fromKey = v; renderChecklist(); }, undefined, layoutLabel));
+    fromRow.appendChild(h("span", { text: "to" }));
+    fromRow.appendChild(mkSelect(keys, toKey, (v) => { toKey = v; updateCount(); }, undefined, layoutLabel));
+    dlg.appendChild(fromRow);
+    dlg.appendChild(h("div", { class: "sbg-ly3-xfer-dim", text: "Tick sections (or single tabs) to copy. Picking the same layout twice duplicates in place." }));
+
+    const listEl = h("div", { class: "sbg-ly3-xfer-list" });
+    dlg.appendChild(listEl);
+
+    // Selection state lives in the checkbox DOM; rows keep the model objects.
+    let rows = [];
+    function renderChecklist() {
+      listEl.innerHTML = "";
+      rows = [];
+      for (const sec of sourceSections(fromKey)) {
+        if (!sec || typeof sec !== "object") continue;
+        const r = { sec, tabRows: [] };
+        const item = h("label", { class: "sbg-ly3-xfer-item" });
+        const cb = h("input", { type: "checkbox" });
+        r.cb = cb;
+        item.appendChild(cb);
+        item.appendChild(h("span", { text: sec.title || "(untitled)" }));
+        const bits = [sec.style || "flat"];
+        const tabs = Array.isArray(sec.tabs) ? sec.tabs : [];
+        if (tabs.length) bits.push(tabs.length + " tab" + (tabs.length > 1 ? "s" : ""));
+        else if ((sec.params || []).length) bits.push(sec.params.length + " field" + (sec.params.length > 1 ? "s" : ""));
+        if (sec.hidden) bits.push("hidden");
+        item.appendChild(h("span", { class: "sbg-ly3-xfer-dim", text: bits.join(" · ") }));
+        listEl.appendChild(item);
+        cb.addEventListener("change", () => {
+          for (const tr of r.tabRows) tr.cb.checked = cb.checked;
+          syncParentHint(r); updateCount();
+        });
+        for (const tab of tabs) {
+          const ti = h("label", { class: "sbg-ly3-xfer-item sbg-ly3-xfer-item--tab" });
+          const tcb = h("input", { type: "checkbox" });
+          ti.appendChild(tcb);
+          ti.appendChild(h("span", { text: tab.label || (tab.path ? labelize(tab.path) : "Tab") }));
+          listEl.appendChild(ti);
+          const tr = { tab, cb: tcb };
+          r.tabRows.push(tr);
+          tcb.addEventListener("change", () => {
+            // Unchecking the last remaining tab deselects the whole section, so a
+            // checked section always carries at least one tab. This is the single
+            // guard against copying (or Replace-overwriting with) an empty shell.
+            if (r.cb.checked && !r.tabRows.some(x => x.cb.checked)) r.cb.checked = false;
+            syncParentHint(r); updateCount();
+          });
+        }
+        rows.push(r);
+      }
+      if (!rows.length) listEl.appendChild(h("div", { class: "sbg-ly3-empty", text: "This layout has no sections." }));
+      updateCount();
+    }
+    // Indeterminate marks "tabs ticked inside an unticked section", the lone
+    // tab selection, so the partial state is visible at a glance.
+    function syncParentHint(r) {
+      r.cb.indeterminate = !r.cb.checked && r.tabRows.some(tr => tr.cb.checked);
+    }
+    function selection() {
+      const secItems = [], loneTabs = [];
+      for (const r of rows) {
+        const picked = r.tabRows.filter(tr => tr.cb.checked).map(tr => tr.tab);
+        if (r.cb.checked) {
+          secItems.push({ sec: r.sec, tabs: picked });
+        } else {
+          for (const tab of picked) loneTabs.push({ srcSec: r.sec, tab });
+        }
+      }
+      return { secItems, loneTabs, count: secItems.length + loneTabs.length };
+    }
+
+    const ruleRow = h("div", { class: "sbg-ly3-xfer-row" });
+    ruleRow.appendChild(h("span", { class: "sbg-ly3-xfer-dim", text: "If the target already has a section with the same name:" }));
+    const mkRule = (val, lbl, chk) => {
+      const l = h("label", { class: "sbg-ly3-xfer-radio" });
+      const rb = h("input", { type: "radio", name: "sbg-xfer-clash", value: val });
+      rb.checked = chk;
+      l.appendChild(rb);
+      l.appendChild(document.createTextNode(lbl));
+      return l;
+    };
+    ruleRow.appendChild(mkRule("add", "Add as a copy", true));
+    ruleRow.appendChild(mkRule("replace", "Replace it", false));
+    dlg.appendChild(ruleRow);
+
+    const foot = h("div", { class: "sbg-ly3-xfer-foot" });
+    const cancel = h("button", { class: "sbg-btn sbg-btn--sm", text: "Cancel" });
+    cancel.addEventListener("click", close);
+    const go = h("button", { class: "sbg-btn sbg-btn--sm sbg-btn--primary", text: "Copy 0 selected" });
+    go.disabled = true;
+    go.addEventListener("click", commit);
+    foot.appendChild(cancel);
+    foot.appendChild(go);
+    dlg.appendChild(foot);
+
+    function updateCount() {
+      const { count } = selection();
+      go.textContent = "Copy " + count + " selected";
+      go.disabled = !count;
+    }
+
+    function commit() {
+      const { secItems, loneTabs, count } = selection();
+      if (!count) return;
+      const rb = overlay.querySelector('input[name="sbg-xfer-clash"]:checked');
+      // Copying a layout onto itself is a duplicate-in-place (the hint says so), so
+      // Replace there would mean "replace a section with a filtered copy of itself"
+      // and silently drop its unticked tabs. Force Add whenever From equals To.
+      const replace = toKey !== fromKey && rb && rb.value === "replace";
+      const dst = byKey.get(toKey);
+      if (!dst) return;
+      const target = layoutFor(dst.app, dst.isVideo);
+      // Only expand copied sections when the copy lands in the layout on screen; a
+      // materialised target keeps the source layout's ids, so adding them to the
+      // shared expanded set would expand or redirect the same id in the active
+      // profile.
+      const toActive = toKey === activeKey();
+
+      // Replace resolves against the sections the target had BEFORE this commit,
+      // claiming each at most once, so two copies with the same title never land
+      // on each other (the second falls through to append).
+      const originalTargets = target.slice();
+      const claimedReplace = new Set();
+      const claimReplaceTarget = (title) => {
+        const s = originalTargets.find(x => x && !claimedReplace.has(x) && _titleKey(x.title) === _titleKey(title));
+        if (s) claimedReplace.add(s);
+        return s || null;
+      };
+      // A lone-tab host must be able to hold tabs and be visible, so nodes/raw and
+      // hidden sections are never reused; the copied tab would otherwise vanish.
+      const canHost = (s) => s && s.style !== "nodes" && s.style !== "raw" && !s.hidden;
+      const findHost = (title) => target.find(s => canHost(s) && _titleKey(s.title) === _titleKey(title)) || null;
+
+      for (const it of secItems) {
+        const clone = cloneSectionForCopy(it.sec);
+        if (Array.isArray(clone.tabs)) {
+          // Keep only the ticked tabs, matched by position against the source.
+          const keep = new Set(it.tabs.map(t => (it.sec.tabs || []).indexOf(t)));
+          clone.tabs = clone.tabs.filter((t, i) => keep.has(i));
+          if (!clone.tabs.length) delete clone.tabs;
+        }
+        const repl = replace ? claimReplaceTarget(it.sec.title) : null;
+        if (repl) {
+          // Keep the replaced section's id so id-keyed features (the search rename
+          // bridge, remembered active tab, catalog repairs) still point at it.
+          clone.id = repl.id;
+          target.splice(target.indexOf(repl), 1, clone);
+        } else {
+          target.push(clone);
+        }
+        if (toActive) expanded.add(clone.id);
+      }
+
+      // Lone tabs, grouped per source section and hosted by the target's
+      // same-named (tab-capable) section, created when none exists.
+      const groups = new Map();
+      for (const lt of loneTabs) {
+        if (!groups.has(lt.srcSec)) groups.set(lt.srcSec, []);
+        groups.get(lt.srcSec).push(lt.tab);
+      }
+      // Replace only ever overwrites a tab that existed in the host BEFORE this
+      // commit; a tab the same commit just added (a fresh host clone's tabs, or an
+      // earlier lone tab) is never a replace target, so two copies never collapse.
+      const hostOrigTabs = new Map();
+      for (const [srcSec, tabs] of groups) {
+        let host = findHost(srcSec.title);
+        if (!host) {
+          host = { id: TL.uid(), title: srcSec.title || "Section", style: srcSec.style || "flat", open: true, params: [] };
+          if (srcSec.color) host.color = JSON.parse(JSON.stringify(srcSec.color));
+          target.push(host);
+        }
+        if (!hostOrigTabs.has(host)) {
+          hostOrigTabs.set(host, originalTargets.includes(host) && Array.isArray(host.tabs) ? host.tabs.slice() : []);
+        }
+        const origTabs = hostOrigTabs.get(host);
+        for (const tab of tabs) {
+          const tclone = cloneTabForCopy(tab);
+          const key = _titleKey(tab.label);
+          // Only a real, matching, pre-existing tab is replaced; unlabeled tabs
+          // (key "") always append so they never overwrite an unrelated unnamed tab.
+          const ti = replace && key && Array.isArray(host.tabs)
+            ? host.tabs.findIndex(t => origTabs.includes(t) && _titleKey(t.label) === key) : -1;
+          if (ti >= 0) host.tabs.splice(ti, 1, tclone); else appendTabToSection(host, tclone);
+        }
+        if (toActive) expanded.add(host.id);
+      }
+
+      persist();
+      showToast("Copied " + count + " item" + (count > 1 ? "s" : "") + " to " + layoutLabel(toKey));
+      close();
+      if (toActive) render();
+    }
+
+    renderChecklist();
+    document.body.appendChild(overlay);
+  }
+
+  // Scaffold
   const topBar = h("div", { class: "sbg-ly3-top" });
   const split = h("div", { class: "sbg-ly3-split" });
   const leftPane = h("div", { class: "sbg-ly3-edit" });
@@ -335,7 +729,7 @@ export function renderLayout(content, galleryCtx, closeGS) {
   content.appendChild(topBar);
   content.appendChild(split);
 
-  // ── Top bar ─────────────────────────────────────────────────────────
+  // Top bar
   function renderTopBar() {
     topBar.innerHTML = "";
     const appWrap = h("div", { class: "sbg-ly3-tabs" });
@@ -358,12 +752,21 @@ export function renderLayout(content, galleryCtx, closeGS) {
     if (activeMedia === "video") {
       const clone = h("button", { class: "sbg-btn sbg-btn--sm", text: "⇐ Clone Images" });
       clone.addEventListener("click", () => {
-        const src = profiles[TL.profileKey(activeApp, false)] || TL.getActiveProfile(activeApp, false);
+        // Materialise the image layout the same way every other reader does, so an
+        // emptied-but-stored image profile clones its real effective layout rather
+        // than an empty array (which would then reseed as the video default).
+        const src = layoutFor(activeApp, false);
         profiles[activeKey()] = JSON.parse(JSON.stringify(src));
         persist(); render(); showToast("Cloned image layout to video");
       });
       actions.appendChild(clone);
     }
+    const xfer = h("button", {
+      class: "sbg-btn sbg-btn--sm", text: "⧉ Copy between layouts",
+      title: "Copy sections or tabs from one layout into another",
+    });
+    xfer.addEventListener("click", openTransferDialog);
+    actions.appendChild(xfer);
     const reset = h("button", { class: "sbg-btn sbg-btn--sm", text: "↺ Reset" });
     let rc = false;
     reset.addEventListener("click", () => {
@@ -374,14 +777,14 @@ export function renderLayout(content, galleryCtx, closeGS) {
     topBar.appendChild(actions);
   }
 
-  // ── Full render ─────────────────────────────────────────────────────
+  // Full render
   function render() {
     renderTopBar();
     renderEditor();
     refreshPreview();
   }
 
-  // ── Left pane: editable section list + field tray ───────────────────
+  // Left pane: editable section list + field tray
   function renderEditor() {
     leftPane.innerHTML = "";
     leftPane.appendChild(h("div", { class: "sbg-ly3-hint", text: "Drag ⋮⋮ to reorder. Expand a section to edit its fields, or drag fields in from the tray below. The right pane previews your panel live." }));
@@ -415,7 +818,7 @@ export function renderLayout(content, galleryCtx, closeGS) {
     exp.addEventListener("click", () => { if (isOpen) expanded.delete(sec.id); else expanded.add(sec.id); renderEditor(); });
     head.appendChild(exp);
 
-    const eye = h("button", { class: "sbg-iconbtn sbg-eyebtn" + (sec.hidden ? " sbg-iconbtn--off" : ""), title: sec.hidden ? "Hidden from panel — click to show" : "Shown in panel — click to hide", text: "👁" });
+    const eye = h("button", { class: "sbg-iconbtn sbg-eyebtn" + (sec.hidden ? " sbg-iconbtn--off" : ""), title: sec.hidden ? "Hidden from panel. Click to show" : "Shown in panel. Click to hide", text: "👁" });
     eye.addEventListener("click", () => { sec.hidden = !sec.hidden; persist(); render(); });
     head.appendChild(eye);
 
@@ -461,7 +864,7 @@ export function renderLayout(content, galleryCtx, closeGS) {
       // When tabs are in use they own the content (each tab has its own source /
       // fields), so hide the section-level source row and field list.
       if (sec.style === "cards" && !hasTabs) {
-        // High/Low pairing toggle (MoE) — shown inline in the source row.
+        // High/Low pairing toggle (MoE), shown inline in the source row.
         const hlLbl = h("label", { class: "sbg-ly3-openlbl", title: "Pair high-noise / low-noise models side-by-side (Wan2.2-style MoE)" });
         const hlCb = h("input", { type: "checkbox" });
         const autoOn = sec.highlow == null && HIGHLOW_SOURCES.has(sec.source);
@@ -481,14 +884,14 @@ export function renderLayout(content, galleryCtx, closeGS) {
         const fields = h("div", { class: "sbg-ly3-fields" });
         fields.dataset.secId = sec.id;
         for (const p of (sec.params || [])) fields.appendChild(buildFieldRow(sec, p, fields));
-        if (!(sec.params || []).length) fields.appendChild(h("div", { class: "sbg-ly3-empty", text: "No fields yet — drag from the tray below or click + field." }));
+        if (!(sec.params || []).length) fields.appendChild(h("div", { class: "sbg-ly3-empty", text: "No fields yet. Drag from the tray below or click + field." }));
         body.appendChild(fields);
         const addField = h("button", { class: "sbg-ly3-addfield", text: "+ field" });
         addField.addEventListener("click", () => openAddFieldPicker(addField, sec));
         body.appendChild(addField);
       } else {
         // Tabbed section: optional SECTION-LEVEL fields shown OUTSIDE the tabs (with
-        // every tab) — e.g. one shared "show output" field rather than duplicating it
+        // every tab), e.g. one shared "show output" field rather than duplicating it
         // into each tab (which would make every tab appear whenever that node exists).
         const ofHead = h("div", { class: "sbg-ly3-outerfields-head" });
         ofHead.appendChild(h("span", {
@@ -504,7 +907,7 @@ export function renderLayout(content, galleryCtx, closeGS) {
         const fields = h("div", { class: "sbg-ly3-fields" });
         fields.dataset.secId = sec.id;
         for (const p of (sec.params || [])) fields.appendChild(buildFieldRow(sec, p, fields));
-        if (!(sec.params || []).length) fields.appendChild(h("div", { class: "sbg-ly3-empty", text: "No fields outside tabs — drag one here from the tray, or click + field." }));
+        if (!(sec.params || []).length) fields.appendChild(h("div", { class: "sbg-ly3-empty", text: "No fields outside tabs. Drag one here from the tray, or click + field." }));
         body.appendChild(fields);
         const addField = h("button", { class: "sbg-ly3-addfield", text: "+ field" });
         addField.addEventListener("click", () => openAddFieldPicker(addField, sec));
@@ -513,11 +916,25 @@ export function renderLayout(content, galleryCtx, closeGS) {
       card.appendChild(body);
     }
 
-    initSortable(list, grip, card, { type: "section", itemSelector: ".sbg-ly3-sec", onDrop: () => syncFromDOM() });
+    initSortable(list, grip, card, {
+      type: "section", itemSelector: ".sbg-ly3-sec",
+      // Dropping onto the middle band of another section merges this one into
+      // it as tabs; the edge zones keep the plain reorder.
+      convertTargets: secConvertTargets([0.3, 0.7]),
+      onDrop: (itm, info) => {
+        if (info && info.convertEl && info.convertEl._section) mergeSectionIntoSection(sec, info.convertEl._section);
+        else syncFromDOM();
+      },
+    });
     return card;
   }
 
   function buildFieldRow(sec, p, fields, opts = {}) {
+    // `sec` is the container the param belongs to, and it is a TAB when this row
+    // sits in a tab's field list; opts.inSec then names the enclosing section, so
+    // the colour picker's defaults probe the full section and tab ancestry.
+    const hostSec = opts.inSec || sec;
+    const hostTab = opts.inSec ? sec : null;
     const hidden = p.style === "hidden";
     const row = h("div", { class: "sbg-ly3-field" + (hidden ? " sbg-ly3-field--hidden" : "") });
     row.dataset.type = "param";
@@ -542,7 +959,7 @@ export function renderLayout(content, galleryCtx, closeGS) {
         title: "Bound to one node instance: " + matchChipText(p.match) + ". Click × to match every instance again.",
       });
       chip.appendChild(h("span", { class: "sbg-ly3-matchchip__txt", text: matchChipText(p.match) }));
-      const clearX = h("span", { class: "sbg-ly3-matchchip__x", text: "×", title: "Clear instance binding — match every instance again" });
+      const clearX = h("span", { class: "sbg-ly3-matchchip__x", text: "×", title: "Clear instance binding and match every instance again" });
       clearX.addEventListener("click", (e) => { e.stopPropagation(); delete p.match; persist(); renderEditor(); refreshPreview(); });
       chip.appendChild(clearX);
       row.appendChild(chip);
@@ -563,15 +980,14 @@ export function renderLayout(content, galleryCtx, closeGS) {
       fmt.addEventListener("input", () => { p.format = fmt.value.trim() || undefined; persist(); refreshPreview(); });
       tools.appendChild(fmt);
     }
-    // Colour picker — available for every visible style (pill/kv/detail/title/text),
-    // not just pills (regression: text/kv used to be colourable too).
+    // Colour picker, available for every visible style (pill/kv/detail/title/text).
     if (effStyle !== "hidden") {
-      // The picker's default colours come from a probe of the kind's REAL
-      // rendered element, so pass the actual style (kv/detail/title/text/pill).
+      // Pass the actual style so the picker's default colours probe the kind's
+      // real rendered element.
       const _ckind = effStyle === "text" && (p.variant === "neg" || /negative/i.test(p.path)) ? "text-neg" : effStyle;
       const colorBtn = h("button", { class: "sbg-iconbtn", title: "Colours", text: "🎨" });
-      _paintSwatch(colorBtn, p.color, _swatchDefaults(_ckind, sec));
-      colorBtn.addEventListener("click", () => openPillColorPicker(colorBtn, p, sec, "color", _ckind));
+      _paintSwatch(colorBtn, p.color, _swatchDefaults(_ckind, hostSec, hostTab));
+      colorBtn.addEventListener("click", () => openPillColorPicker(colorBtn, p, hostSec, "color", _ckind, hostTab));
       tools.appendChild(colorBtn);
     }
     // Find
@@ -585,7 +1001,7 @@ export function renderLayout(content, galleryCtx, closeGS) {
       });
       tools.appendChild(findBtn);
     }
-    const eyeBtn = h("button", { class: "sbg-iconbtn sbg-eyebtn" + (hidden ? " sbg-iconbtn--off" : ""), title: hidden ? "Hidden — click to show" : "Click to hide", text: "👁" });
+    const eyeBtn = h("button", { class: "sbg-iconbtn sbg-eyebtn" + (hidden ? " sbg-iconbtn--off" : ""), title: hidden ? "Hidden. Click to show" : "Click to hide", text: "👁" });
     eyeBtn.addEventListener("click", () => {
       if (p.style === "hidden") { p.style = p._prevStyle || "kv"; delete p._prevStyle; }
       else { p._prevStyle = p.style || "kv"; p.style = "hidden"; }
@@ -593,7 +1009,7 @@ export function renderLayout(content, galleryCtx, closeGS) {
     });
     tools.appendChild(eyeBtn);
     const delBtn = h("button", { class: "sbg-iconbtn sbg-iconbtn--danger", title: "Remove field", text: "🗑" });
-    delBtn.addEventListener("click", () => { const i = sec.params.indexOf(p); if (i >= 0) sec.params.splice(i, 1); persist(); renderEditor(); refreshPreview(); });
+    delBtn.addEventListener("click", () => { detachParam(sec, p); persist(); renderEditor(); refreshPreview(); });
     tools.appendChild(delBtn);
     row.appendChild(tools);
 
@@ -603,18 +1019,26 @@ export function renderLayout(content, galleryCtx, closeGS) {
       // param can be dragged into (or out of) a tabbed section. syncFromDOM is
       // tab-aware and rebuilds the destination tab's params.
       dropContainerSelector: opts.dropContainerSelector || ".sbg-ly3-fields, .sbg-ly3-tabfields",
-      onDrop: opts.onDrop || (() => syncFromDOM()),
+      // Dropping onto a section card (e.g. a collapsed one) moves the field into
+      // that section; dropping between cards promotes it to its own section.
+      convertTargets: secConvertTargets([0.12, 0.88]),
+      promote: SEC_PROMOTE,
+      onDrop: (itm, info) => {
+        if (info && info.convertEl && info.convertEl._section) moveFieldIntoSection(sec, p, info.convertEl._section);
+        else if (info && info.promoteIndex != null) promoteFieldToSection(sec, p, info.promoteIndex);
+        else (opts.onDrop || (() => syncFromDOM()))(itm, info);
+      },
     });
     return row;
   }
 
-  // ── Tabs editor (any section) ───────────────────────────────────────
+  // Tabs editor (any section)
   // Each tab is a mini-section, rendered as a stacked row that mirrors the
   // SECTION row pattern (grip-drag to reorder, inline rename, expand to edit
-  // fields, style/colour controls) — so it behaves like everything else.
+  // fields, style/colour controls), so it behaves like everything else.
   function _normalizeTab(t) {
     // Upgrade a legacy {label, path} tab to the subsection shape in place.
-    // Returns true if anything changed (so the caller can persist once — a tab's
+    // Returns true if anything changed, so the caller can persist once (a tab's
     // id drives its expand state, which must be stable across reloads).
     let changed = false;
     if (t && !Array.isArray(t.params)) {
@@ -646,18 +1070,19 @@ export function renderLayout(content, galleryCtx, closeGS) {
       if (sec.tabs.length === 0 && (sec.params || []).length) {
         // First tab: move the section's existing fields (and its style/source)
         // INTO the tab so they aren't orphaned/hidden. Later tabs start empty.
-        nt = { id: TL.uid("tab"), label: sec.title || "Tab 1", style: sec.style || "flat", source: sec.source, params: sec.params };
+        nt = makeAbsorbTab(sec, sec.title || "Tab 1");
         sec.params = [];
       } else {
         nt = { id: TL.uid("tab"), label: "Tab " + (sec.tabs.length + 1), style: "text", params: [] };
+        expanded.add(nt.id);
       }
-      sec.tabs.push(nt); expanded.add(nt.id);
+      sec.tabs.push(nt);
       persist(); renderEditor(); refreshPreview();
     });
     head.appendChild(add);
     wrap.appendChild(head);
 
-    // Always render the tab-list — even when empty — so a tab dragged from ANOTHER
+    // Always render the tab-list, even when empty, so a tab dragged from ANOTHER
     // section has somewhere to land here. The empty list is invisible at rest and
     // only reveals itself as a drop zone while a tab is actually being dragged
     // (see body.sbg-dragging-tab in the CSS).
@@ -667,7 +1092,7 @@ export function renderLayout(content, galleryCtx, closeGS) {
     return wrap;
   }
 
-  // One tab row — mirrors buildSectionEditor's row (grip / expand / rename /
+  // One tab row. Mirrors buildSectionEditor's row (grip / expand / rename /
   // style / pill-colour / bg-colour / delete) + an expandable field list.
   function buildTabRow(sec, t, list, onTabDrop) {
     const isOpen = expanded.has(t.id);
@@ -683,19 +1108,19 @@ export function renderLayout(content, galleryCtx, closeGS) {
     name.addEventListener("input", () => { t.label = name.value || undefined; persist(); refreshPreview(); });
     head.appendChild(name);
     head.appendChild(mkSelect(SECTION_STYLES, t.style || "text", (v) => { t.style = v; persist(); renderEditor(); refreshPreview(); }, "Tab render style"));
-    // Pill colour (the tab's pill in the panel — renders as .sbg-prompt-pill,
-    // not a .sbg-badge, so probe the right element for its defaults).
+    // Pill colour. The tab's pill in the panel renders as .sbg-prompt-pill
+    // rather than .sbg-badge, so probe the right element for its defaults.
     const pillBtn = h("button", { class: "sbg-iconbtn", title: "Tab pill colour", text: "🔵" });
-    _paintSwatch(pillBtn, t.pillColor, _swatchDefaults("tabpill"));
+    _paintSwatch(pillBtn, t.pillColor, _swatchDefaults("tabpill", sec));
     pillBtn.addEventListener("click", () => openPillColorPicker(pillBtn, t, sec, "pillColor", "tabpill"));
     head.appendChild(pillBtn);
     // Content background colour (applies to the .sbg-tab-body host).
     const bgBtn = h("button", { class: "sbg-iconbtn", title: "Tab content background", text: "🎨" });
-    _paintSwatch(bgBtn, t.color, _swatchDefaults("tabbody"));
+    _paintSwatch(bgBtn, t.color, _swatchDefaults("tabbody", sec));
     bgBtn.addEventListener("click", () => openPillColorPicker(bgBtn, t, sec, "color", "tabbody"));
     head.appendChild(bgBtn);
     const del = h("button", { class: "sbg-iconbtn sbg-iconbtn--danger", title: "Delete tab", text: "🗑" });
-    del.addEventListener("click", () => { const i = sec.tabs.indexOf(t); if (i >= 0) sec.tabs.splice(i, 1); if (!sec.tabs.length) delete sec.tabs; expanded.delete(t.id); persist(); renderEditor(); refreshPreview(); });
+    del.addEventListener("click", () => { detachTab(sec, t); expanded.delete(t.id); persist(); renderEditor(); refreshPreview(); });
     head.appendChild(del);
     row.appendChild(head);
 
@@ -708,8 +1133,8 @@ export function renderLayout(content, galleryCtx, closeGS) {
       if (t.style !== "nodes" && t.style !== "raw") {
         // Tab-only class (NOT .sbg-ly3-fields) so syncFromDOM never overwrites sec.params.
         const fields = h("div", { class: "sbg-ly3-tabfields" });
-        for (const p of (t.params || [])) fields.appendChild(buildFieldRow(t, p, fields, { dropContainerSelector: ".sbg-ly3-fields, .sbg-ly3-tabfields", onDrop: () => syncFromDOM() }));
-        if (!(t.params || []).length) fields.appendChild(h("div", { class: "sbg-ly3-empty", text: "No fields in this tab — drag from the tray or click + field." }));
+        for (const p of (t.params || [])) fields.appendChild(buildFieldRow(t, p, fields, { inSec: sec, dropContainerSelector: ".sbg-ly3-fields, .sbg-ly3-tabfields", onDrop: () => syncFromDOM() }));
+        if (!(t.params || []).length) fields.appendChild(h("div", { class: "sbg-ly3-empty", text: "No fields in this tab. Drag from the tray or click + field." }));
         body.appendChild(fields);
         const addField = h("button", { class: "sbg-ly3-addfield", text: "+ field" });
         addField.addEventListener("click", () => openAddFieldPicker(addField, t));
@@ -718,14 +1143,25 @@ export function renderLayout(content, galleryCtx, closeGS) {
       row.appendChild(body);
     }
 
-    initSortable(list, grip, row, { type: "tab", itemSelector: ".sbg-ly3-tabrow", dropContainerSelector: ".sbg-ly3-tablist", onDrop: onTabDrop });
+    initSortable(list, grip, row, {
+      type: "tab", itemSelector: ".sbg-ly3-tabrow", dropContainerSelector: ".sbg-ly3-tablist",
+      // Dropping onto a section card (e.g. a collapsed one) moves the tab into
+      // that section; dropping between cards promotes it to its own section.
+      convertTargets: secConvertTargets([0.12, 0.88]),
+      promote: SEC_PROMOTE,
+      onDrop: (itm, info) => {
+        if (info && info.convertEl && info.convertEl._section) moveTabIntoSection(sec, t, info.convertEl._section);
+        else if (info && info.promoteIndex != null) promoteTabToSection(sec, t, info.promoteIndex);
+        else onTabDrop(itm, info);
+      },
+    });
     return row;
   }
 
-  // ── Field tray ("All Fields / Nodes") ───────────────────────────────
+  // Field tray ("All Fields / Nodes")
   function buildTray() {
     const tray = h("div", { class: "sbg-ly3-tray" + (trayOpen ? " sbg-ly3-tray--open" : "") });
-    const head = h("button", { class: "sbg-ly3-trayhead", text: (trayOpen ? "▼ " : "▶ ") + "All Fields / Nodes — drag into a section" });
+    const head = h("button", { class: "sbg-ly3-trayhead", text: (trayOpen ? "▼ " : "▶ ") + "All Fields / Nodes (drag into a section)" });
     head.addEventListener("click", () => { trayOpen = !trayOpen; _viewMemory.trayOpen = trayOpen; renderEditor(); });
     tray.appendChild(head);
     if (!trayOpen) return tray;
@@ -802,7 +1238,7 @@ export function renderLayout(content, galleryCtx, closeGS) {
         if (idx >= 0 && idx < arr.length) arr.splice(idx, 0, param); else arr.push(param);
         persist();
       };
-      // Dropped into a TAB's field list → add to that tab.
+      // Dropped into a TAB's field list: add to that tab.
       const tabFieldsEl = movedItem.closest(".sbg-ly3-tabfields");
       const fieldsEl = movedItem.closest(".sbg-ly3-fields");
       if (tabFieldsEl) {
@@ -814,10 +1250,10 @@ export function renderLayout(content, galleryCtx, closeGS) {
         if (sec) { if (!sec.params) sec.params = []; addAt(sec.params, fieldsEl); }
       }
     }
-    render(); // rebuild — discards the relocated tray node and restores the tray intact
+    render(); // rebuild: discards the relocated tray node and restores the tray intact
   }
 
-  // ── Add-field picker (click "+ field") ──────────────────────────────
+  // Add-field picker (click "+ field")
   // onPick: optional. When given, clicking a field invokes onPick(path) and
   // closes the picker (used for choosing a tab's path) instead of adding a param.
   function openAddFieldPicker(anchor, sec, onPick) {
@@ -862,19 +1298,20 @@ export function renderLayout(content, galleryCtx, closeGS) {
     setTimeout(() => search.focus(), 0);
   }
 
-  // ── Pill HSL colour picker (bg / text / border) ─────────────────────
+  // Pill HSL colour picker (bg / text / border)
   // colorKey: which property of `p` to edit ("color" by default; tabs also use
   // "pillColor"). kind: which rendered element supplies the DEFAULT colours shown
-  // when nothing is set yet ("pill" | "section" | "text"). Lets one picker drive
-  // multiple colourable targets and always show the real current colour.
-  function openPillColorPicker(anchor, p, sec, colorKey = "color", kind = "section") {
-    // Close any open popover WITH cleanup (a bare .remove() would orphan its
-    // outside-click mousedown listener, which then fires closePopovers() on the
-    // next click and instantly closes THIS picker — the self-closing bug).
+  // when nothing is set yet ("pill" | "section" | "text"). tab: the enclosing tab
+  // when `p` is a field inside one, so the defaults probe the full ancestry. Lets
+  // one picker drive multiple colourable targets and always show the real
+  // current colour.
+  function openPillColorPicker(anchor, p, sec, colorKey = "color", kind = "section", tab = null) {
+    // Close any open popover WITH cleanup: a bare .remove() would orphan its
+    // outside-click listener, which then closes THIS picker on the next click.
     closePopovers();
     if (!p[colorKey]) p[colorKey] = {};
     const col = p[colorKey];
-    const d = _swatchDefaults(kind, sec);
+    const d = _swatchDefaults(kind, sec, tab);
     const pop = h("div", { class: "sbg-ly3-pop sbg-ly3-colorpop" });
     const channels = [["Background", "bg", d.bg || "#2a2a4a"], ["Text", "text", d.text || "#e0e0ff"], ["Border", "border", d.border || "#444444"]];
     let active = "bg", picker = null;
@@ -902,13 +1339,16 @@ export function renderLayout(content, galleryCtx, closeGS) {
     // change/blur fires, flush any pending typed colour first. Reads the current
     // `picker` (mountPicker reassigns it on channel switch).
     pop._commitActive = () => { if (picker && picker.commit) picker.commit(); };
+    // Destroy the picker on close so its document listeners (mousemove/mouseup)
+    // and closure are released rather than leaking per open.
+    pop._destroyPicker = () => { if (picker && picker.destroy) picker.destroy(); picker = null; };
     pop.appendChild(tabs); pop.appendChild(mount); pop.appendChild(clearRow);
     placePopover(pop, anchor, true);
     mountPicker();
   }
 
-  // ── Popover placement + dismissal ───────────────────────────────────
-  function closePopovers() { document.querySelectorAll(".sbg-ly3-pop").forEach(e => { if (e._commitActive) e._commitActive(); if (e._cleanup) e._cleanup(); e.remove(); }); }
+  // Popover placement + dismissal
+  function closePopovers() { document.querySelectorAll(".sbg-ly3-pop").forEach(e => { if (e._commitActive) e._commitActive(); if (e._destroyPicker) e._destroyPicker(); if (e._cleanup) e._cleanup(); e.remove(); }); }
   function placePopover(pop, anchor, openLeft) {
     document.body.appendChild(pop);
     const clamp = () => {
@@ -934,7 +1374,7 @@ export function renderLayout(content, galleryCtx, closeGS) {
     setTimeout(() => document.addEventListener("mousedown", onDown), 0);
   }
 
-  // ── Right pane: live full-panel preview (same renderer as lightbox) ──
+  // Right pane: live full-panel preview (same renderer as lightbox)
   function refreshPreview() {
     rightPane.innerHTML = "";
     const m = mock();
@@ -945,7 +1385,7 @@ export function renderLayout(content, galleryCtx, closeGS) {
     for (const sec of activeLayout()) {
       if (!sec || !sec.title) continue;
       if (sec.hidden) continue;
-      // preview:true → renderers show EVERY configured field, using an em-dash
+      // preview:true makes renderers show EVERY configured field, with the "—"
       // placeholder where the sample data has no value, so the user sees their
       // full layout while editing.
       const rawData = sec.style === "raw" ? (m.__raw__ || m) : null;
@@ -999,7 +1439,7 @@ export function renderLayout(content, galleryCtx, closeGS) {
     return secEl;
   }
 
-  // ── Sync profile order from the left-pane DOM after a drag ───────────
+  // Sync profile order from the left-pane DOM after a drag
   function syncFromDOM() {
     const cards = [...leftPane.querySelectorAll(".sbg-ly3-seclist > .sbg-ly3-sec")];
     if (!cards.length) { render(); return; }
@@ -1016,7 +1456,7 @@ export function renderLayout(content, galleryCtx, closeGS) {
           if (tf) t.params = [...tf.querySelectorAll(".sbg-ly3-field")].map(r => r._param).filter(Boolean);
         }
         // Section-level fields shown OUTSIDE the tabs live in the section's own
-        // .sbg-ly3-fields (tab fields use .sbg-ly3-tabfields) — rebuild those too, so
+        // .sbg-ly3-fields (tab fields use .sbg-ly3-tabfields). Rebuild those too, so
         // a field can be dragged between a tab and the outside area.
         const outer = cardEl.querySelector(":scope > .sbg-ly3-secbody > .sbg-ly3-fields");
         if (outer && expanded.has(sec.id)) {
@@ -1053,19 +1493,17 @@ export function renderLayout(content, galleryCtx, closeGS) {
       const tabs = [...tabList.querySelectorAll(":scope > .sbg-ly3-tabrow")].map(r => r._tab).filter(Boolean);
       if (tabs.length) {
         // A section that just gained its FIRST tab may still hold loose
-        // section-level fields — wrap them into a leading tab so they aren't
+        // section-level fields. Wrap them into a leading tab so they aren't
         // hidden under the tab UI (same idea as the "+ Tab" absorb behaviour).
-        // Skip when the section already had tabs (its loose params, if any, were
-        // already hidden — don't surface them as a surprise tab).
+        // Skip when the section already had tabs: its loose params, if any, were
+        // already hidden, and surfacing them as a surprise tab would be wrong.
         if (!hadTabs && sec.params && sec.params.length) {
-          const absorb = { id: TL.uid("tab"), label: sec.title || "Tab", style: sec.style || "flat", source: sec.source, params: sec.params };
-          expanded.add(absorb.id);
-          tabs.unshift(absorb);
+          tabs.unshift(makeAbsorbTab(sec));
           sec.params = [];
         }
         sec.tabs = tabs;
       } else {
-        delete sec.tabs;  // last tab dragged out → back to a normal field section
+        delete sec.tabs;  // last tab dragged out: back to a normal field section
       }
     }
     persist();
@@ -1073,7 +1511,7 @@ export function renderLayout(content, galleryCtx, closeGS) {
     refreshPreview();
   }
 
-  // ── Helpers ─────────────────────────────────────────────────────────
+  // Helpers
   function pathToSearch(path) {
     const parts = String(path).split(".");
     const head = parts[0];
@@ -1097,9 +1535,14 @@ export function renderLayout(content, galleryCtx, closeGS) {
     ["duration", "codec", "fps", "total_frames"].forEach(p => paths.add(p));
     ["model", "vae", "clip_skip", "positive_prompt", "negative_prompt", "initial_prompt"].forEach(p => paths.add(p));
     if (keys) {
-      const SKIP = new Set(["samplers", "loras", "controlnet", "adetailer", "upscaling", "interpolation", "mmaudio", "extra", "workflow_nodes", "has_prompt", "has_workflow"]);
+      // Catalog-derived from the server (list/object sections + list/bool
+      // flags); the literal list is only a fallback for a stale backend.
+      const SKIP = new Set(keys.non_bindable
+        || ["samplers", "loras", "controlnet", "adetailer", "upscaling", "interpolation", "mmaudio", "extra", "workflow_nodes", "has_prompt", "has_workflow", "initial_images"]);
       for (const sec of (keys.sections || [])) if (!SKIP.has(sec)) paths.add(sec);
-      const arr = (list, pfx) => (list || []).forEach(k => paths.add(pfx + "." + k));
+      const skipEl = keys.non_bindable_element
+        || { samplers: ["stage", "role", "label"], loras: ["loader", "role"] };
+      const arr = (list, pfx) => (list || []).forEach(k => { if (!(skipEl[pfx] || []).includes(k)) paths.add(pfx + "." + k); });
       arr(keys.sampler_keys, "samplers"); arr(keys.lora_keys, "loras"); arr(keys.controlnet_keys, "controlnet");
       arr(keys.adetailer_keys, "adetailer"); arr(keys.upscaling_keys, "upscaling"); arr(keys.interpolation_keys, "interpolation");
       arr(keys.mmaudio_keys, "mmaudio"); arr(keys.extra_keys, "extra");
@@ -1108,17 +1551,20 @@ export function renderLayout(content, galleryCtx, closeGS) {
     return [...paths].sort();
   }
 
-  function mkSelect(opts, current, onChange, title) {
+  // labelFor (optional) maps an option value to its display text, so one builder
+  // serves both the style dropdowns and the copy dialog's layout pickers (where
+  // the value is a profile key).
+  function mkSelect(opts, current, onChange, title, labelFor) {
     const sel = document.createElement("select");
     sel.className = "sbg-gs-select--xs";
     if (title) sel.title = title;
-    for (const o of opts) { const opt = document.createElement("option"); opt.value = o; opt.textContent = o; if (o === current) opt.selected = true; sel.appendChild(opt); }
+    for (const o of opts) { const opt = document.createElement("option"); opt.value = o; opt.textContent = labelFor ? labelFor(o) : o; if (o === current) opt.selected = true; sel.appendChild(opt); }
     sel.addEventListener("change", () => onChange(sel.value));
     sel.addEventListener("click", (e) => e.stopPropagation());
     return sel;
   }
 
-  // ── Mock sample data (fetched once per media, cached) ───────────────
+  // Mock sample data (fetched once per media, cached)
   // The live preview should show EVERY section the user configured, even if the
   // first example media lacks (say) upscaling. We therefore merge summaries from
   // many items, borrowing each source's example values from whichever item
@@ -1126,8 +1572,8 @@ export function renderLayout(content, galleryCtx, closeGS) {
   // covered (or we hit a cap).
   const _MOCK_ARR = new Set(["samplers", "loras", "controlnet", "adetailer", "upscaling", "interpolation", "workflow_nodes"]);
   const _MOCK_OBJ = new Set(["mmaudio", "extra"]);
-  // File-info comes from the gallery item / isn't reliably in the summary — don't
-  // let these block "all sources covered".
+  // File-info comes from the gallery item and isn't reliably in the summary, so
+  // don't let these block "all sources covered".
   const _MOCK_FILE_INFO = new Set(["filename", "path", "filesize", "size", "resolution", "modified",
     "duration", "codec", "fps", "total_frames", "width", "height"]);
 
@@ -1153,7 +1599,11 @@ export function renderLayout(content, galleryCtx, closeGS) {
     const pool = items.filter(it => (it.kind === "video") === wantVideo);
     if (!pool.length) { mockByMedia[activeMedia] = {}; return; }
 
-    const MAX_FETCH = 60;
+    // Sample size for example values. These fire as one parallel burst the
+    // moment the Layout tab opens, and the preview paints at 12 examples, so
+    // a larger pool mostly buys example coverage for rarely used sections at
+    // the cost of a slower first paint over remote connections.
+    const MAX_FETCH = 12;
     const sample = pool.slice(0, MAX_FETCH);
     const need = neededSources();
     const merged = {};
@@ -1174,9 +1624,8 @@ export function renderLayout(content, galleryCtx, closeGS) {
       mockByMedia[activeMedia] = merged;
       refreshPreview(); renderEditor();
     };
-    // Late fetches keep enriching `merged` in place after the first render. Repaint
-    // (debounced) as they land so fields backed by later-resolved items fill in on
-    // their own — previously they stayed blank until an unrelated edit re-rendered.
+    // Late fetches keep enriching `merged` in place after the first render;
+    // repaint (debounced) as they land so later-resolved fields fill in.
     let _previewTimer = null;
     const scheduleRefresh = () => {
       clearTimeout(_previewTimer);
@@ -1208,7 +1657,7 @@ export function renderLayout(content, galleryCtx, closeGS) {
     setTimeout(finish, 2500);
   }
 
-  // ── Boot ────────────────────────────────────────────────────────────
+  // Boot
   // First open this session: expand the first editable section so the editor
   // isn't a wall of collapsed rows. Reopens keep the remembered view instead.
   if (_viewMemory.fresh) {

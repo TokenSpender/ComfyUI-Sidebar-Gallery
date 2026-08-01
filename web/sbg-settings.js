@@ -1,5 +1,5 @@
 /**
- * sbg-settings.js \u2014 Gallery Settings overlay
+ * sbg-settings.js: Gallery Settings overlay
  *
  * Contains the full settings panel: Layout Editor, Appearance,
  * Keybindings, Settings, Presets, and Diagnostics tabs.
@@ -11,13 +11,36 @@ import {
   parseColor, formatColor, formatRgba, checkerBg,
   _metaCache, _metaCacheAPI, _resetIdb,
   _thumbCacheAPI, _thumbMemCache, resetFailedThumbs,
-  _sectionOrderKey, S, APP_REGISTRY,
+  S, APP_REGISTRY,
   progressPoller, formatProgress,
 } from "./sbg-core.js";
 
 import { renderLayout, clearSwatchCache } from "./sbg-layout-editor.js";
 import { createColorPicker } from "./sbg-color-picker.js";
 import { replaceElementColor } from "./sbg-translation-layer.js";
+import { itemKey } from "./sbg-compare-utils.js";
+
+/**
+ * Keybinding capture and apply for presets, kept as one pair so the two halves
+ * cannot drift apart. An untouched binding is stored as null, and apply treats
+ * null and "" alike as "not set here": a stored "" parses to zero chunks and
+ * matches no key, so honouring it would silently disable every action the
+ * preset author left alone, Escape included. Older presets and the shipped
+ * themes hold "" for untouched bindings, so the empty check protects them.
+ */
+export function _capturePresetKeys() {
+  const keys = {};
+  for (const [k, id] of Object.entries(S)) {
+    if (k.startsWith("KEY_")) keys[id] = getSetting(id, null);
+  }
+  return keys;
+}
+
+export function _applyPresetKeys(keys) {
+  for (const [id, val] of Object.entries(keys || {})) {
+    if (val !== null && val !== "") saveSetting(id, val);
+  }
+}
 
 /**
  * Open the Gallery Settings panel.
@@ -72,11 +95,6 @@ function _gsKey(e) { if (e.key === "Escape") closeGS(); }
 gsClose.addEventListener("click", closeGS);
 gsOverlay.addEventListener("click", (e) => { if (e.target === gsOverlay) closeGS(); });
 document.addEventListener("keydown", _gsKey);
-
-// Helper: read a setting from the single source of truth (disk-backed cache).
-function _readSetting(id, fallback) {
-  return getSetting(id, fallback);
-}
 
 // Cache sizes: placeholder when empty, otherwise the shared byte formatter.
 function _fmtCacheSize(bytes) {
@@ -164,7 +182,7 @@ function _writeSetting(id, value) {
   saveSetting(id, value);
 }
 
-// ── Helper: make a setting row ──
+// Helper: make a setting row
 function _settingRow(label, input, tooltip) {
   const row = h("div", { class: "sbg-gs-row", title: tooltip || "" });
   row.appendChild(h("label", { class: "sbg-gs-label", text: label }));
@@ -173,7 +191,7 @@ function _settingRow(label, input, tooltip) {
 }
 
 function _toggle(id, fallback, label, tooltip) {
-  const val = _readSetting(id, fallback);
+  const val = getSetting(id, fallback);
   const cb = h("input", { type: "checkbox" });
   cb.checked = !!val;
   cb.addEventListener("change", () => _writeSetting(id, cb.checked));
@@ -181,26 +199,43 @@ function _toggle(id, fallback, label, tooltip) {
 }
 
 function _textInput(id, fallback, label, tooltip) {
-  const val = _readSetting(id, fallback);
+  const val = getSetting(id, fallback);
   const inp = h("input", { type: "text", class: "sbg-gs-input", value: String(val || "") });
   inp.addEventListener("change", () => _writeSetting(id, inp.value));
   return _settingRow(label, inp, tooltip);
 }
 
+// Resolve the live accent to a concrete rgb() string, read the same way the CSS
+// resolves it: through a hidden probe on the gallery root. The accent is declared as
+// var(--p-primary-color, ...), so reading the property value directly returns that
+// unresolved var() text. Falls back to the historic accent when the root is absent.
+function _resolveAccent() {
+  const root = document.querySelector(".sbg-root");
+  if (!root) return "#7c6aef";
+  const probe = h("span", { style: "display:none;color:var(--sbg-accent,#7c6aef)" });
+  root.appendChild(probe);
+  const c = getComputedStyle(probe).color;
+  probe.remove();
+  return c || "#7c6aef";
+}
+
 function _colorInput(id, fallback, label, tooltip, callback, replaceChannel) {
-  const val = _readSetting(id, fallback);
+  const val = getSetting(id, fallback);
   const wrap = h("div", { class: "sbg-gs-color-wrap", style: "position:relative" });
 
-  // displayColor: the canonical CSS colour (hex when opaque, rgba when translucent).
-  // Unparseable values (e.g. "var(--sbg-accent)") are stored verbatim.
-  let displayColor = val || fallback || "#7c6aef";
+  // displayColor: what the swatch, text field and picker show. Stored colours are
+  // always rgba, and older saved hex still parses. When nothing is stored and no
+  // fallback is given (the lightbox buttons, which mean "follow the accent"), show
+  // the live accent so the swatch and picker match the button. Unparseable values
+  // such as "var(--sbg-accent)" are shown verbatim.
+  let displayColor = val || fallback || _resolveAccent();
   // The text field always reads as rgba(...), matching the colour picker, even
-  // at full opacity. The stored/applied value (displayColor) stays canonical.
+  // at full opacity.
   const _toRgba = (c) => { const pc = parseColor(c); return pc ? formatRgba(pc.r, pc.g, pc.b, pc.a) : c; };
 
   // Pill colour rows only: debounced find-and-replace of matching per-element pill
   // colours. The baseline is the colour before the current edit burst, so dragging
-  // the picker (which fires applyColor continuously) commits one old->new replace at
+  // the picker (which fires applyColor continuously) commits one old-to-new replace at
   // the end rather than chasing every intermediate value.
   let _replBaseline = displayColor, _replTimer = null;
 
@@ -221,7 +256,7 @@ function _colorInput(id, fallback, label, tooltip, callback, replaceChannel) {
     }
   }
 
-  // ── Clickable swatch (shows transparency over a checkerboard) ──
+  // Clickable swatch (shows transparency over a checkerboard)
   const swatch = h("div", {
     class: "sbg-color-swatch",
     style: "width:28px;height:28px;border-radius:6px;border:2px solid var(--sbg-border);cursor:pointer;flex-shrink:0;transition:box-shadow 0.15s;"
@@ -230,7 +265,7 @@ function _colorInput(id, fallback, label, tooltip, callback, replaceChannel) {
   swatch.addEventListener("mouseenter", () => { swatch.style.boxShadow = "0 0 0 2px var(--sbg-accent)"; });
   swatch.addEventListener("mouseleave", () => { swatch.style.boxShadow = ""; });
 
-  // ── Colour text input (accepts hex or rgba) ──
+  // Colour text input (accepts hex or rgba)
   const text = h("input", { type: "text", class: "sbg-gs-input sbg-gs-input--sm", value: _toRgba(displayColor) });
   text.addEventListener("change", () => {
     const v = text.value.trim();
@@ -239,7 +274,7 @@ function _colorInput(id, fallback, label, tooltip, callback, replaceChannel) {
     else { displayColor = v; swatch.style.background = checkerBg(v); _writeSetting(id, v); if (callback) callback(v); }
   });
 
-  // ── Popover hosting the shared colour picker (created lazily on first open) ──
+  // Popover hosting the shared colour picker (created lazily on first open)
   const panel = h("div", { class: "sbg-color-panel", style: "display:none;position:fixed;z-index:9999;background:var(--sbg-surface,#1e1e1e);border:1px solid var(--sbg-border);border-radius:10px;padding:12px;box-shadow:0 12px 40px rgba(0,0,0,0.6);width:max-content;min-width:220px;" });
   let picker = null;
   function ensurePicker() {
@@ -260,7 +295,7 @@ function _colorInput(id, fallback, label, tooltip, callback, replaceChannel) {
     panel.style.top = top + "px";
   }
 
-  // ── Toggle popover ──
+  // Toggle popover
   swatch.addEventListener("click", (e) => {
     e.stopPropagation();
     const isOpen = panel.style.display !== "none";
@@ -289,7 +324,7 @@ function _colorInput(id, fallback, label, tooltip, callback, replaceChannel) {
 }
 
 function _comboInput(id, fallback, options, label, tooltip, callback) {
-  const val = _readSetting(id, fallback);
+  const val = getSetting(id, fallback);
   const sel = h("select", { class: "sbg-gs-select" }, options.map(o => h("option", { value: o, text: o })));
   sel.value = val;
   sel.addEventListener("change", () => { _writeSetting(id, sel.value); if (callback) callback(sel.value); });
@@ -297,16 +332,16 @@ function _comboInput(id, fallback, options, label, tooltip, callback) {
 }
 
 function _numberInput(id, fallback, label, tooltip) {
-  const val = _readSetting(id, fallback);
+  const val = getSetting(id, fallback);
   const inp = h("input", { type: "number", class: "sbg-gs-input sbg-gs-input--sm", value: String(val || fallback) });
   inp.addEventListener("change", () => _writeSetting(id, Number(inp.value)));
   return _settingRow(label, inp, tooltip);
 }
 
-// ── Tab Renderers ──
+// Tab Renderers
 
 
-/* ── Layout Editor (extracted to sbg-layout-editor.js) ── */
+/* Layout Editor (extracted to sbg-layout-editor.js) */
 
 
 
@@ -333,21 +368,21 @@ function renderAppearance() {
   }
 
   // HIGH Badge with live preview
-  const highBadge = _badgePreview("HIGH", _readSetting(S.BADGE_HIGH_COLOR, "#f87171") || "#f87171");
+  const highBadge = _badgePreview("HIGH", getSetting(S.BADGE_HIGH_COLOR, "#f87171") || "#f87171");
   const highRow = _colorInput(S.BADGE_HIGH_COLOR, "#f87171", "", "Color for HIGH/base KSampler and model badges", (c) => { highBadge.style.background = c; });
   const highLabel = highRow.querySelector(".sbg-gs-label");
   if (highLabel) { highLabel.innerHTML = ""; highLabel.appendChild(highBadge); highLabel.appendChild(document.createTextNode(" Badge")); }
   wrap.appendChild(highRow);
 
   // LOW Badge with live preview
-  const lowBadge = _badgePreview("LOW", _readSetting(S.BADGE_LOW_COLOR, "#60a5fa") || "#60a5fa");
+  const lowBadge = _badgePreview("LOW", getSetting(S.BADGE_LOW_COLOR, "#60a5fa") || "#60a5fa");
   const lowRow = _colorInput(S.BADGE_LOW_COLOR, "#60a5fa", "", "Color for LOW/refine KSampler and model badges", (c) => { lowBadge.style.background = c; });
   const lowLabel = lowRow.querySelector(".sbg-gs-label");
   if (lowLabel) { lowLabel.innerHTML = ""; lowLabel.appendChild(lowBadge); lowLabel.appendChild(document.createTextNode(" Badge")); }
   wrap.appendChild(lowRow);
 
   // Video Badge with live preview
-  const vidBadge = _badgePreview("MP4", _readSetting(S.VIDEO_BADGE_COLOR, "#facc15") || "#facc15");
+  const vidBadge = _badgePreview("MP4", getSetting(S.VIDEO_BADGE_COLOR, "#facc15") || "#facc15");
   vidBadge.style.color = "#000";
   const vidRow = _colorInput(S.VIDEO_BADGE_COLOR, "#facc15", "", "Color for the format badge on video thumbnails", (c) => { vidBadge.style.background = c; });
   const vidLabel = vidRow.querySelector(".sbg-gs-label");
@@ -355,14 +390,14 @@ function renderAppearance() {
   wrap.appendChild(vidRow);
 
   // Search Tag Badge with live preview
-  const searchBadge = _badgePreview("search", _readSetting(S.SEARCH_TAG_COLOR, "#6495ed") || "#6495ed");
+  const searchBadge = _badgePreview("search", getSetting(S.SEARCH_TAG_COLOR, "#6495ed") || "#6495ed");
   const searchRow = _colorInput(S.SEARCH_TAG_COLOR, "#6495ed", "", "Color for search tag badges in the search bar", (c) => { searchBadge.style.background = c; });
   const searchLabel = searchRow.querySelector(".sbg-gs-label");
   if (searchLabel) { searchLabel.innerHTML = ""; searchLabel.appendChild(searchBadge); searchLabel.appendChild(document.createTextNode(" Search Badge")); }
   wrap.appendChild(searchRow);
 
   // Negative Search Tag Badge with live preview
-  const negBadge = _badgePreview("−exclude", _readSetting(S.SEARCH_TAG_NEG_COLOR, "#ef4444") || "#ef4444");
+  const negBadge = _badgePreview("−exclude", getSetting(S.SEARCH_TAG_NEG_COLOR, "#ef4444") || "#ef4444");
   const negRow = _colorInput(S.SEARCH_TAG_NEG_COLOR, "#ef4444", "", "Color for negative/exclude search tag badges", (c) => { negBadge.style.background = c; });
   const negLabel = negRow.querySelector(".sbg-gs-label");
   if (negLabel) { negLabel.innerHTML = ""; negLabel.appendChild(negBadge); negLabel.appendChild(document.createTextNode(" Exclude Badge")); }
@@ -383,7 +418,7 @@ function renderAppearance() {
 
   wrap.appendChild(h("div", { class: "sbg-gs-section-title", text: "Theme", style: "margin-top:16px" }));
 
-  const customWrap = h("div", { class: "sbg-gs-form sbg-gs-custom-theme", style: _readSetting(S.THEME, "comfyui") === "custom" ? "display:block; margin-top:10px; padding:10px; background:rgba(0,0,0,0.15); border-radius:5px; border:1px solid var(--sbg-border)" : "display:none" });
+  const customWrap = h("div", { class: "sbg-gs-form sbg-gs-custom-theme", style: getSetting(S.THEME, "comfyui") === "custom" ? "display:block; margin-top:10px; padding:10px; background:rgba(0,0,0,0.15); border-radius:5px; border:1px solid var(--sbg-border)" : "display:none" });
 
   wrap.appendChild(_comboInput(S.THEME, "comfyui", ["comfyui", "dark", "blue", "midnight", "synthwave", "retro", "custom"], "Gallery Theme", "Color theme for the gallery sidebar", (val) => {
     const rootEl = document.querySelector(".sbg-root");
@@ -392,11 +427,11 @@ function renderAppearance() {
       else rootEl.removeAttribute("data-theme");
 
       if (val === "custom") {
-        rootEl.style.setProperty("--sbg-bg", _readSetting("CUSTOM_BG", "#1a1a1a"));
-        rootEl.style.setProperty("--sbg-surface", _readSetting("CUSTOM_SURFACE", "#222222"));
-        rootEl.style.setProperty("--sbg-border", _readSetting("CUSTOM_BORDER", "#444444"));
-        rootEl.style.setProperty("--sbg-text", _readSetting("CUSTOM_TEXT", "#e0e0e0"));
-        rootEl.style.setProperty("--sbg-accent", _readSetting("CUSTOM_ACCENT", "#7c6aef"));
+        rootEl.style.setProperty("--sbg-bg", getSetting("CUSTOM_BG", "#1a1a1a"));
+        rootEl.style.setProperty("--sbg-surface", getSetting("CUSTOM_SURFACE", "#222222"));
+        rootEl.style.setProperty("--sbg-border", getSetting("CUSTOM_BORDER", "#444444"));
+        rootEl.style.setProperty("--sbg-text", getSetting("CUSTOM_TEXT", "#e0e0e0"));
+        rootEl.style.setProperty("--sbg-accent", getSetting("CUSTOM_ACCENT", "#7c6aef"));
       } else {
         rootEl.style.removeProperty("--sbg-bg");
         rootEl.style.removeProperty("--sbg-surface");
@@ -409,7 +444,7 @@ function renderAppearance() {
   }));
 
   customWrap.appendChild(h("div", { class: "sbg-gs-desc", text: "Configure your own custom UI colors." }));
-  const applyVar = (v, c) => { if (_readSetting(S.THEME, "comfyui") === "custom") document.querySelector(".sbg-root")?.style.setProperty(v, c); };
+  const applyVar = (v, c) => { if (getSetting(S.THEME, "comfyui") === "custom") document.querySelector(".sbg-root")?.style.setProperty(v, c); };
   customWrap.appendChild(_colorInput("CUSTOM_BG", "#1a1a1a", "Background", "Base background color", (c) => applyVar("--sbg-bg", c)));
   customWrap.appendChild(_colorInput("CUSTOM_SURFACE", "#222222", "Surface", "Surface background color", (c) => applyVar("--sbg-surface", c)));
   customWrap.appendChild(_colorInput("CUSTOM_BORDER", "#444444", "Border elements", "Borders and dividers", (c) => applyVar("--sbg-border", c)));
@@ -425,28 +460,28 @@ function renderAppearance() {
     return h("span", { text, style: `display:inline-block;padding:3px 8px;border-radius:6px;font-size:10px;font-weight:500;color:#fff;background:${color || "var(--sbg-accent,#7c6aef)"};cursor:default;` });
   }
 
-  const dlColor = _readSetting(S.LB_COLOR_DOWNLOAD, "") || "var(--sbg-accent,#7c6aef)";
+  const dlColor = getSetting(S.LB_COLOR_DOWNLOAD, "") || "var(--sbg-accent,#7c6aef)";
   const dlBtn = _btnPreview("Download", dlColor);
   const dlRow = _colorInput(S.LB_COLOR_DOWNLOAD, "", "", "Background color for download button", (c) => { dlBtn.style.background = c || "var(--sbg-accent,#7c6aef)"; });
   const dlLabel = dlRow.querySelector(".sbg-gs-label");
   if (dlLabel) { dlLabel.innerHTML = ""; dlLabel.appendChild(dlBtn); }
   wrap.appendChild(dlRow);
 
-  const cpColor = _readSetting(S.LB_COLOR_COPY_PROMPT, "") || "var(--sbg-accent,#7c6aef)";
+  const cpColor = getSetting(S.LB_COLOR_COPY_PROMPT, "") || "var(--sbg-accent,#7c6aef)";
   const cpBtn = _btnPreview("Copy Prompt", cpColor);
   const cpRow = _colorInput(S.LB_COLOR_COPY_PROMPT, "", "", "Background color for copy prompt button", (c) => { cpBtn.style.background = c || "var(--sbg-accent,#7c6aef)"; });
   const cpLabel = cpRow.querySelector(".sbg-gs-label");
   if (cpLabel) { cpLabel.innerHTML = ""; cpLabel.appendChild(cpBtn); }
   wrap.appendChild(cpRow);
 
-  const cwColor = _readSetting(S.LB_COLOR_COPY_WF, "") || "var(--sbg-accent,#7c6aef)";
+  const cwColor = getSetting(S.LB_COLOR_COPY_WF, "") || "var(--sbg-accent,#7c6aef)";
   const cwBtn = _btnPreview("Copy WF", cwColor);
   const cwRow = _colorInput(S.LB_COLOR_COPY_WF, "", "", "Background color for copy workflow button", (c) => { cwBtn.style.background = c || "var(--sbg-accent,#7c6aef)"; });
   const cwLabel = cwRow.querySelector(".sbg-gs-label");
   if (cwLabel) { cwLabel.innerHTML = ""; cwLabel.appendChild(cwBtn); }
   wrap.appendChild(cwRow);
 
-  const lwColor = _readSetting(S.LB_COLOR_LOAD_WF, "") || "var(--sbg-accent,#7c6aef)";
+  const lwColor = getSetting(S.LB_COLOR_LOAD_WF, "") || "var(--sbg-accent,#7c6aef)";
   const lwBtn = _btnPreview("Load Workflow", lwColor);
   const lwRow = _colorInput(S.LB_COLOR_LOAD_WF, "", "", "Background color for load workflow button", (c) => { lwBtn.style.background = c || "var(--sbg-accent,#7c6aef)"; });
   const lwLabel = lwRow.querySelector(".sbg-gs-label");
@@ -463,7 +498,7 @@ function renderAppearance() {
     { key: a.settingKey, label: a.label, default: a.defaultColor, cssVar: a.cssVar }));
 
   for (const ab of _appBadges) {
-    const badgeEl = _badgePreview(ab.label, _readSetting(ab.key, "") || ab.default);
+    const badgeEl = _badgePreview(ab.label, getSetting(ab.key, "") || ab.default);
     const row = _colorInput(ab.key, ab.default, "", `Color for ${ab.label} source badge`, (c) => {
       const color = c || ab.default;
       badgeEl.style.background = color;
@@ -472,14 +507,14 @@ function renderAppearance() {
     const label = row.querySelector(".sbg-gs-label");
     if (label) { label.innerHTML = ""; label.appendChild(badgeEl); }
     // Apply initial CSS custom property
-    const saved = _readSetting(ab.key, "");
+    const saved = getSetting(ab.key, "");
     if (saved) document.documentElement.style.setProperty(ab.cssVar, saved);
     wrap.appendChild(row);
   }
 
   // Initial Image Tab Color
   wrap.appendChild(h("div", { class: "sbg-gs-section-title", text: "Initial Image Tab", style: "margin-top:16px" }));
-  const initTabBadge = _badgePreview("Initial Image", _readSetting(S.INITIAL_IMAGE_TAB_COLOR, "") || "#94a3b8");
+  const initTabBadge = _badgePreview("Initial Image", getSetting(S.INITIAL_IMAGE_TAB_COLOR, "") || "#94a3b8");
   const initTabRow = _colorInput(S.INITIAL_IMAGE_TAB_COLOR, "#94a3b8", "", "Color for the Initial Image tab button in the lightbox metadata panel", (c) => {
     initTabBadge.style.background = c || "#94a3b8";
   });
@@ -487,12 +522,12 @@ function renderAppearance() {
   if (initTabLabel) { initTabLabel.innerHTML = ""; initTabLabel.appendChild(initTabBadge); }
   wrap.appendChild(initTabRow);
 
-  // Pill/Badge Colors
-  wrap.appendChild(h("div", { class: "sbg-gs-section-title", text: "Pill / Badge Colors", style: "margin-top:16px" }));
-  wrap.appendChild(h("div", { class: "sbg-gs-desc", text: "Customize the color of metadata pills and badges. Leave empty for defaults." }));
-  const pillPreview = _badgePreview("Example Pill", _readSetting(S.PILL_BG_COLOR, "") || "rgba(255,255,255,0.06)");
-  pillPreview.style.color = _readSetting(S.PILL_TEXT_COLOR, "") || "rgba(255,255,255,0.8)";
-  pillPreview.style.border = `1px solid ${_readSetting(S.PILL_BORDER_COLOR, "") || "rgba(255,255,255,0.08)"}`;
+  // Default pill colours
+  wrap.appendChild(h("div", { class: "sbg-gs-section-title", text: "Default Pill Colors", style: "margin-top:16px" }));
+  wrap.appendChild(h("div", { class: "sbg-gs-desc", text: "The default background, text and border for values shown as pills, used for any field you have not given its own colour. Leave a box empty for the theme default." }));
+  const pillPreview = _badgePreview("Example Pill", getSetting(S.PILL_BG_COLOR, "") || "rgba(255,255,255,0.06)");
+  pillPreview.style.color = getSetting(S.PILL_TEXT_COLOR, "") || "rgba(255,255,255,0.8)";
+  pillPreview.style.border = `1px solid ${getSetting(S.PILL_BORDER_COLOR, "") || "rgba(255,255,255,0.08)"}`;
   const pillBgRow = _colorInput(S.PILL_BG_COLOR, "rgba(255,255,255,0.06)", "Background", "Pill background color", (c) => {
     pillPreview.style.background = c || "rgba(255,255,255,0.06)";
     if (c) document.documentElement.style.setProperty("--sbg-pill-bg", c);
@@ -523,10 +558,10 @@ function renderKeybindings() {
   content.innerHTML = "";
   const wrap = h("div", { class: "sbg-gs-form" });
   wrap.appendChild(h("div", { class: "sbg-gs-section-title", text: "Keyboard Shortcuts" }));
-  wrap.appendChild(h("div", { class: "sbg-gs-desc", text: "Comma-separated key names. Example: ArrowLeft,a" }));
-  wrap.appendChild(_textInput(S.KEY_PREV, "ArrowLeft,a", "Previous Image", "Keys for previous image in lightbox"));
-  wrap.appendChild(_textInput(S.KEY_NEXT, "ArrowRight,d", "Next Image", "Keys for next image in lightbox"));
-  wrap.appendChild(_textInput(S.KEY_CLOSE, "Escape", "Close Lightbox", "Key to close lightbox"));
+  wrap.appendChild(h("div", { class: "sbg-gs-desc", text: "Comma-separated key names. Example: ArrowLeft,a. Combos join modifiers with a plus sign, like Shift+ArrowLeft or Ctrl+d. Mouse buttons can be named too: MiddleClick, Mouse4, Mouse5. The comma key is written Comma and the plus key Plus." }));
+  wrap.appendChild(_textInput(S.KEY_PREV, "ArrowLeft,a,j", "Previous Image", "Keys for previous image in lightbox"));
+  wrap.appendChild(_textInput(S.KEY_NEXT, "ArrowRight,d,l", "Next Image", "Keys for next image in lightbox"));
+  wrap.appendChild(_textInput(S.KEY_CLOSE, "Escape,q,z,0", "Close Lightbox", "Keys to close lightbox"));
   wrap.appendChild(_textInput(S.KEY_TOGGLE, "z,0", "Toggle Gallery", "Keys to open/close the gallery sidebar"));
   wrap.appendChild(_textInput(S.KEY_REFRESH, "", "Refresh Gallery", "Key to refresh gallery (leave empty to disable)"));
 
@@ -536,6 +571,20 @@ function renderKeybindings() {
   wrap.appendChild(_textInput(S.KEY_COPY_PROMPT, "", "Copy Prompt", "Copy positive prompt (leave empty to disable)"));
   wrap.appendChild(_textInput(S.KEY_COPY_WF, "", "Copy Workflow", "Copy workflow JSON (leave empty to disable)"));
   wrap.appendChild(_textInput(S.KEY_LOAD_WF, "", "Load Workflow", "Load workflow into ComfyUI (leave empty to disable)"));
+  wrap.appendChild(_textInput(S.KEY_COMPARE, "c", "Compare Mode", "Toggle compare mode in lightbox"));
+  wrap.appendChild(_textInput(S.KEY_RESET_ZOOM, "MiddleClick,r", "Reset Zoom", "Return the image to fit. In independent compare zoom this targets the pane under the cursor, then the leftmost zoomed pane."));
+  wrap.appendChild(_textInput(S.KEY_ZOOM_IN, "=,+", "Zoom In", "Zoom in one step per press; hold to keep zooming. Follows the Zoom Sensitivity and Zoom Direction settings."));
+  wrap.appendChild(_textInput(S.KEY_ZOOM_OUT, "-", "Zoom Out", "Zoom out one step per press; hold to keep zooming."));
+
+  wrap.appendChild(h("div", { class: "sbg-gs-section-title", text: "Video", style: "margin-top:16px" }));
+  wrap.appendChild(_textInput(S.KEY_MUTE, "m", "Mute", "Mute or unmute the current video"));
+  wrap.appendChild(_textInput(S.KEY_FRAME_PREV, "Comma", "Frame Back", "Pause the video and step one frame back"));
+  wrap.appendChild(_textInput(S.KEY_FRAME_NEXT, ".", "Frame Forward", "Pause the video and step one frame forward"));
+
+  wrap.appendChild(h("div", { class: "sbg-gs-section-title", text: "Compare Mode", style: "margin-top:16px" }));
+  wrap.appendChild(h("div", { class: "sbg-gs-desc", text: "Plain navigation keys change the compared image on the right. These change the current image on the left." }));
+  wrap.appendChild(_textInput(S.KEY_CMP_CUR_PREV, "Shift+ArrowLeft,Shift+a", "Current Image Previous", "Previous current image while compare mode is open"));
+  wrap.appendChild(_textInput(S.KEY_CMP_CUR_NEXT, "Shift+ArrowRight,Shift+d", "Current Image Next", "Next current image while compare mode is open"));
 
   wrap.appendChild(h("div", { class: "sbg-gs-desc", text: "Note: Arrows seek video in fullscreen. A/D always navigate." }));
   content.appendChild(wrap);
@@ -552,7 +601,7 @@ function renderSettings() {
   // Normalize a legacy stored sort value so the combo shows the right selection.
   {
     const _sortAlias = { newest: "created_desc", oldest: "created_asc" };
-    const _cur = _readSetting(S.SORT, "created_desc");
+    const _cur = getSetting(S.SORT, "created_desc");
     if (_sortAlias[_cur]) _writeSetting(S.SORT, _sortAlias[_cur]);
   }
   wrap.appendChild(_comboInput(S.SORT, "created_desc",
@@ -574,8 +623,8 @@ function renderSettings() {
   }
   const _loadCfg = () => fetch("/sidebar_gallery/config").then(r => r.json());
 
-  // Auto-refresh interval is server config (auto_refresh_interval_s), not a
-  // localStorage setting, so it POSTs to /config instead of using _numberInput.
+  // Auto-refresh interval lives in server config (auto_refresh_interval_s)
+  // rather than localStorage, so it POSTs to /config instead of using _numberInput.
   // The server clamps to 0 or >=5s; the input and toast echo the effective
   // value from the response.
   {
@@ -618,6 +667,19 @@ function renderSettings() {
   wrap.appendChild(_toggle(S.LB_SHOW_COPY_WF, true, "Copy WF Button", "Show copy workflow button in lightbox"));
   wrap.appendChild(_toggle(S.LB_SHOW_LOAD_WF, true, "Load Workflow Button", "Show load workflow button in lightbox"));
 
+  wrap.appendChild(h("div", { class: "sbg-gs-section-title", text: "Lightbox Zoom", style: "margin-top:16px" }));
+  wrap.appendChild(h("div", { class: "sbg-gs-desc", text: "Zoom and pan on the image or video in the lightbox. Pinch always zooms; drag pans when zoomed in." }));
+  wrap.appendChild(_comboInput(S.LB_ZOOM_SCROLL_MODE, "mouse", ["mouse", "touchpad", "auto"], "Scroll Input",
+    "What plain scrolling over the image does. Mouse: scroll zooms. Touchpad: two-finger scroll pans when zoomed (pinch always zooms). Auto: detect the device from the scroll events."));
+  wrap.appendChild(_comboInput(S.LB_ZOOM_ANCHOR, "cursor", ["cursor", "center"], "Zoom Direction",
+    "Zoom toward the mouse cursor or toward the center of the view."));
+  wrap.appendChild(_numberInput(S.LB_ZOOM_SENSITIVITY, 1, "Zoom Sensitivity",
+    "Zoom speed multiplier, 0.1 to 5. 1 = default; higher zooms faster per scroll."));
+  wrap.appendChild(_comboInput(S.LB_COMPARE_ZOOM, "independent", ["independent", "synced"], "Compare Zoom",
+    "In compare mode: zoom/pan only the side under the cursor, or keep both sides at the same zoom and relative position."));
+  wrap.appendChild(_toggle(S.LB_ZOOM_KEEP_ON_NAV, false, "Keep Zoom While Browsing",
+    "Keep the current zoom level and position when moving to the next or previous image or video. Off: every navigation resets to fit-to-screen."));
+
   wrap.appendChild(h("div", { class: "sbg-gs-section-title", text: "Metadata", style: "margin-top:16px" }));
   wrap.appendChild(_comboInput(S.PROMPT_VIEW, "remember", ["enhanced", "initial", "remember"], "Default Tab View", "Which tab opens first in tabbed sections. For prompt sections this picks Enhanced or Original; 'Remember' keeps your last-opened tab on every tabbed section."));
   wrap.appendChild(_comboInput(S.PROMPT_PADDING, "6", ["0", "1", "2", "3", "4", "5", "6", "8", "10", "12"], "Prompt Padding", "Horizontal padding inside prompt text boxes (in px); top/bottom run 2px tighter.", (v) => {
@@ -627,7 +689,7 @@ function renderSettings() {
   wrap.appendChild(_comboInput(S.MODEL_NAME_STYLE, "basename", ["basename", "relpath"], "Model Display", "Show model and LoRA names as just the filename (basename) or the full relative path."));
   wrap.appendChild(_toggle(S.META_TAB_PERSIST, false, "Remember Metadata Tab", "Keep the active metadata tab (Generated/Initial Image) when navigating between images."));
 
-  // ── Folders: extra media roots shown in the folder picker and indexed ──
+  // Folders: extra media roots shown in the folder picker and indexed
   wrap.appendChild(h("div", { class: "sbg-gs-section-title", text: "Folders", style: "margin-top:16px" }));
   wrap.appendChild(h("div", { class: "sbg-gs-desc", text: "Extra folders to browse and index alongside ComfyUI's output folder. Paths are on the machine running ComfyUI." }));
   const foldersList = h("div", {});
@@ -684,9 +746,9 @@ function renderSettings() {
     foldersList.appendChild(addWrap);
   }
 
-  // ── Excluded folders: names skipped while scanning (+ optional hidden-folder skip) ──
+  // Excluded folders: names skipped while scanning (+ optional hidden-folder skip)
   wrap.appendChild(h("div", { class: "sbg-gs-section-title", text: "Excluded folders", style: "margin-top:16px" }));
-  wrap.appendChild(h("div", { class: "sbg-gs-desc", text: "Folder names to skip while scanning (e.g. thumbnails, backup). Matching is by folder name, not full path, and is not case-sensitive. Changes take effect on the next scan." }));
+  wrap.appendChild(h("div", { class: "sbg-gs-desc", text: "Folder names to skip while scanning (e.g. thumbnails, backup). Matching is by folder name rather than full path, and ignores case. Changes take effect on the next scan." }));
   const excludedList = h("div", {});
   wrap.appendChild(excludedList);
 
@@ -813,18 +875,14 @@ function renderPresets() {
     if (!name) { showToast("Enter a preset name"); return; }
     const preset = { name, created: Date.now() };
     if (incLayout.checked) {
-      // Active layout system: the per-app x per-media section profiles
-      // ("SBG.Layouts", translation layer).
+      // The per-app x per-media section profiles ("SBG.Layouts", translation layer).
       preset.layouts = getSetting("SBG.Layouts", null);
-      // Legacy keys captured for back-compat with old installs.
-      try { preset.layout = JSON.parse(localStorage.getItem("SBG.Layout")); } catch { }
-      try { preset.layoutRenames = JSON.parse(localStorage.getItem("SBG.LayoutRenames")); } catch { }
     }
     if (incColors.checked) {
       preset.colors = {
-        high: _readSetting(S.BADGE_HIGH_COLOR, "#f87171"),
-        low: _readSetting(S.BADGE_LOW_COLOR, "#60a5fa"),
-        video: _readSetting(S.VIDEO_BADGE_COLOR, "#facc15"),
+        high: getSetting(S.BADGE_HIGH_COLOR, "#f87171"),
+        low: getSetting(S.BADGE_LOW_COLOR, "#60a5fa"),
+        video: getSetting(S.VIDEO_BADGE_COLOR, "#facc15"),
         highlight: localStorage.getItem("SBG.GS.HighlightBg") || "",
       };
     }
@@ -832,15 +890,10 @@ function renderPresets() {
       preset.settings = {};
       for (const [k, id] of Object.entries(S)) {
         if (k.startsWith("KEY_")) continue; // keybindings saved separately
-        preset.settings[id] = _readSetting(id, null);
+        preset.settings[id] = getSetting(id, null);
       }
     }
-    if (incKeys.checked) {
-      preset.keys = {};
-      for (const [k, id] of Object.entries(S)) {
-        if (k.startsWith("KEY_")) preset.keys[id] = _readSetting(id, "");
-      }
-    }
+    if (incKeys.checked) preset.keys = _capturePresetKeys();
     presets = presets.filter(p => p.name !== name);
     presets.unshift(preset);
     localStorage.setItem(PRESETS_KEY, JSON.stringify(presets));
@@ -866,16 +919,10 @@ function renderPresets() {
           setTimeout(() => { loadConfirm = false; loadBtn.textContent = "Load"; loadBtn.style.background = ""; }, 2000);
           return;
         }
-        // Active layout system (per-app/per-media profiles)
         if (p.layouts) {
           saveSetting("SBG.Layouts", p.layouts);
           document.dispatchEvent(new CustomEvent("sbg-layout-changed"));
         }
-        // Legacy keys (older preset files)
-        if (p.sectionOrder) localStorage.setItem(_sectionOrderKey, JSON.stringify(p.sectionOrder));
-        if (p.layout) localStorage.setItem("SBG.Layout", JSON.stringify(p.layout));
-        if (p.layoutRenames) localStorage.setItem("SBG.LayoutRenames", JSON.stringify(p.layoutRenames));
-        if (p.hiddenSections) localStorage.setItem("SBG.GS.HiddenSections", JSON.stringify(p.hiddenSections));
         if (p.colors) {
           _writeSetting(S.BADGE_HIGH_COLOR, p.colors.high);
           _writeSetting(S.BADGE_LOW_COLOR, p.colors.low);
@@ -888,7 +935,7 @@ function renderPresets() {
           }
         }
         if (p.keys) {
-          for (const [id, val] of Object.entries(p.keys)) _writeSetting(id, val);
+          _applyPresetKeys(p.keys);
         }
         showToast(`Preset "${p.name}" loaded. Refresh gallery to apply.`);
       });
@@ -978,10 +1025,6 @@ function renderPresets() {
             saveSetting("SBG.Layouts", p.layouts);
             document.dispatchEvent(new CustomEvent("sbg-layout-changed"));
           }
-          if (p.sectionOrder) localStorage.setItem(_sectionOrderKey, JSON.stringify(p.sectionOrder));
-          if (p.layout) localStorage.setItem("SBG.Layout", JSON.stringify(p.layout));
-          if (p.layoutRenames) localStorage.setItem("SBG.LayoutRenames", JSON.stringify(p.layoutRenames));
-          if (p.hiddenSections) localStorage.setItem("SBG.GS.HiddenSections", JSON.stringify(p.hiddenSections));
           if (p.colors) {
             _writeSetting(S.BADGE_HIGH_COLOR, p.colors.high);
             _writeSetting(S.BADGE_LOW_COLOR, p.colors.low);
@@ -994,7 +1037,7 @@ function renderPresets() {
             }
           }
           if (p.keys) {
-            for (const [id, val] of Object.entries(p.keys)) _writeSetting(id, val);
+            _applyPresetKeys(p.keys);
           }
           showToast(`Server theme "${sp.name}" loaded. Refresh gallery to apply.`);
         } catch (e) { showToast("Error loading theme: " + e.message); }
@@ -1028,18 +1071,14 @@ function renderPresets() {
     if (!name) { showToast("Enter a preset name first"); return; }
     const preset = { name, created: Date.now() };
     if (incLayout.checked) {
-      // Active layout system: the per-app x per-media section profiles
-      // ("SBG.Layouts", translation layer).
+      // The per-app x per-media section profiles ("SBG.Layouts", translation layer).
       preset.layouts = getSetting("SBG.Layouts", null);
-      // Legacy keys captured for back-compat with old installs.
-      try { preset.layout = JSON.parse(localStorage.getItem("SBG.Layout")); } catch { }
-      try { preset.layoutRenames = JSON.parse(localStorage.getItem("SBG.LayoutRenames")); } catch { }
     }
     if (incColors.checked) {
       preset.colors = {
-        high: _readSetting(S.BADGE_HIGH_COLOR, "#f87171"),
-        low: _readSetting(S.BADGE_LOW_COLOR, "#60a5fa"),
-        video: _readSetting(S.VIDEO_BADGE_COLOR, "#facc15"),
+        high: getSetting(S.BADGE_HIGH_COLOR, "#f87171"),
+        low: getSetting(S.BADGE_LOW_COLOR, "#60a5fa"),
+        video: getSetting(S.VIDEO_BADGE_COLOR, "#facc15"),
         highlight: localStorage.getItem("SBG.GS.HighlightBg") || "",
       };
     }
@@ -1047,15 +1086,10 @@ function renderPresets() {
       preset.settings = {};
       for (const [k, id] of Object.entries(S)) {
         if (k.startsWith("KEY_")) continue;
-        preset.settings[id] = _readSetting(id, null);
+        preset.settings[id] = getSetting(id, null);
       }
     }
-    if (incKeys.checked) {
-      preset.keys = {};
-      for (const [k, id] of Object.entries(S)) {
-        if (k.startsWith("KEY_")) preset.keys[id] = _readSetting(id, "");
-      }
-    }
+    if (incKeys.checked) preset.keys = _capturePresetKeys();
     try {
       await fetch("/sidebar_gallery/presets", {
         method: "POST",
@@ -1157,7 +1191,7 @@ function renderDiagnosticsTab() {
       let cached = 0;
       const batch = [];
       for (const it of items) {
-        const key = `${it.root_id}:${it.relpath}`;
+        const key = itemKey(it);
         if (_metaCache.has(key)) { cached++; continue; }
         try {
           const m = await api("/sidebar_gallery/metadata", { root_id: it.root_id, relpath: it.relpath, summary_only: "1" });
@@ -1191,8 +1225,12 @@ function renderDiagnosticsTab() {
       let cached = 0;
       for (const it of items) {
         if (!it.thumb_url) continue;
+        // Already cached: count it and move on. The returned object URL is the
+        // LIVE memory-cache entry that visible cards share; revoking it here
+        // broke every mounted card using it and left the dead URL being served
+        // for the rest of the session.
         const existing = await _thumbCacheAPI.tryGet(it.thumb_url);
-        if (existing) { URL.revokeObjectURL(existing); cached++; continue; }
+        if (existing) { cached++; continue; }
         try {
           await _thumbCacheAPI.getOrFetch(it.thumb_url);
           cached++;
