@@ -5,20 +5,21 @@ This replaces the parser's name-pattern guessing with ComfyUI's own knowledge
 of every installed node: input names/types, output names/types, category.
 
 - NodeRegistry: live mode reads ComfyUI's NODE_CLASS_MAPPINGS in-process;
-  snapshot mode loads the /object_info-shaped JSON written by
-  tools/build_fixtures.py so tests run without ComfyUI. Unknown classes
+  snapshot mode loads an /object_info-shaped JSON snapshot so everything
+  works without a live ComfyUI. Unknown classes
   return None and callers fall back to the legacy name heuristics.
 
 - classify(): structural role of a node (sampler / text_encode / loader /
   lora / image_resize / latent_resize / interpolation / display / switch /
-  zero_conditioning) derived from its I/O types, not its name.
+  zero_conditioning) derived from its I/O types instead of its name.
 
 - resolve_link(): follow a [node_id, slot] reference to a concrete value.
-  A value is only trusted if its producer is a PURE VALUE node — all of its
-  own connected inputs are scalars (recursively). Output slots are matched
-  by their declared names (GetImageSize width/height, mxSlider2D X/Y, JPS
-  width/height from a "WxH" combo string). Runtime-measured values (an
-  IMAGE-fed producer) yield UNRESOLVED, never an unrelated upstream literal.
+  A value is only trusted if its producer is a PURE VALUE node, meaning all
+  of its own connected inputs are scalars (recursively). Output slots are
+  matched by their declared names (GetImageSize width/height, mxSlider2D X/Y,
+  JPS width/height from a "WxH" combo string). Runtime-measured values (an
+  IMAGE-fed producer) always yield UNRESOLVED rather than an unrelated
+  upstream literal.
 """
 from __future__ import annotations
 
@@ -29,12 +30,12 @@ import re
 from typing import Any
 
 # Tensor-ish type names: a node with a CONNECTED input of one of these kinds
-# computes its output at runtime — its value is not in the file.
+# computes its output at runtime, so its value is not in the file.
 _SCALAR_TYPE_NAMES = {"INT", "FLOAT", "STRING", "BOOLEAN", "NUMBER", "COMBO"}
 
 _DIM_STRING_RE = re.compile(r"(\d{2,5})\s*[x×]\s*(\d{2,5})")
 
-# Sentinel: the chain crossed a node we have no signature for — the caller
+# Sentinel: the chain crossed a node we have no signature for, so the caller
 # should fall back to the legacy resolver (which handles unknown packs).
 UNKNOWN = object()
 # Sentinel: provably unresolvable from the file (runtime-measured / ambiguous).
@@ -84,7 +85,7 @@ class NodeRegistry:
         # Only memoize HITS. Caching a miss would pin a class as "unknown" for
         # the whole process, so a node pack installed mid-session (live mode
         # hot-reloads NODE_CLASS_MAPPINGS) would never be picked up. Re-resolving
-        # an unknown class is just a dict miss — cheap, no INPUT_TYPES() call.
+        # an unknown class is just a cheap dict miss with no INPUT_TYPES() call.
         if out is not None:
             self._cache[class_type] = out
         return out
@@ -120,15 +121,16 @@ _live_registry: NodeRegistry | None = None
 
 
 def get_registry() -> NodeRegistry:
-    """The process-wide registry: live inside ComfyUI, snapshot in tests
-    (SBG_OBJECT_INFO_SNAPSHOT env var or tests/fixtures fallback)."""
+    """The process-wide registry: live inside ComfyUI, otherwise a snapshot
+    (named by the SBG_OBJECT_INFO_SNAPSHOT env var, with a local fixture
+    fallback)."""
     global _live_registry
     if _live_registry is not None:
         return _live_registry
     snap = os.environ.get("SBG_OBJECT_INFO_SNAPSHOT")
     if not snap:
         try:
-            import nodes  # noqa: F401 — running inside ComfyUI
+            import nodes  # noqa: F401 (running inside ComfyUI)
             _live_registry = NodeRegistry(None)
             return _live_registry
         except Exception:
@@ -138,7 +140,7 @@ def get_registry() -> NodeRegistry:
     if snap and os.path.isfile(snap):
         _live_registry = NodeRegistry.from_snapshot(snap)
     else:
-        _live_registry = NodeRegistry({})  # nothing known — callers use legacy paths
+        _live_registry = NodeRegistry({})  # nothing known: callers use legacy paths
     return _live_registry
 
 
@@ -146,12 +148,12 @@ def _is_scalar_kind(kind: str) -> bool:
     return kind in _SCALAR_TYPE_NAMES
 
 
-# ── Structural classification ─────────────────────────────────────────
+# Structural classification
 
 _SAMPLER_PARAM_NAMES = {"steps", "cfg", "seed", "noise_seed", "denoise", "sampler_name"}
 
-# Name-only sampler test for UNKNOWN (uninstalled-pack) classes — the single
-# source of truth shared by find_generation_resolution and metadata.py's
+# Name-only sampler test for UNKNOWN (uninstalled-pack) classes. This is the
+# single source of truth shared by find_generation_resolution and metadata.py's
 # extractor so the two can't drift. Excludes selectors, parameter packers and
 # audio/LLM "samplers" that aren't diffusion samplers.
 _NOT_A_SAMPLER_NAME = ("select", "mmaudio", "parameter", "packer",
@@ -174,9 +176,9 @@ def classify(class_type: str, sig: dict | None) -> str | None:
 
     # rgthree Context / Context Big (and similar pipe bundles) carry a CONTEXT
     # object on output slot 0 and expose seed/steps/cfg as PASSTHROUGH fields.
-    # They are carriers, not samplers — classify them as such BEFORE the sampler
-    # test, which would otherwise fire on their LATENT output + seed/steps/cfg
-    # inputs and yield a phantom sampler. resolve_link already treats CONTEXT
+    # They are carriers rather than samplers, and must be classified as such
+    # BEFORE the sampler test, which would otherwise fire on their LATENT output
+    # + seed/steps/cfg inputs and yield a phantom sampler. resolve_link already treats CONTEXT
     # slots as passthrough; this keeps classify() consistent with it.
     out_names = sig["output_names"] or []
     if out_names and str(out_names[0]).upper() == "CONTEXT":
@@ -201,7 +203,9 @@ def classify(class_type: str, sig: dict | None) -> str | None:
         if "UPSCALE_MODEL" in in_types or "upscal" in (sig["category"] or "").lower():
             return "image_resize"
         if {"upscale_method", "scale_method", "scale_by", "scale", "megapixels",
-            "resolution", "longer_edge", "width", "height"} & set(inputs):
+            "resolution", "longer_edge", "width", "height",
+            "generation_width", "generation_height",
+            "target_width", "target_height"} & set(inputs):
             return "image_resize"
     if "LATENT" in out_types and "LATENT" in in_types and (
             {"upscale_method", "scale_by", "width", "height"} & set(inputs)):
@@ -210,8 +214,13 @@ def classify(class_type: str, sig: dict | None) -> str | None:
     tensorish_in = {t for t in in_types if not _is_scalar_kind(t) and t != "*"}
     if not tensorish_in and ({"MODEL", "CLIP", "VAE", "UPSCALE_MODEL", "CONTROL_NET"} & out_types):
         return "loader"
+    # A LoRA loader must have an input that SELECTS a LoRA (lora_name, lora,
+    # or numbered lora_1/lora_01 slots). lora_strength / lora_stack / lora_list
+    # alone must not qualify: IPAdapter FaceID loaders and stack appliers
+    # carry those without being LoRA loaders themselves.
     if "MODEL" in out_types and "MODEL" in in_types and any(
-            k == "lora_name" or k.startswith("lora_") for k in inputs):
+            k in ("lora_name", "lora") or (k.startswith("lora_") and k[5:].isdigit())
+            for k in inputs):
         return "lora"
     if sig["output_node"] and ("STRING" in in_types or "*" in in_types):
         return "display"
@@ -221,7 +230,7 @@ def classify(class_type: str, sig: dict | None) -> str | None:
     return "other"
 
 
-# ── Pure-value link resolution ────────────────────────────────────────
+# Pure-value link resolution
 
 
 def _resolve_context_field(prompt: dict, node_id: str, field_name: str,
@@ -229,7 +238,7 @@ def _resolve_context_field(prompt: dict, node_id: str, field_name: str,
     """Resolve a named field out of an rgthree Context bundle.
 
     The field is set on this Context node directly (an override input) or
-    inherited from the base context it extends — follow base_ctx upward.
+    inherited from the base context it extends (follow base_ctx upward).
     Returns the scalar value, or UNRESOLVED.
     """
     if depth > 12:
@@ -248,8 +257,8 @@ def _resolve_context_field(prompt: dict, node_id: str, field_name: str,
             return resolve_link(prompt, v, registry, depth + 1, visited)
         return v
     # Otherwise inherit from the base context. If the base is produced by a
-    # class the registry doesn't know, return UNKNOWN (not UNRESOLVED) so the
-    # caller falls back to the legacy resolver instead of silently giving up.
+    # class the registry doesn't know, return UNKNOWN rather than UNRESOLVED so
+    # the caller falls back to the legacy resolver instead of silently giving up.
     for bk in ("base_ctx", "ctx", "context"):
         bv = inputs.get(bk)
         if isinstance(bv, list) and len(bv) >= 1:
@@ -273,7 +282,7 @@ def resolve_link(prompt: dict, ref: Any, registry: NodeRegistry,
                  _depth: int = 0, _visited: set | None = None):
     """Resolve [node_id, slot] to a scalar value, UNRESOLVED, or UNKNOWN.
 
-    UNKNOWN means the chain crossed a class the registry doesn't know —
+    UNKNOWN means the chain crossed a class the registry doesn't know, and
     the caller should use the legacy resolver for this link.
     """
     if _depth > 10:
@@ -298,8 +307,8 @@ def resolve_link(prompt: dict, ref: Any, registry: NodeRegistry,
     out_names_all = sig["output_names"] or []
     out_name = str(out_names_all[slot]) if slot < len(out_names_all) else ""
 
-    # Context bundles (rgthree Context / Context Big): a passthrough carrier,
-    # NOT a runtime computation. Output slot N carries a named field (SEED,
+    # Context bundles (rgthree Context / Context Big) are passthrough carriers
+    # with no runtime computation. Output slot N carries a named field (SEED,
     # STEPS, STEP_REFINER, CFG…); resolve that field through this node's own
     # input or, if absent, the base context it extends. Must run BEFORE the
     # purity gate (the base_ctx input is a non-scalar bundle type).
@@ -319,7 +328,7 @@ def resolve_link(prompt: dict, ref: Any, registry: NodeRegistry,
     role = classify(ct, sig)
 
     # Switches (rgthree Any Switch and friends): the FIRST connected input wins
-    # — literal widget fallbacks are ignored. So return the first connected
+    # and literal widget fallbacks are ignored. So return the first connected
     # branch that resolves; only if no branch resolves fall back to a literal.
     if role == "switch":
         saw_unknown = False
@@ -332,10 +341,10 @@ def resolve_link(prompt: dict, ref: Any, registry: NodeRegistry,
                 if r is not UNRESOLVED and r is not None:
                     return r
         if saw_unknown:
-            return UNKNOWN  # a branch crossed an unknown pack — let legacy resolve
-        # No branch resolved → fall back to a lone literal widget. Exclude bools:
-        # a switch's literal fallback carries a value, not a control flag, and a
-        # stray bool returned where a numeric param is expected would be wrong.
+            return UNKNOWN  # a branch crossed an unknown pack, so let legacy resolve
+        # No branch resolved, so fall back to a lone literal widget. Exclude bools:
+        # a switch's literal fallback carries a value rather than a control flag,
+        # and a stray bool returned where a numeric param is expected would be wrong.
         lits = [v for v in inputs.values()
                 if isinstance(v, (int, float, str)) and not isinstance(v, bool)]
         return lits[0] if len(lits) == 1 else UNRESOLVED
@@ -354,8 +363,8 @@ def resolve_link(prompt: dict, ref: Any, registry: NodeRegistry,
 
     # 1) input named like the output slot (GetImageSize-style): exact match
     # first, else case-insensitive. The named input is authoritative for this
-    # slot — return its value, or propagate the UNRESOLVED/UNKNOWN sentinel
-    # (both are real answers; don't fall through to a later strategy and risk
+    # slot, so return its value or propagate the UNRESOLVED/UNKNOWN sentinel
+    # (both are real answers; falling through to a later strategy would risk
     # returning an unrelated input's value).
     lower_map = {k.lower(): k for k in inputs}
     match_key = None
@@ -369,7 +378,7 @@ def resolve_link(prompt: dict, ref: Any, registry: NodeRegistry,
         if v is not None:
             return v
 
-    # 2) prefixed inputs (mxSlider2D: output "X" → inputs Xi/Xf + isfloatX).
+    # 2) prefixed inputs (mxSlider2D: output "X" is fed by inputs Xi/Xf + isfloatX).
     # Require the match to be the output name plus a SHORT suffix (≤2 chars, the
     # i/f of Xi/Xf) so an unrelated input that merely shares a leading letter
     # (e.g. "weight" for output "W") can't masquerade as the value.
@@ -400,7 +409,7 @@ def resolve_link(prompt: dict, ref: Any, registry: NodeRegistry,
                 if m:
                     return int(m.group(1 if out_name.lower() in ("width", "w") else 2))
 
-    # 4) single scalar widget → that's the value (Primitive*, sliders, Seed…).
+    # 4) a lone scalar widget is taken as the value (Primitive*, sliders, Seed…).
     scalars = [(k, v) for k, v in inputs.items()
                if isinstance(v, (int, float, str, bool)) and not isinstance(v, dict)]
     # Ignore obvious control widgets that never carry the value.
@@ -422,7 +431,7 @@ def resolve_link(prompt: dict, ref: Any, registry: NodeRegistry,
     return UNRESOLVED
 
 
-# ── Pipeline model: generation resolution from the active sampler chain ──
+# Pipeline model: generation resolution from the active sampler chain
 
 
 def _build_consumers(prompt: dict) -> dict[str, list[str]]:
@@ -452,7 +461,7 @@ def _is_output_like(class_type: str, sig: dict | None) -> bool:
 def _is_display_node(class_type: str) -> bool:
     """Terminal show/display node (ShowText/DisplayAny/…) the user placed to view
     a value. dead_node_ids keeps it (and its upstream) alive so its shown text is
-    captured — but it is NOT a save output, so find_generation_resolution must not
+    captured. It is still NOT a save output, so find_generation_resolution must not
     treat a sampler that only feeds a display as 'active' (which would change or
     null the reported generation resolution)."""
     return bool(re.search(r"showtext|showany|showstring|displaytext|displayany|showlabel",
@@ -466,9 +475,10 @@ def _reaches_output_node(prompt: dict, nid: str, consumers: dict[str, list[str]]
     OTHER connected branches (so which branch produced the saved pixels is
     not knowable from the file)?
 
-    The `seen` set alone bounds the walk; there is deliberately NO depth cap —
-    one would falsely report a node many hops upstream of the save node as not
-    reaching it, silently dropping its metadata on deep (video/upscale) graphs.
+    The `seen` set alone bounds the walk; there is deliberately NO depth cap,
+    because one would falsely report a node many hops upstream of the save node
+    as not reaching it, silently dropping its metadata on deep (video/upscale)
+    graphs.
     """
     queue = [(nid, False)]
     seen: set[str] = set()
@@ -522,6 +532,77 @@ def _originates_from(prompt: dict, ref: Any, target_id: str) -> bool:
     return False
 
 
+def _aspect_combo_size_node(node: Any) -> tuple[int, int] | None:
+    """Dimensions stated by a size-selector node's own widgets.
+
+    Two dialects. A combo spells the size out as text
+    ("832 x 1216 (portrait)"), so the text is parsed, honouring a
+    swap_dimensions widget. A FluxResolutionNode style selector states a
+    megapixel area, an "A:B" ratio, and a rounding unit; each side is the
+    square root of the area times its ratio share, rounded to the unit, which
+    reproduces the node's own arithmetic. Both compute at runtime, so the
+    link stays UNRESOLVED under pure-value rules even though the choice is
+    written in the file."""
+    if not isinstance(node, dict):
+        return None
+    ct = str(node.get("class_type", "")).lower().replace(" ", "").replace("_", "")
+    if "aspectratio" not in ct and "resolution" not in ct:
+        return None
+    inputs = node.get("inputs", {})
+    if not isinstance(inputs, dict):
+        return None
+    for v in inputs.values():
+        if not isinstance(v, str):
+            continue
+        m = re.search(r"(\d{2,5})\s*[x×]\s*(\d{2,5})", v)
+        if m:
+            w, h = int(m.group(1)), int(m.group(2))
+            if str(inputs.get("swap_dimensions", "")).strip().lower() in (
+                    "on", "yes", "true", "swap"):
+                w, h = h, w
+            return (w, h)
+    mp = None
+    for k, v in inputs.items():
+        if "megapixel" in k.lower():
+            try:
+                mp = float(v)
+            except (TypeError, ValueError):
+                pass
+            break
+    ratio = None
+    _custom = str(inputs.get("custom_ratio", "")).strip().lower() in ("true", "on", "yes")
+    for k, v in inputs.items():
+        if not isinstance(v, str) or "ratio" not in k.lower():
+            continue
+        if (k.lower().startswith("custom")) != _custom:
+            continue
+        m = re.search(r"(\d+)\s*:\s*(\d+)", v)
+        if m:
+            ratio = (int(m.group(1)), int(m.group(2)))
+            break
+    if not (mp and ratio and ratio[0] > 0 and ratio[1] > 0):
+        return None
+    div = 64
+    for k, v in inputs.items():
+        if "divisible" in k.lower():
+            try:
+                div = max(1, int(float(v)))
+            except (TypeError, ValueError):
+                pass
+            break
+    area = mp * 1_000_000
+    w = round((area * ratio[0] / ratio[1]) ** 0.5 / div) * div
+    h = round((area * ratio[1] / ratio[0]) ** 0.5 / div) * div
+    if 16 <= w <= 16384 and 16 <= h <= 16384:
+        return (w, h)
+    return None
+
+
+def _aspect_combo_size(prompt: dict, ref: Any) -> tuple[int, int] | None:
+    node, _nid, _slot = _node_of(prompt, ref)
+    return _aspect_combo_size_node(node)
+
+
 def find_generation_resolution(prompt: dict, registry: NodeRegistry,
                                legacy_dim_fn=None) -> tuple[int, int] | None:
     """The latent size entering the FIRST active sampler.
@@ -530,7 +611,7 @@ def find_generation_resolution(prompt: dict, registry: NodeRegistry,
     style node or an image-to-video conditioner with width/height). Samplers
     whose output never reaches a save node are editing leftovers and are
     ignored. img2img sources (VAEEncode) and runtime-measured sizes yield
-    None — the honest answer.
+    None rather than a guess.
     """
     consumers = _build_consumers(prompt)
     sampler_ids: list[str] = []
@@ -581,19 +662,23 @@ def find_generation_resolution(prompt: dict, registry: NodeRegistry,
                                               (not s_sig and sk in ("pixels", "image")))
                     for sk, sv in s_inputs.items())
                 if s_role == "sampler" or has_latent_in:
-                    # another sampler or a latent op — keep walking up
+                    # another sampler or a latent op, so keep walking up
                     return latent_source(src_id, depth + 1, seen)
                 if takes_pixels and not ("width" in s_inputs or "height" in s_inputs):
-                    return "img2img"  # VAEEncode — size not in the file
+                    return "img2img"  # VAEEncode: the size is not in the file
                 if "width" in s_inputs or "height" in s_inputs:
                     return src_node  # EmptyLatent* / WanImageToVideo-style creator
+                if _aspect_combo_size_node(src_node):
+                    # An aspect-ratio node emitting the empty latent itself:
+                    # the size lives in its combo text rather than in inputs.
+                    return src_node
                 return None
         return None
 
     # Prefer samplers that actually flow into an output node; among them, the
     # one whose chain ends at a latent CREATOR (the first pass). When every
     # path to the output crosses a multi-branch runtime switch, which branch
-    # produced the saved pixels is unknowable — claim nothing.
+    # produced the saved pixels is unknowable, so claim nothing.
     reach = {s: _reaches_output_node(prompt, s, consumers, registry) for s in sampler_ids}
     unambiguous = [s for s in sampler_ids if reach[s][0] and not reach[s][1]]
     active = [s for s in sampler_ids if reach[s][0]]
@@ -602,21 +687,39 @@ def find_generation_resolution(prompt: dict, registry: NodeRegistry,
     for sid in (unambiguous or active or sampler_ids):
         src = latent_source(sid)
         if src == "img2img":
-            continue  # this pass starts from a measured image — try other samplers
+            continue  # this pass starts from a measured image, so try other samplers
         if isinstance(src, dict):
             inputs = src.get("inputs", {})
-            wv, hv = inputs.get("width"), inputs.get("height")
+            wl, hl = inputs.get("width"), inputs.get("height")
+            wv, hv = wl, hl
             if isinstance(wv, list):
                 wv = resolve_dimension(prompt, wv, 0, registry, legacy_dim_fn)
             if isinstance(hv, list):
                 hv = resolve_dimension(prompt, hv, 1, registry, legacy_dim_fn)
+            def _dim_ok(v):
+                try:
+                    return 16 <= int(v) <= 16384
+                except (TypeError, ValueError):
+                    return False
+            if not (_dim_ok(wv) and _dim_ok(hv)):
+                # Runtime-computed size: an aspect-ratio combo upstream (or the
+                # creator itself) still states the chosen dimensions verbatim.
+                combo = _aspect_combo_size_node(src)
+                if not combo:
+                    for lnk in (wl, hl):
+                        if isinstance(lnk, list):
+                            combo = _aspect_combo_size(prompt, lnk)
+                            if combo:
+                                break
+                if combo:
+                    wv, hv = combo
             try:
                 wi, hi = int(wv), int(hv)
                 if 16 <= wi <= 16384 and 16 <= hi <= 16384:
                     return wi, hi
             except (TypeError, ValueError):
                 pass
-            continue  # creator found but size unresolvable here — try other samplers
+            continue  # creator found but size unresolvable here, so try other samplers
     return None
 
 
@@ -626,7 +729,7 @@ _BROADCAST_PATTERNS = ("anythingeverywhere", "useeverywhere", "everywhere",
 
 def has_implicit_links(prompt: dict, registry: NodeRegistry) -> bool:
     """True if the graph uses nodes that create connections NOT present as
-    explicit input links — rgthree 'Anything Everywhere'/'Use Everywhere'
+    explicit input links: rgthree 'Anything Everywhere'/'Use Everywhere'
     broadcasts and Set/Get virtual wires. When present, explicit-link
     reachability is incomplete, so dead-node detection must stand down."""
     for nd in prompt.values():
@@ -639,9 +742,8 @@ def has_implicit_links(prompt: dict, registry: NodeRegistry) -> bool:
 
 
 def dead_node_ids(prompt: dict, registry: NodeRegistry) -> set[str]:
-    """Node ids that take no part in producing the saved output — disconnected
-    editing leftovers (e.g. an LLava sampler wired to nothing) that should not
-    appear in the metadata panel.
+    """Node ids that take no part in producing the saved output: disconnected
+    editing leftovers that should not appear in the metadata panel.
 
     Computed ONLY for graphs without implicit-link nodes, where reachability
     through explicit input links is exact. With broadcasts/Set-Get present the
@@ -652,8 +754,8 @@ def dead_node_ids(prompt: dict, registry: NodeRegistry) -> set[str]:
     if has_implicit_links(prompt, registry):
         return set()
     # Need at least one recognizable output/save node to anchor reachability;
-    # without one (atypical graphs, test stubs) liveness can't be judged — keep
-    # everything rather than nuke the whole graph.
+    # without one (atypical graphs, odd exports) liveness can't be judged, so
+    # keep everything rather than nuke the whole graph.
     output_ids = [str(nid) for nid, nd in prompt.items()
                   if isinstance(nd, dict)
                   and (_is_output_like(nd.get("class_type", ""), registry.sig(nd.get("class_type", "")))
@@ -661,9 +763,9 @@ def dead_node_ids(prompt: dict, registry: NodeRegistry) -> set[str]:
     if not output_ids:
         return set()
     # A node is LIVE if it (transitively) feeds an output. ONE reverse walk from
-    # the outputs to their producers marks every such node in O(N+E) — instead
-    # of a separate forward BFS per node (O(N·(N+E)), and with its old depth cap
-    # it also dropped live nodes far upstream of the save node). dead = the rest.
+    # the outputs to their producers marks every such node in O(N+E), replacing
+    # a separate forward BFS per node (O(N·(N+E)), whose old depth cap also
+    # dropped live nodes far upstream of the save node). dead = the rest.
     live: set[str] = set()
     queue = list(output_ids)
     while queue:

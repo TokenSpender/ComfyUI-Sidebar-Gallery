@@ -10,7 +10,7 @@ A customizable gallery that supports all metadata.
 
 </div>
 
-Sidebar Gallery is a ComfyUI extension that adds a media browser to the sidebar. It indexes the images and videos in your output folders, reads the generation metadata embedded in each file, and presents it as a structured, searchable panel. It supports images and videos made with ComfyUI, Automatic1111, Forge, SD.Next, and Fooocus.
+Sidebar Gallery is a ComfyUI extension that adds a media browser to the sidebar. It indexes the images and videos in your output folders, reads the generation metadata embedded in each file, and presents it as a structured, searchable panel. It supports images and videos made with ComfyUI, Automatic1111, Forge, SD.Next, Fooocus, and CivitAI's on-site generator.
 
 ## Gallery
 
@@ -18,11 +18,11 @@ The gallery indexes your ComfyUI `output` folder, together with any other folder
 
 ![Sidebar gallery](https://raw.githubusercontent.com/TokenSpender/ComfyUI-Sidebar-Gallery/media/assets/sidebar.png)
 
-Thumbnails are generated on demand, including for video. You can browse subfolders, filter to images or video, set the sort order, and adjust both the thumbnail size and the number of items per row.
+Thumbnails are generated on demand, including for video. You can browse subfolders, filter to images or video, set the sort order, and adjust both the thumbnail size and the number of items per row. The viewer zooms with the scroll wheel and pans by dragging, on images and videos alike; zoom keys, middle-click reset, the sensitivity, and keeping the zoom while browsing are all configurable.
 
 ## Metadata
 
-Selecting an item opens it at full size alongside a panel describing how it was made. The panel reads metadata from ComfyUI, Automatic1111, Forge, SD.Next, and Fooocus, and labels each item with its source.
+Selecting an item opens it at full size alongside a panel describing how it was made. The panel reads metadata from ComfyUI, Automatic1111, Forge, SD.Next, Fooocus, and CivitAI, and labels each item with its source.
 
 ![Metadata panel](https://raw.githubusercontent.com/TokenSpender/ComfyUI-Sidebar-Gallery/media/assets/lightbox.png)
 
@@ -44,7 +44,7 @@ Most of the interface is configurable through the settings panel, which is divid
 
 - **Layout** rebuilds the metadata panel in a two-pane editor (detailed below).
 - **Appearance** sets the colors used throughout the panel.
-- **Keybindings** assigns keyboard shortcuts.
+- **Keybindings** assigns keyboard shortcuts. Bindings accept key combos and mouse buttons, with defaults for navigation, zoom, mute, and video frame stepping.
 - **Settings** holds options such as thumbnail size, items per row, and sort order.
 
 Any combination of these can be saved as a named preset, kept on your own machine, and loaded again later.
@@ -59,12 +59,13 @@ The layout editor controls how the metadata panel is structured, with separate l
 - **Cards** display one card per entry in a list, such as one card per LoRA or per sampler, or a single card built from one node.
 - **Tabs** split a section into pill-switchable sub-sections, such as the original and enhanced prompt.
 - **High and low pairing** shows the two halves of an MoE workflow side by side.
+- **Copying between layouts** duplicates or moves sections and tabs into another profile. Dragging also converts: a tab dropped between sections becomes its own section, and a section dropped onto another joins it as a tab.
 
 Layouts are saved locally by the extension's backend, the same local server that ComfyUI itself runs on, so they persist across browsers and sessions without anything being sent off your computer.
 
 ## Search
 
-The search bar queries every field at once. A query with no prefix matches anything in the metadata: positive and negative prompts, checkpoint, LoRAs, ControlNet, samplers, and so on. Adding a prefix restricts the query to a single field, for example `model:flux` or `lora:detail`. When several terms are combined, a toggle controls whether a result must match all of them (AND) or any of them (OR). Each result lists the fields that matched beneath its thumbnail.
+The search bar queries every field at once. A query with no prefix matches anything in the metadata: positive and negative prompts, checkpoint, LoRAs, ControlNet, samplers, and so on. Adding a prefix restricts the query to a single field, for example `model:flux` or `lora:detail`. As you type, a dropdown suggests field names, including sections you renamed or created in the layout editor. When several terms are combined, a toggle controls whether a result must match all of them (AND) or any of them (OR). Each result lists the fields that matched beneath its thumbnail.
 
 ![Search results](https://raw.githubusercontent.com/TokenSpender/ComfyUI-Sidebar-Gallery/media/assets/search.png)
 

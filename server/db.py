@@ -12,6 +12,7 @@ import os
 import sqlite3
 import threading
 import time
+from collections import deque
 from concurrent.futures import ThreadPoolExecutor
 from dataclasses import dataclass, field
 from pathlib import Path
@@ -33,7 +34,7 @@ ALL_MEDIA_EXTS = IMAGE_EXTS | VIDEO_EXTS
 # modest so a background rebuild never floods the box.
 _REINDEX_META_WORKERS = 4
 
-# Database version counters - one per root plus a global aggregate, bumped only
+# Database version counters: one per root plus a global aggregate, bumped only
 # when a write materially changes a row (insert, real update, delete). The
 # per-root counters live in sbg_meta ("root_version:<root_id>") and are
 # incremented on the writer's own connection, so a bump commits atomically with
@@ -46,13 +47,13 @@ _REINDEX_META_WORKERS = 4
 _db_version = 0
 _versions_lock = threading.Lock()
 
-# Metadata epoch - increments only when metadata is fully re-extracted (a reindex),
+# Metadata epoch: increments only when metadata is fully re-extracted (a reindex),
 # not on every write. Kept in memory (mirrors _db_version) so the list_all hot path
 # reads it without opening a fresh SQLite connection per request; persisted in
 # sbg_meta and restored in init_db so it survives a restart.
 _meta_epoch = 0
 
-# Cached result of get_all_meta_keys() - a full scan of every row is too slow to
+# Cached result of get_all_meta_keys(): a full scan of every row is too slow to
 # repeat per request, so the aggregate is recomputed only when _db_version changes.
 # The lock serializes concurrent callers (each runs in a run_in_executor worker
 # thread) so they don't both run the scan and race on the module-global cache.
@@ -120,15 +121,6 @@ def set_meta_value(key: str, value: str) -> None:
         pass
 
 
-def delete_meta_value(key: str) -> None:
-    """Remove a key from the sbg_meta table (best-effort)."""
-    try:
-        with _get_conn() as conn:
-            conn.execute("DELETE FROM sbg_meta WHERE key = ?", (key,))
-    except Exception:
-        pass
-
-
 def get_meta_epoch() -> int:
     """Epoch that increments when metadata is fully re-extracted (a reindex).
     A reindex rewrites every row's metadata_json without changing file mtimes,
@@ -156,12 +148,12 @@ def has_any_files() -> bool:
         return False
 
 
-# ── Connection management ──────────────────────────────────────────────
+# Connection management
 
 def _get_conn() -> sqlite3.Connection:
     """Open a new SQLite connection with WAL mode.
 
-    Per-call, not thread-local or pooled. Callers either close it explicitly
+    Opened per call, with no thread-local reuse or pooling. Callers either close it explicitly
     (long scans) or rely on GC after a short `with conn:` block. WAL mode plus
     the 30s busy timeout make concurrent use safe.
     """
@@ -288,14 +280,14 @@ def _migrate_trim_node_text_bloat() -> None:
             conn.commit()
         if trimmed:
             logger.info(
-                "SBG: trimmed oversized node text in %d row(s) - search speed restored. "
+                "SBG: trimmed oversized node text in %d row(s), restoring search speed. "
                 "Disk space is reclaimed on the next VACUUM.", trimmed,
             )
     except Exception as exc:  # never block startup on this cleanup
         logger.warning("SBG: node-text bloat-trim migration skipped: %s", exc)
 
 
-# ── Core CRUD ──────────────────────────────────────────────────────────
+# Core CRUD
 
 def upsert_file(
     conn: sqlite3.Connection,
@@ -348,13 +340,32 @@ def upsert_file(
         _bump_version(conn, root_id)
 
 
+def get_rows_since(root_id: str, since: float) -> list[dict]:
+    """The delta path's working set: rows with mtime > since. Filters in SQL
+    on idx_root_mtime so a typical few-item delta reads a few rows instead of
+    walking the whole table in Python (and only the matching rows pay the
+    json_extract for w/h)."""
+    with _get_conn() as conn:
+        rows = conn.execute(
+            """SELECT root_id, relpath, filename, subfolder, ext, kind,
+                      size, mtime, ctime,
+                      json_extract(metadata_json, '$.width') as w,
+                      json_extract(metadata_json, '$.height') as h
+               FROM media_files
+               WHERE root_id = ? AND mtime > ?
+               ORDER BY ctime DESC, relpath DESC""",
+            (root_id, since),
+        ).fetchall()
+    return [dict(r) for r in rows]
+
+
 def get_all(root_id: str) -> list[dict]:
     """Return all files for a root, sorted by ctime desc (creation time).
-    
+
     Uses ctime instead of mtime for sort order to prevent files from
-    jumping to the top when merely viewed in File Explorer (which can
-    update mtime on Windows).
-    
+    jumping to the top after merely being viewed, since some file managers
+    update mtime on viewing.
+
     Includes extracted width/height from metadata for AR thumbnail support.
     """
     with _get_conn() as conn:
@@ -440,19 +451,29 @@ def get_all_with_metadata(root_id: str) -> list[dict]:
     return [dict(r) for r in rows]
 
 
+# One bind parameter per relpath in an IN list. SQLite's variable limit is 999
+# on older builds, and a client refreshing after a long absence can send tens
+# of thousands of relpaths, so the query runs in chunks under that limit.
+_IN_CHUNK = 900
+
+
 def get_items_with_metadata(root_id: str, relpaths: list[str]) -> list[dict]:
     """Return metadata for specific relpaths only (for delta search)."""
     if not relpaths:
         return []
+    out: list[dict] = []
     with _get_conn() as conn:
-        placeholders = ",".join("?" for _ in relpaths)
-        rows = conn.execute(
-            f"""SELECT root_id, relpath, metadata_json
-               FROM media_files
-               WHERE root_id = ? AND relpath IN ({placeholders})""",
-            [root_id] + relpaths,
-        ).fetchall()
-    return [dict(r) for r in rows]
+        for start in range(0, len(relpaths), _IN_CHUNK):
+            chunk = relpaths[start:start + _IN_CHUNK]
+            placeholders = ",".join("?" for _ in chunk)
+            rows = conn.execute(
+                f"""SELECT root_id, relpath, metadata_json
+                   FROM media_files
+                   WHERE root_id = ? AND relpath IN ({placeholders})""",
+                [root_id] + chunk,
+            ).fetchall()
+            out.extend(dict(r) for r in rows)
+    return out
 
 
 def get_file(root_id: str, relpath: str) -> dict | None:
@@ -490,14 +511,93 @@ def get_count(root_id: str) -> int:
     return row["cnt"] if row else 0
 
 
-def delete_file(conn: sqlite3.Connection, root_id: str, relpath: str):
-    """Delete a single file record (requires existing connection)."""
+def delete_file(conn: sqlite3.Connection, root_id: str, relpath: str) -> bool:
+    """Delete a single file record (requires existing connection). Returns
+    whether a row was actually removed. Announcing the deletion to the delta
+    buffer is the caller's job, via record_removals() AFTER the transaction
+    commits, so a rollback can never leave an announcement for rows that are
+    still present."""
     cur = conn.execute(
         "DELETE FROM media_files WHERE root_id = ? AND relpath = ?",
         (root_id, relpath),
     )
     if cur.rowcount:
         _bump_version(conn, root_id)
+        return True
+    return False
+
+
+# Recent-removals buffer
+# The list_new delta path needs "which relpaths vanished since version X"
+# without paying a directory walk per request. Removals are rare, so a small
+# per-root ring buffer answers deterministically for any client whose version
+# falls inside this process's lifetime. Older clients get None ("can't
+# answer") and fall back to a full refetch.
+_REMOVALS_MAX = 500
+_removals_lock = threading.Lock()
+_recent_removals: dict[str, deque] = {}   # per-root deques of (version_after, relpath)
+_removals_floor: dict[str, int] = {}      # answers are complete for since_version >= floor
+
+
+def record_removals(root_id: str, relpaths: list[str], complete_since: int) -> None:
+    """Publish committed deletions to the delta buffer.
+
+    Call AFTER the transaction that deleted the rows has committed, with
+    `complete_since` holding the committed version from just before that
+    transaction. The buffer entries carry one further version bump, made
+    here in a transaction of their own: a client that polled between the
+    delete commit and this call stamped itself with the pre-announcement
+    version, so the extra bump guarantees its next poll still surfaces
+    these relpaths instead of leaving ghost cards until a consistency
+    check. A failure here degrades to exactly that consistency-check path,
+    so it is logged and swallowed rather than raised into the scan."""
+    if not relpaths:
+        return
+    try:
+        conn = _get_conn()
+        try:
+            with _removals_lock:
+                _bump_version(conn, root_id)
+                conn.commit()
+                row = conn.execute(
+                    "SELECT value FROM sbg_meta WHERE key = ?",
+                    (f"root_version:{root_id}",),
+                ).fetchone()
+                ver = int(row[0]) if row else 0
+                dq = _recent_removals.get(root_id)
+                if dq is None:
+                    dq = deque(maxlen=_REMOVALS_MAX)
+                    _recent_removals[root_id] = dq
+                    # An earlier poll may have proven completeness from an even
+                    # older version; keep that when present.
+                    _removals_floor.setdefault(root_id, complete_since)
+                for rp in relpaths:
+                    if len(dq) == dq.maxlen:
+                        _removals_floor[root_id] = dq[0][0]  # oldest entry is about to evict
+                    dq.append((ver, rp))
+        finally:
+            conn.close()
+    except Exception as e:
+        logger.warning(
+            "SBG: could not announce %d deletion(s) for %s (%s); clients "
+            "reconcile on their next consistency check", len(relpaths), root_id, e,
+        )
+
+
+def get_removals_since(root_id: str, since_version: int) -> list[str] | None:
+    """Relpaths removed after since_version, or None when the buffer cannot
+    answer (the client's version predates this process or evicted entries)."""
+    current = get_root_version(root_id)
+    with _removals_lock:
+        # First touch in this process life: nothing was removed since startup,
+        # so the buffer is trivially complete from the current version onward.
+        _removals_floor.setdefault(root_id, current)
+        if since_version < _removals_floor[root_id]:
+            return None
+        dq = _recent_removals.get(root_id)
+        if not dq:
+            return []
+        return [rp for (v, rp) in dq if v > since_version]
 
 
 def delete_root_rows(root_id: str) -> int:
@@ -511,16 +611,24 @@ def delete_root_rows(root_id: str) -> int:
             _bump_version(conn, root_id)
         # The root is gone from config: clear its per-root bookkeeping so a
         # re-added folder starts fresh (first-index progress included).
-        conn.execute("DELETE FROM sbg_meta WHERE key IN (?, ?)",
-                     (f"root_version:{root_id}", f"indexed:{root_id}"))
+        conn.execute("DELETE FROM sbg_meta WHERE key IN (?, ?, ?)",
+                     (f"root_version:{root_id}", f"indexed:{root_id}",
+                      f"parser_version:{root_id}"))
         conn.commit()
         _mtimes_cache.pop(root_id, None)
+        # The removals buffer and its floor belong to the retired version
+        # sequence. A re-added root restarts its counter at zero, so leftover
+        # entries would either replay old deletions for files that are present
+        # or force every refresh into a full refetch. Forget them with the root.
+        with _removals_lock:
+            _recent_removals.pop(root_id, None)
+            _removals_floor.pop(root_id, None)
         return n
     finally:
         conn.close()
 
 
-# ── Scan support: results, error counters, progress registry ──────────
+# Scan support: results, error counters, progress registry
 
 @dataclass
 class ScanResult:
@@ -577,8 +685,8 @@ def update_progress(key: str, token: int, **fields) -> None:
 
 
 def end_progress(key: str, token: int, phase: str, error: str | None = None) -> None:
-    """Finish an entry with an honest final phase ("done" or "error"). The
-    entry stays visible (running=False) so pollers can observe completion."""
+    """Finish an entry with its final phase ("done" or "error"). The entry
+    stays visible (running=False) so pollers can observe completion."""
     with _scan_progress_lock:
         entry = _scan_progress.get(key)
         if entry is None or entry.get("_token") != token:
@@ -614,7 +722,7 @@ def get_progress() -> dict:
         }
 
 
-# ── Incremental scan (fast) ───────────────────────────────────────────
+# Incremental scan (fast)
 
 def _filter_scan_dirs(dirnames: list[str], excluded: set[str], *, skip_hidden: bool = True) -> None:
     """Prune the os.walk subtree in place so the scanner skips whole folders.
@@ -734,7 +842,12 @@ def _read_and_upsert_batches(
         if cancel_event is not None and cancel_event.is_set():
             break
         batch = items[start:start + batch_size]
-        for rel, ext, kind, size, mtime, ctime, meta_json in pool.map(_read_one, batch):
+        # Drain the parallel parses BEFORE the first upsert: the first write
+        # opens the batch's transaction, and holding it open across still-running
+        # parses would block every other writer (and, via the event-loop's sync
+        # writes, the whole UI) for the batch's parse tail.
+        parsed = list(pool.map(_read_one, batch))
+        for rel, ext, kind, size, mtime, ctime, meta_json in parsed:
             upsert_file(conn, rid, rel, ext, kind, size, mtime, meta_json, ctime=ctime)
             done += 1
         conn.commit()
@@ -745,7 +858,7 @@ def _read_and_upsert_batches(
 
 # Cached (root_version, {relpath: mtime}) per root. The auto-refresh poll scans
 # frequently, and re-SELECTing tens of thousands of rows just to conclude
-# "nothing changed" is wasteful; the per-root version key keeps the cache exact
+# "nothing changed" is wasteful. The per-root version key keeps the cache exact
 # (every material write bumps it).
 _mtimes_cache: dict[str, tuple[int, dict[str, float]]] = {}
 
@@ -762,8 +875,8 @@ def incremental_scan(
     """Fast incremental scan: only update new/changed files.
 
     1. Walk the filesystem and collect all files + mtime/size
-    2. Compare against DB mtime - only upsert new/changed files
-    3. Delete DB records for files no longer on disk - SKIPPED when the
+    2. Compare against DB mtime and only upsert new/changed files
+    3. Delete DB records for files no longer on disk. SKIPPED when the
        enumeration was incomplete (see the sweep guard below)
 
     `report_progress` is decided by the caller (routes knows whether the root
@@ -808,7 +921,7 @@ def _incremental_scan_impl(root, base_abs, rid, token, *, read_metadata_fn,
     if not os.path.isdir(base_abs):
         raise OSError(f"root path not accessible: {base_abs}")
 
-    # Existing DB records for this root (relpath -> mtime), cached per version.
+    # Existing DB records for this root (mtime keyed by relpath), cached per version.
     cur_version = get_root_version(rid)
     cached = _mtimes_cache.get(rid)
     if cached is not None and cached[0] == cur_version:
@@ -823,7 +936,7 @@ def _incremental_scan_impl(root, base_abs, rid, token, *, read_metadata_fn,
         _mtimes_cache[rid] = (cur_version, db_mtimes)
 
     # Collect all current files from filesystem.
-    disk_files: dict[str, tuple[str, str, int, float, float]] = {}  # relpath -> (ext, kind, size, mtime, ctime)
+    disk_files: dict[str, tuple[str, str, int, float, float]] = {}  # keyed by relpath: (ext, kind, size, mtime, ctime)
     excluded = excluded_dirs or set()
     skip_hidden = not index_hidden_dirs
     errors = _ScanErrors()
@@ -873,14 +986,21 @@ def _incremental_scan_impl(root, base_abs, rid, token, *, read_metadata_fn,
             result.complete = False
         else:
             removed = set(db_mtimes.keys()) - set(disk_files.keys())
-            for rel in removed:
-                delete_file(conn, rid, rel)
-            result.removed = sorted(removed)
-            result.changed += len(removed)
+            # Committed version from before this transaction (the writer's own
+            # uncommitted bumps are not visible to this read): the completeness
+            # floor for the announcement below.
+            v_before = get_root_version(rid)
+            result.removed = sorted(rel for rel in removed
+                                    if delete_file(conn, rid, rel))
+            result.changed += len(result.removed)
 
         conn.commit()
     finally:
         conn.close()
+    # Announce only after the commit above; a scan that failed or rolled back
+    # never reaches this line, so no deletion is ever announced speculatively.
+    if result.removed:
+        record_removals(rid, result.removed, v_before)
     if result.complete:
         # Cache the post-scan state keyed to the post-commit version, so the
         # next idle poll skips the mtimes SELECT even right after a change.
@@ -891,7 +1011,7 @@ def _incremental_scan_impl(root, base_abs, rid, token, *, read_metadata_fn,
     return result
 
 
-# ── Full reindex (background) ─────────────────────────────────────────
+# Full reindex (background)
 
 
 def full_reindex(
@@ -947,13 +1067,35 @@ def full_reindex(
             # flaky share must not be treated as deletions). Uses delete_file
             # (not a raw executemany) so each removal bumps the root version;
             # otherwise clients never learn reindex-swept files are gone.
+            swept: list[str] = []
+            v_before = get_root_version(rid)
             if errors.dir_errors == 0 and os.path.isdir(base_abs):
+                def _now_excluded(relpath: str) -> bool:
+                    # Mirror _filter_scan_dirs: a row under a folder the walk
+                    # prunes (excluded name, or hidden while hidden indexing is
+                    # off) is out of the index by configuration even though its
+                    # file exists on disk.
+                    for seg in relpath.split("/")[:-1]:
+                        if (skip_hidden and seg.startswith(".")) or seg.lower() in excluded:
+                            return True
+                    return False
                 existing_rows = conn.execute(
                     "SELECT relpath FROM media_files WHERE root_id = ?", (rid,)
                 ).fetchall()
                 for r in existing_rows:
                     if r["relpath"] not in new_relpaths:
-                        delete_file(conn, rid, r["relpath"])
+                        # A row can postdate the Phase 1 snapshot: a file
+                        # generated while the rebuild ran gets its row from
+                        # the delta endpoint or the metadata backfill.
+                        # Deleting on the stale snapshot alone would sweep it
+                        # and announce a false removal, so a candidate only
+                        # goes when the file is genuinely absent from disk, or
+                        # sits under a folder the current rules exclude.
+                        if (os.path.isfile(os.path.join(base_abs, r["relpath"]))
+                                and not _now_excluded(r["relpath"])):
+                            continue
+                        if delete_file(conn, rid, r["relpath"]):
+                            swept.append(r["relpath"])
             else:
                 logger.warning(
                     "SBG: full reindex of %s had %d unreadable director(y/ies); "
@@ -964,6 +1106,8 @@ def full_reindex(
             update_progress(_FULL_KEY, token, done=len(disk_files))
         finally:
             conn.close()
+        # Announce the swept rows only now that they are committed away.
+        record_removals(rid, swept, v_before)
 
         end_progress(_FULL_KEY, token, "done")
         set_meta_value(f"indexed:{rid}", "1")
@@ -979,19 +1123,20 @@ def full_reindex(
         raise
 
 
-# ── is_empty check ─────────────────────────────────────────────────────
+# is_empty check
 
 def is_empty() -> bool:
-    """Return True if the DB has no indexed files at all."""
+    """Return True if the DB has no indexed files at all. A LIMIT 1 probe
+    answers this without counting the whole table."""
     try:
         with _get_conn() as conn:
-            row = conn.execute("SELECT COUNT(*) as cnt FROM media_files").fetchone()
-        return (row["cnt"] if row else 0) == 0
+            row = conn.execute("SELECT 1 FROM media_files LIMIT 1").fetchone()
+        return row is None
     except Exception:
         return True
 
 
-# ── Layout Editor: aggregate all metadata keys ─────────────────────────
+# Layout Editor: aggregate all metadata keys
 
 def get_all_meta_keys() -> dict:
     """Scan ALL indexed files and return all unique metadata keys.
@@ -1038,7 +1183,7 @@ def _compute_all_meta_keys() -> dict:
     workflow_node_titles: dict[str, str] = {}
     # Per-instance info for duplicated/contextual nodes, keyed by class_type.
     # identity key = title or _from or index; lets the layout editor offer
-    # "ShowAny - 'LLM Output'" / "ShowAny (from BasicScheduler)" / "KSampler #2".
+    # "ShowAny: 'LLM Output'" / "ShowAny (from BasicScheduler)" / "KSampler #2".
     workflow_node_instances: dict[str, dict[str, dict]] = {}
     sampler_keys: set[str] = set()
     lora_keys: set[str] = set()
@@ -1060,9 +1205,9 @@ def _compute_all_meta_keys() -> dict:
 
     try:
         with _get_conn() as conn:
-            # Aggregate over every indexed file (deterministic), not a random
-            # sample. Stream the cursor (no fetchall) so all metadata blobs
-            # aren't pulled into memory at once.
+            # Aggregate over every indexed file rather than a random sample,
+            # so the result is deterministic. Stream the cursor (no fetchall)
+            # so all metadata blobs aren't pulled into memory at once.
             cur = conn.execute(
                 """SELECT metadata_json FROM media_files
                    WHERE metadata_json IS NOT NULL AND metadata_json != ''"""
@@ -1148,6 +1293,6 @@ def _compute_all_meta_keys() -> dict:
     }
 
 
-# ── Initialize on import ──────────────────────────────────────────────
+# Initialize on import
 
 init_db()

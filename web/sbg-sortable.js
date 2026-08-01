@@ -1,8 +1,8 @@
 /**
- * sbg-sortable.js — Pointer-based real-time sortable
+ * sbg-sortable.js: Pointer-based real-time sortable
  *
  * Items physically reorder as you drag them, like a modern sortable list.
- * Used by both the layout editor and the live metadata panel.
+ * The layout editor drives it for sections, tabs, and fields.
  * No external dependencies.
  */
 
@@ -15,12 +15,20 @@ let _sortState = null;
  * @param {HTMLElement} handle - The drag handle element (mousedown target)
  * @param {HTMLElement} item - The draggable item element
  * @param {Object} [opts]
- * @param {string} [opts.type] - "section" or "param" — determines default sibling selector
+ * @param {string} [opts.type] - "section" or "param"; determines the default sibling selector
  * @param {string} [opts.itemSelector] - explicit selector for sortable siblings (overrides type default)
- * @param {string} [opts.dropContainerSelector] - cross-container param moves: container selector to detect under cursor
- * @param {string} [opts.groupSelector] - optional inner group element to drop into within a drop container
- * @param {string} [opts.groupClass] - class for a missing inner group (default "sbg-meta-group")
- * @param {Function} [opts.onDrop] - callback(item) after drop
+ * @param {string} [opts.dropContainerSelector] - cross-container param/tab moves: container selector to detect under cursor
+ * @param {Object} [opts.convertTargets] - drop-INTO targets: {selector, accepts(el, item), band, className}.
+ *   While the cursor is over a matching element (inside the vertical band, a
+ *   [lo, hi] fraction of its height), the element is highlighted and the drop
+ *   reports it via info.convertEl instead of reordering.
+ * @param {Object} [opts.promote] - gap-promote zones: {containerSelector, itemSelector}.
+ *   When the cursor is over the container but no drop list or convert target
+ *   claims it, the placeholder is positioned BETWEEN the container's items and
+ *   the drop reports that position via info.promoteIndex.
+ * @param {Function} [opts.onDrop] - callback(item, info) after drop. info carries
+ *   {convertEl} or {promoteIndex} when one of those zones took the drop, and is
+ *   empty for a plain reorder or cross-list move.
  */
 export function initSortable(container, handle, item, opts = {}) {
   handle.style.cursor = "grab";
@@ -56,8 +64,10 @@ export function initSortable(container, handle, item, opts = {}) {
     // themselves only while a drag of that kind is in progress.
     document.body.classList.add("sbg-dragging-" + (opts.type || "item"));
 
-    // Insert placeholder where item was
+    // Insert placeholder where item was. homeNext is the item's original
+    // following sibling, so an abandoned drag can put it back exactly.
     const actualParent = item.parentNode;
+    const homeNext = item.nextSibling;
     actualParent.insertBefore(placeholder, item);
 
     // Get sortable siblings (exclude the dragged item)
@@ -77,6 +87,8 @@ export function initSortable(container, handle, item, opts = {}) {
     const SCROLL_EDGE = 50; // px from edge to trigger auto-scroll
     const SCROLL_SPEED = 8; // px per frame
 
+    let _lastX = 0, _lastY = 0; // last real cursor position, for re-testing during auto-scroll
+
     function autoScroll(clientY) {
       if (_scrollRAF) cancelAnimationFrame(_scrollRAF);
       const spRect = scrollParent.getBoundingClientRect();
@@ -89,52 +101,102 @@ export function initSortable(container, handle, item, opts = {}) {
       if (speed !== 0) {
         (function scroll() {
           scrollParent.scrollTop += speed;
+          // The cursor is stationary while auto-scrolling, so no mousemove fires.
+          // Re-run the hit test against the scrolled content so the convert
+          // highlight and placeholder track the section now under the pointer.
+          evaluate(_lastX, _lastY);
           _scrollRAF = requestAnimationFrame(scroll);
         })();
       }
+    }
+
+    // Convert-target state: the element currently highlighted as a drop-INTO
+    // target, if any. Cleared whenever the cursor leaves it.
+    let convertEl = null;
+    const convertClass = (opts.convertTargets && opts.convertTargets.className) || "sbg-sortable-dropinto";
+    function clearConvert() {
+      if (convertEl) { convertEl.classList.remove(convertClass); convertEl = null; }
     }
 
     _sortState = { item, placeholder, container, offsetX, offsetY, selector, getSiblings, opts };
 
     function onMove(ev) {
       if (!_sortState) return;
+      // A mouseup delivered outside the window never reaches our listener, and a
+      // synthetic mousemove from other page code carries no button. Either way a
+      // move with no button held means this is not a live user gesture, so ABANDON
+      // the drag (revert, no drop) rather than commit something unintended.
+      if (ev.buttons === 0) { cancelDrag(); return; }
+      _lastX = ev.clientX; _lastY = ev.clientY;
       // Move the dragged item with cursor
       item.style.left = (ev.clientX - offsetX) + "px";
       item.style.top = (ev.clientY - offsetY) + "px";
-
       // Auto-scroll when near container edges
       autoScroll(ev.clientY);
+      evaluate(ev.clientX, ev.clientY);
+    }
 
-      // Find which sibling we're hovering over and reorder
-      // Use 40% threshold (not 50% midpoint) for snappier feel
-      
+    // Position the placeholder / pick a convert target for a cursor position.
+    // Called from onMove and, with the last cursor position, from the auto-scroll
+    // loop so a stationary cursor keeps tracking the scrolled content.
+    // Uses a 40% threshold (not the 50% midpoint) for a snappier reorder feel.
+    function evaluate(clientX, clientY) {
+      if (!_sortState) return;
+      const elUnder = document.elementFromPoint(clientX, clientY);
+
       // For params (cross-section field moves) AND tabs (cross-section tab moves):
       // detect the drop container under the cursor so the item can hop lists.
+      // A hovered drop list always wins over convert targets and promote zones.
       let activeContainer = container;
-      if (opts.type === "param" || opts.type === "tab") {
-        const dropSel = opts.dropContainerSelector || (opts.type === "tab" ? ".sbg-ly3-tablist" : ".sbg-section__body");
-        const elUnder = document.elementFromPoint(ev.clientX, ev.clientY);
-        if (elUnder) {
-          const dropC = elUnder.closest(dropSel);
-          if (dropC && dropC !== activeContainer && dropC !== item) {
-            if (opts.groupSelector) {
-              // Move into an inner group element, creating it if absent
-              let tbl = dropC.querySelector(opts.groupSelector);
-              if (!tbl) {
-                tbl = document.createElement("div");
-                tbl.className = opts.groupClass || "sbg-meta-group";
-                dropC.appendChild(tbl);
-              }
-              activeContainer = tbl;
-            } else {
-              // Drop directly into the container
-              activeContainer = dropC;
-            }
+      let overDropList = false;
+      if ((opts.type === "param" || opts.type === "tab") && opts.dropContainerSelector && elUnder) {
+        const dropC = elUnder.closest(opts.dropContainerSelector);
+        if (dropC) overDropList = true;
+        if (dropC && dropC !== activeContainer && dropC !== item) activeContainer = dropC;
+      }
+
+      // Drop-INTO target: hovering a matching card (inside its vertical band)
+      // highlights it and the drop converts the item instead of reordering. The
+      // band leaves the card's edges to plain reorder or gap-promote placement.
+      if (opts.convertTargets && !overDropList && elUnder) {
+        const ct = opts.convertTargets;
+        const t = elUnder.closest(ct.selector);
+        if (t && t !== item && !t.contains(item) && (!ct.accepts || ct.accepts(t, item))) {
+          const r = t.getBoundingClientRect();
+          const frac = (clientY - r.top) / Math.max(1, r.height);
+          const band = ct.band || [0, 1];
+          if (frac >= band[0] && frac <= band[1]) {
+            if (convertEl !== t) { clearConvert(); convertEl = t; t.classList.add(convertClass); }
+            // Leave the placeholder in flow (do not hide it): hiding removes its
+            // reserved height, which shifts the cards under the cursor and makes
+            // the band test flip between convert and reorder on every frame. Clear
+            // its promote caption so a merge target and a gap hint never show at once.
+            placeholder.classList.remove("sbg-sortable-placeholder--promote");
+            return;
           }
         }
       }
-      
-      const siblings = [...activeContainer.querySelectorAll(selector)].filter(s => s !== item && !s.classList.contains("sbg-sortable-placeholder"));
+      clearConvert();
+
+      // Gap-promote zone: the cursor is over the promote container but no drop
+      // list or convert target claimed it, so position the placeholder between
+      // the container's items (e.g. a tab about to become its own section).
+      // Hovering the item's OWN card is exempt, so reordering inside it keeps
+      // the placeholder where it was rather than jumping out to a gap.
+      let placeSelector = selector;
+      let promoting = false;
+      if (opts.promote && !overDropList && elUnder) {
+        const pc = elUnder.closest(opts.promote.containerSelector);
+        const overCard = opts.convertTargets ? elUnder.closest(opts.convertTargets.selector) : null;
+        if (pc && !(overCard && overCard.contains(item))) {
+          activeContainer = pc;
+          placeSelector = opts.promote.itemSelector;
+          promoting = true;
+        }
+      }
+      placeholder.classList.toggle("sbg-sortable-placeholder--promote", promoting);
+
+      const siblings = [...activeContainer.querySelectorAll(placeSelector)].filter(s => s !== item && !s.classList.contains("sbg-sortable-placeholder"));
 
       // Detect flow orientation from the first two siblings. Horizontally-wrapped
       // lists (e.g. the layout editor's field chips) share a row, so a Y-only test
@@ -148,17 +210,17 @@ export function initSortable(container, handle, item, opts = {}) {
         horizontal = (b.left > a.left + 1) && (Math.abs(b.top - a.top) < Math.min(a.height, b.height) * 0.6);
       }
 
-      let ref = null; // sibling to insert the placeholder BEFORE; null → append at end
+      let ref = null; // sibling to insert the placeholder BEFORE; null appends at the end
       if (horizontal) {
         for (const sib of siblings) {
           const r = sib.getBoundingClientRect();
-          if (ev.clientY < r.top) { ref = sib; break; }                                   // pointer on an earlier row
-          if (ev.clientY <= r.bottom && ev.clientX < r.left + r.width / 2) { ref = sib; break; } // same row, left half
+          if (clientY < r.top) { ref = sib; break; }                                   // pointer on an earlier row
+          if (clientY <= r.bottom && clientX < r.left + r.width / 2) { ref = sib; break; } // same row, left half
         }
       } else {
         for (const sib of siblings) {
           const r = sib.getBoundingClientRect();
-          if (ev.clientY < r.top + r.height * 0.4) { ref = sib; break; }
+          if (clientY < r.top + r.height * 0.4) { ref = sib; break; }
         }
       }
 
@@ -173,14 +235,10 @@ export function initSortable(container, handle, item, opts = {}) {
       }
     }
 
-    function onUp() {
-      if (!_sortState) return;
-      if (_scrollRAF) cancelAnimationFrame(_scrollRAF);
-      // Place item back into flow where placeholder is
-      placeholder.parentNode.insertBefore(item, placeholder);
-      placeholder.remove();
-
-      // Reset item styles
+    // Shared teardown: restore the dragged item's inline styles and drop the
+    // document listeners. The caller has already cancelled the auto-scroll RAF.
+    function endDrag() {
+      clearConvert();
       item.style.position = "";
       item.style.zIndex = "";
       item.style.width = "";
@@ -192,12 +250,48 @@ export function initSortable(container, handle, item, opts = {}) {
       item.style.transition = "";
       item.classList.remove("sbg-sortable--dragging");
       document.body.classList.remove("sbg-dragging-" + (opts.type || "item"));
-
       _sortState = null;
       document.removeEventListener("mousemove", onMove);
       document.removeEventListener("mouseup", onUp);
+    }
 
-      if (opts.onDrop) opts.onDrop(item);
+    // Abandon the drag: put the item back where it started and fire no drop.
+    function cancelDrag() {
+      if (!_sortState) return;
+      if (_scrollRAF) cancelAnimationFrame(_scrollRAF);
+      placeholder.remove();
+      actualParent.insertBefore(item, homeNext);
+      endDrag();
+    }
+
+    function onUp() {
+      if (!_sortState) return;
+      if (_scrollRAF) cancelAnimationFrame(_scrollRAF);
+
+      // Report what kind of zone took the drop. A highlighted convert target
+      // wins; otherwise a placeholder parked in the promote container reports
+      // its position among that container's items.
+      const info = {};
+      if (convertEl) {
+        info.convertEl = convertEl;
+      } else if (opts.promote && placeholder.parentNode && placeholder.parentNode.matches
+        && placeholder.parentNode.matches(opts.promote.containerSelector)) {
+        let idx = 0;
+        for (const ch of placeholder.parentNode.children) {
+          if (ch === placeholder) break;
+          if (ch.matches && ch.matches(opts.promote.itemSelector) && ch !== item) idx++;
+        }
+        info.promoteIndex = idx;
+      }
+
+      // Place item back into flow where the placeholder is. An async re-render
+      // (e.g. a late sample-metadata fetch repainting the editor) can detach the
+      // placeholder mid-drag; guard so cleanup still runs instead of throwing.
+      if (placeholder.parentNode) placeholder.parentNode.insertBefore(item, placeholder);
+      placeholder.remove();
+      endDrag();
+
+      if (opts.onDrop) opts.onDrop(item, info);
     }
 
     document.addEventListener("mousemove", onMove);

@@ -1,5 +1,5 @@
 /**
- * sidebar_gallery.js - Entry point for the SBG ComfyUI extension
+ * sidebar_gallery.js: Entry point for the SBG ComfyUI extension
  *
  * This module is the thin shell that:
  *   - Registers the ComfyUI sidebar extension
@@ -12,7 +12,7 @@
 import { app } from "../../scripts/app.js";
 import { api as comfyApi } from "../../scripts/api.js";
 
-/* ── Imports from extracted modules ──────────────────────────────── */
+/* Imports from extracted modules */
 import {
   EXT_NAME, CSS_URL,
   _dataCache, ensureCss, h, api, showToast,
@@ -22,11 +22,10 @@ import {
 import { openGallerySettings as _openGallerySettings } from "./sbg-settings.js";
 import { openLightbox } from "./sbg-lightbox.js";
 import { initGallery } from "./sbg-gallery.js";
+import { descFromKeyEvent, descFromMouseEvent, matchExplicit, matchBare } from "./sbg-keybinds.js";
 
 
-/* ══════════════════════════════════════════════════════════════════════
-   SIDEBAR EXTENSION
-   ══════════════════════════════════════════════════════════════════════ */
+/* SIDEBAR EXTENSION */
 
 app.registerExtension({
   name: EXT_NAME,
@@ -37,7 +36,7 @@ app.registerExtension({
     // Load disk-backed settings before anything reads them
     await loadSettings();
 
-    /* ── Apply saved CSS custom properties ────────────────────────── */
+    /* Apply saved CSS custom properties */
 
     // One pass over the shared app registry: every app's badge colour var is
     // set (saved value or registry default), so the stylesheet's var()
@@ -59,7 +58,7 @@ app.registerExtension({
     const promptPad = getSetting(S.PROMPT_PADDING, "");
     if (promptPad) document.documentElement.style.setProperty("--sbg-prompt-padding", promptPad + "px");
 
-    /* ── Global drag-drop handler for workflow loading ────────────── */
+    /* Global drag-drop handler for workflow loading */
 
     document.body.addEventListener("dragover", (e) => {
       if (!e.dataTransfer.types.includes("application/x-sbg-workflow")) return;
@@ -153,7 +152,7 @@ app.registerExtension({
       const isOnGraph = target.closest?.(".litegraph, canvas, .comfyui-body-center, .graph-canvas-container, #graph-canvas")
         || target.tagName === "CANVAS";
       if (!isOnGraph) {
-        return; // not over the canvas - don't intercept
+        return; // not over the canvas, so don't intercept
       }
 
       e.preventDefault();
@@ -189,7 +188,7 @@ app.registerExtension({
       _clearComfyDragHighlight();
     }, true);
 
-    /* ── Register sidebar tab ─────────────────────────────────────── */
+    /* Register sidebar tab */
 
     if (!app?.extensionManager?.registerSidebarTab) return;
 
@@ -207,7 +206,7 @@ app.registerExtension({
         mountEl.style.height = "100%";
         mountEl.style.overflow = "hidden";
 
-        /* ── Gallery settings bridge ──────────────────────────────── */
+        /* Gallery settings bridge */
         function openGallerySettings(defaultTab = "layout") {
           // galleryApi may not be set yet on first render, but state is captured via closure
           const allItems = galleryApi?.state?.allItems || [];
@@ -221,7 +220,7 @@ app.registerExtension({
           }, defaultTab);
         }
 
-        /* ── Init gallery ─────────────────────────────────────────── */
+        /* Init gallery */
         const galleryApi = initGallery(mountEl, {
           openLightbox,
           openGallerySettings,
@@ -229,9 +228,9 @@ app.registerExtension({
       },
     });
 
-    /* ── Global keyboard shortcuts ────────────────────────────────── */
+    /* Global keyboard shortcuts */
 
-    // Only the two GLOBAL shortcuts live here - lightbox keys are read inside
+    // Only the two GLOBAL shortcuts live here. Lightbox keys are read inside
     // the lightbox itself. (KEY_REFRESH defaults to disabled, matching the
     // settings UI's "leave empty to disable".)
     const _keyDefaults = {
@@ -239,49 +238,71 @@ app.registerExtension({
       [S.KEY_REFRESH]: "",
     };
 
-    function matchKeyGlobal(e, settingId) {
-      const bound = getSetting(settingId, _keyDefaults[settingId] || "");
-      if (!bound) return false;
-      const pressed = e.key.length === 1 ? e.key.toLowerCase() : e.key;
-      return String(bound).split(",").map(k => k.trim()).some(k => {
-        const b = k.length === 1 ? k.toLowerCase() : k;
-        return pressed === b;
-      });
+    const _bindingOf = (settingId) => getSetting(settingId, _keyDefaults[settingId] || "");
+
+    // Toggle gallery sidebar. The aria-label form matches current ComfyUI
+    // frontends directly; the id and data-tooltip forms cover older
+    // frontends, and the icon scan below remains as the last resort.
+    function _toggleGallery() {
+      try {
+        const tabBtns = document.querySelectorAll('button[aria-label="Sidebar Gallery"], [id*="sidebarGallery"], [data-tooltip*="Gallery"], [data-tooltip*="Sidebar Gallery"]');
+        for (const btn of tabBtns) {
+          if (btn.click) { btn.click(); return; }
+        }
+        const allTabs = document.querySelectorAll('.p-tablist .p-tab, [class*="sidebar"] button');
+        for (const tab of allTabs) {
+          if (tab.querySelector('.pi-images') || tab.textContent?.includes('Gallery')) {
+            tab.click(); return;
+          }
+        }
+      } catch (err) {
+        console.warn("[SBG] Could not toggle gallery:", err);
+      }
     }
 
-    document.addEventListener("keydown", (e) => {
-      if (e.target.tagName === "INPUT" || e.target.tagName === "TEXTAREA" || e.target.isContentEditable) return;
-      if (e.ctrlKey || e.metaKey || e.altKey) return;
+    // Global actions in priority order.
+    const _globalActions = [
+      { setting: S.KEY_TOGGLE, run: () => _toggleGallery() },
+      { setting: S.KEY_REFRESH, run: () => { if (_dataCache._fetchAllItems) _dataCache._fetchAllItems({ rescan: true }); } },
+    ];
 
-      // Toggle gallery sidebar
-      if (matchKeyGlobal(e, S.KEY_TOGGLE)) {
-        e.preventDefault();
-        try {
-          const tabBtns = document.querySelectorAll('[id*="sidebarGallery"], [data-tooltip*="Gallery"], [data-tooltip*="Sidebar Gallery"]');
-          for (const btn of tabBtns) {
-            if (btn.click) { btn.click(); return; }
-          }
-          const allTabs = document.querySelectorAll('.p-tablist .p-tab, [class*="sidebar"] button');
-          for (const tab of allTabs) {
-            if (tab.querySelector('.pi-images') || tab.textContent?.includes('Gallery')) {
-              tab.click(); return;
-            }
-          }
-        } catch (err) {
-          console.warn("[SBG] Could not toggle gallery:", err);
+    // Returns true when the event matched a global binding and acted, so the
+    // pointerdown/auxclick pair below can deduplicate one physical press.
+    // Two-pass: an explicit chord ("Shift+z") is tried across BOTH actions
+    // before any bare key, so a combo binding beats a bare binding on the
+    // other action for the same key.
+    function _handleGlobal(e, desc) {
+      if (e.target.tagName === "INPUT" || e.target.tagName === "TEXTAREA" || e.target.isContentEditable) return false;
+      for (const match of [matchExplicit, (b, d) => matchBare(b, d)]) {
+        for (const a of _globalActions) {
+          if (match(_bindingOf(a.setting), desc)) { e.preventDefault(); a.run(); return true; }
         }
       }
+      return false;
+    }
 
-      // Refresh gallery
-      if (matchKeyGlobal(e, S.KEY_REFRESH)) {
-        e.preventDefault();
-        if (_dataCache._fetchAllItems) {
-          _dataCache._fetchAllItems({ rescan: true });
-        }
+    document.addEventListener("keydown", (e) => _handleGlobal(e, descFromKeyEvent(e)));
+    // Mouse buttons can be bound too (MiddleClick, Mouse4, Mouse5). Bubble
+    // phase, so the lightbox's capture handler wins any button both bind.
+    // Pointerdown covers most surfaces; over a <video>, Firefox's native
+    // controls consume the whole pointer and mouse down/up pair and only
+    // the auxclick survives, so it dispatches as the fallback. The one-shot
+    // token keeps one physical press from acting twice.
+    let _ptrHandledGlobal = { button: -1, t: 0 };
+    document.addEventListener("pointerdown", (e) => {
+      if (e.button === 0 || e.button === 2) return;
+      if (_handleGlobal(e, descFromMouseEvent(e))) {
+        _ptrHandledGlobal = { button: e.button, t: performance.now() };
       }
     });
+    document.addEventListener("auxclick", (e) => {
+      if (e.button === 0 || e.button === 2) return;
+      const dupe = e.button === _ptrHandledGlobal.button && performance.now() - _ptrHandledGlobal.t < 800;
+      _ptrHandledGlobal = { button: -1, t: 0 };
+      if (!dupe) _handleGlobal(e, descFromMouseEvent(e));
+    });
 
-    /* ── Auto-refresh on execution complete ────────────────────────── */
+    /* Auto-refresh on execution complete */
 
     let _refreshTimer = null;
 
