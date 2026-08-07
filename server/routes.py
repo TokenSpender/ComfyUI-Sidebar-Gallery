@@ -300,8 +300,9 @@ def _extra_root_id(raw: str) -> tuple[str, str]:
 # request on the event loop would freeze ComfyUI. The cache serves the last
 # known list instantly and refreshes off the loop: a config save refreshes
 # synchronously in an executor, config-file edits through the file signature,
-# and liveness changes through the periodic refresh. Only the first build, at
-# import time, runs blocking.
+# and liveness changes through the periodic refresh. The first build runs in
+# the scan executor when the deferred parser check triggers it, or blocking
+# at import in that check's fallback path.
 _ROOTS_TTL_S = 5.0
 _roots_cache: dict | None = None  # {"roots": [...], "sig": tuple | None, "ts": float}
 _roots_refresh_lock = threading.Lock()
@@ -1913,10 +1914,43 @@ def _check_parser_version():
             return
         if _start_full_reindex(stale):
             logging.getLogger("sbg").info(
-                "[SBG] Metadata parser updated (v%s -> v%s): re-extracting %d root(s) in the background",
+                "[SBG] Metadata parser updated (v%s to v%s): re-extracting %d root(s) in the background",
                 stored or "?", PARSER_VERSION, len(stale))
     except Exception as e:
         logging.getLogger("sbg").warning("[SBG] Parser-version check failed: %s", e)
 
 
-_check_parser_version()
+async def _run_parser_version_check(_app):
+    # The check builds the roots list (a stat per configured extra root) and
+    # reads the DB, so it runs in the scan executor: an offline network share
+    # must never stall the loop while every startup hook queues behind it.
+    await asyncio.get_running_loop().run_in_executor(
+        _SCAN_EXECUTOR, _check_parser_version)
+
+
+def _schedule_parser_version_check():
+    """Defer the version check until ComfyUI has loaded every node pack.
+
+    This module imports while custom nodes are still being loaded, and a
+    re-extraction started that early parses files against a partially
+    populated NODE_CLASS_MAPPINGS: every class from a pack that loads later
+    reads as unknown, so link resolution falls back to the legacy path and
+    can capture an unrelated upstream literal. The web application starts
+    serving only after all packs are loaded, so its startup hook is the
+    earliest safe moment. Appending to a started application's hooks raises,
+    in which case the check runs immediately, and the registry is complete
+    in that situation too.
+    """
+    try:
+        server.PromptServer.instance.app.on_startup.append(_run_parser_version_check)
+    except Exception as e:
+        # Make the fallback visible: if this fires for any reason other than
+        # an already-started application, the check is running before every
+        # node pack has loaded and the log line is the only trace.
+        logging.getLogger("sbg").warning(
+            "[SBG] parser version check could not defer to the startup hook"
+            " (%s); running it now", e)
+        _check_parser_version()
+
+
+_schedule_parser_version_check()

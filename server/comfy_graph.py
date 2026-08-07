@@ -38,6 +38,14 @@ _DIM_STRING_RE = re.compile(r"(\d{2,5})\s*[x×]\s*(\d{2,5})")
 # Sentinel: the chain crossed a node we have no signature for, so the caller
 # should fall back to the legacy resolver (which handles unknown packs).
 UNKNOWN = object()
+
+# A link that provably carries NOTHING at run time: a context field with no
+# override and no base to inherit from, or a reference to a node absent from
+# the executed prompt. Distinct from UNRESOLVED, where a value flowed through
+# the link but the file just does not store it. The split matters at
+# switches: a NO_VALUE branch is skipped in favour of later ones, while an
+# UNRESOLVED branch may have been the one that actually ran.
+NO_VALUE = object()
 # Sentinel: provably unresolvable from the file (runtime-measured / ambiguous).
 UNRESOLVED = object()
 
@@ -232,6 +240,88 @@ def classify(class_type: str, sig: dict | None) -> str | None:
 
 # Pure-value link resolution
 
+# Crystools pipe nodes bundle arbitrary values: "Pipe to/edit any" packs
+# any_1..any_N into a CPipeAny, and "Pipe from any" unpacks it, with output
+# slot 0 the pipe itself and slot k carrying any_k. A ref into a pipe slot is
+# demuxed to the bundled source ref before resolution, so every walk built
+# on resolve_link sees through pipes identically.
+PIPE_FROM_PATTERN = "pipe from any"
+PIPE_TO_PATTERN = "pipe to/edit any"
+
+
+# A pipe slot proven to carry nothing: the packer chain ends without ever
+# packing it, the unpacker has no bundle, or the bundle's source was pruned
+# from the executed prompt. Distinct from an inconclusive walk (unknown
+# carrier class, a cycle, the hop cap), which stays fail-open.
+SLOT_EMPTY = object()
+
+
+def pipe_slot_source(prompt: dict, pipe_ref: Any, slot: int, max_hops: int = 12) -> Any:
+    """Walk a CPipeAny chain upstream to the nearest to/edit pipe that
+    connects any_<slot>, and return that bundled ref. Edit pipes override
+    slots selectively, so the walk continues through CPipeAny while the slot
+    is absent. Returns SLOT_EMPTY when the chain provably never packs the
+    slot, and None when the walk is inconclusive."""
+    key = f"any_{slot}"
+    ref = pipe_ref
+    seen: set[str] = set()
+    for _ in range(max_hops):
+        if not (isinstance(ref, list) and len(ref) >= 1):
+            return SLOT_EMPTY  # chain ended without packing the slot
+        nid = str(ref[0])
+        if nid in seen:
+            return None
+        seen.add(nid)
+        node = prompt.get(nid)
+        if not isinstance(node, dict):
+            return SLOT_EMPTY  # bundle source pruned from the executed prompt
+        inputs = node.get("inputs")
+        if not isinstance(inputs, dict):
+            return SLOT_EMPTY
+        ct_l = str(node.get("class_type", "")).lower()
+        if PIPE_TO_PATTERN in ct_l:
+            v = inputs.get(key)
+            if isinstance(v, list) and len(v) >= 1:
+                return v
+            ref = inputs.get("CPipeAny")
+        elif PIPE_FROM_PATTERN in ct_l:
+            ref = inputs.get("CPipeAny")
+        else:
+            return None  # bundle from a class this walk cannot see through
+    return None
+
+
+def demux_pipe_ref(prompt: dict, ref: Any, max_hops: int = 8) -> Any:
+    """Resolve a ref pointing into a "Pipe from any" output slot to the
+    bundled source ref, repeating while the result is itself a pipe slot.
+    Returns NO_VALUE for a slot the chain provably never packs. Refs that do
+    not point into a pipe unpacker, and inconclusive walks, come back
+    unchanged so callers stay fail-open."""
+    for _ in range(max_hops):
+        if not (isinstance(ref, list) and len(ref) >= 2):
+            return ref
+        node = prompt.get(str(ref[0]))
+        if not isinstance(node, dict):
+            return ref
+        if PIPE_FROM_PATTERN not in str(node.get("class_type", "")).lower():
+            return ref
+        inputs = node.get("inputs")
+        if not isinstance(inputs, dict):
+            return ref
+        try:
+            slot = int(ref[1])
+        except (TypeError, ValueError):
+            return ref
+        if slot < 1:
+            return ref
+        got = pipe_slot_source(prompt, inputs.get("CPipeAny"), slot)
+        if got is SLOT_EMPTY:
+            return NO_VALUE
+        if got is None:
+            return ref
+        ref = got
+    return ref
+
 
 def _resolve_context_field(prompt: dict, node_id: str, field_name: str,
                            registry: NodeRegistry, depth: int, visited: set):
@@ -239,16 +329,17 @@ def _resolve_context_field(prompt: dict, node_id: str, field_name: str,
 
     The field is set on this Context node directly (an override input) or
     inherited from the base context it extends (follow base_ctx upward).
-    Returns the scalar value, or UNRESOLVED.
+    Returns the scalar value, NO_VALUE when the field is provably unset (no
+    override and no base to inherit from), or UNRESOLVED when unprovable.
     """
     if depth > 12:
         return UNRESOLVED
     node = prompt.get(str(node_id))
     if not isinstance(node, dict):
-        return UNRESOLVED
+        return NO_VALUE  # the carrier is absent from the executed prompt
     inputs = node.get("inputs", {})
     if not isinstance(inputs, dict):
-        return UNRESOLVED
+        return NO_VALUE
     fl = field_name.lower()
     # Direct override on this context node.
     if fl in inputs:
@@ -266,7 +357,75 @@ def _resolve_context_field(prompt: dict, node_id: str, field_name: str,
             if isinstance(base_node, dict) and registry.sig(base_node.get("class_type", "")) is None:
                 return UNKNOWN
             return _resolve_context_field(prompt, bv[0], field_name, registry, depth + 1, visited)
-    return UNRESOLVED
+    # Context Switch and Context Merge carry candidate bundles on dynamic
+    # ctx_NN inputs instead of a single base, and each kind decides its
+    # winner differently at run time, so the field resolves per kind below.
+    cands = [v for k, v in inputs.items()
+             if k.lower().startswith("ctx") and isinstance(v, list) and len(v) >= 1]
+    if cands:
+        results = []
+        for cv in cands:
+            base_node = prompt.get(str(cv[0]))
+            if isinstance(base_node, dict) and registry.sig(base_node.get("class_type", "")) is None:
+                return UNKNOWN
+            results.append(_resolve_context_field(
+                prompt, cv[0], field_name, registry, depth + 1, set(visited or ())))
+        if any(r is UNKNOWN for r in results):
+            return UNKNOWN
+        ct_kind = str(node.get("class_type", "")).lower()
+        if "merge" in ct_kind:
+            # A merge lets later bundles override earlier ones per field, so
+            # the last candidate carrying the field wins outright.
+            for r in reversed(results):
+                if r is not NO_VALUE:
+                    return r
+            return NO_VALUE
+        if "switch" in ct_kind:
+            # A switch forwards its first non-empty BUNDLE, emitting its
+            # field even when unset. A candidate whose field resolves proves
+            # its bundle non-empty and wins; one preceded by a field-empty
+            # candidate is unknowable, since that earlier bundle may carry
+            # other fields.
+            for i, r in enumerate(results):
+                if r is not NO_VALUE:
+                    if any(x is NO_VALUE for x in results[:i]):
+                        return UNRESOLVED
+                    return r
+            return NO_VALUE
+        # A carrier matching neither kind: settle only when every carrying
+        # candidate agrees on one value.
+        vals = [r for r in results if r is not NO_VALUE]
+        if not vals:
+            return NO_VALUE  # no candidate ever packs the field
+        if any(r is UNRESOLVED for r in vals):
+            return UNRESOLVED
+        if all(v == vals[0] for v in vals[1:]):
+            return vals[0]
+        return UNRESOLVED  # the candidates disagree, so the winner is unknowable
+    # A node that is not itself a context carrier can still relay the
+    # bundle: a switch forwards its taken input, a passthrough its only
+    # connection. NO_VALUE below is reserved for genuine carriers only, since
+    # on any other class it would misread "unknown node" as proven emptiness
+    # and make an enclosing switch skip the taken branch.
+    ct = str(node.get("class_type", ""))
+    sig = registry.sig(ct)
+    out_names = (sig or {}).get("output_names") or []
+    if not (out_names and str(out_names[0]).upper() == "CONTEXT"):
+        follow = None
+        if classify(ct, sig) == "switch" or "switch" in ct.lower():
+            follow = live_switch_branch(prompt, node, registry)
+        else:
+            linked = [v for v in inputs.values() if isinstance(v, list) and len(v) >= 1]
+            if len(linked) == 1:
+                follow = linked[0]
+        if isinstance(follow, list) and len(follow) >= 1:
+            nxt = prompt.get(str(follow[0]))
+            if isinstance(nxt, dict) and registry.sig(nxt.get("class_type", "")) is None:
+                return UNKNOWN
+            return _resolve_context_field(prompt, follow[0], field_name, registry, depth + 1, visited)
+        return UNRESOLVED
+    # No override and no base context connected: the field is None at run time.
+    return NO_VALUE
 
 
 def _node_of(prompt: dict, ref: Any) -> tuple[dict | None, str, int]:
@@ -278,18 +437,120 @@ def _node_of(prompt: dict, ref: Any) -> tuple[dict | None, str, int]:
     return (node if isinstance(node, dict) else None), nid, slot
 
 
+def _selector_switch_parts(sig: dict | None):
+    """(selector_input, [branch_inputs]) when the signature shapes a
+    selector-driven switch: a single output, exactly one BOOLEAN or INT
+    input (the selector), and at least two branch inputs carrying the
+    output's type. Returns None for every other shape, including the
+    selector-less any-switches that pick by liveness."""
+    if not sig or len(sig.get("output_types") or []) != 1:
+        return None
+    out_t = sig["output_types"][0]
+    sels = [k for k, t in sig["inputs"].items() if t in ("BOOLEAN", "INT")]
+    branches = [k for k, t in sig["inputs"].items()
+                if k not in sels and (t == out_t or t == "*" or out_t == "*")]
+    if len(sels) != 1 or len(branches) < 2:
+        return None
+    return sels[0], branches
+
+
+def _selector_switch_choice(prompt: dict, node: dict, sig: dict | None,
+                            registry: NodeRegistry, _depth: int = 0,
+                            _visited: set | None = None):
+    """Decide a selector-driven switch's taken branch from the graph.
+
+    Resolves the selector and maps it to the branch it names: boolean to the
+    true/false branch, integer to the branch whose numeric suffix matches.
+    Gated to switch-named classes so a node merely combining a flag with two
+    same-typed inputs (a blend) is never treated as routing.
+
+    Returns None when not a decidable selector switch (caller keeps its
+    existing behavior). Otherwise a pair: ("ref", link) for a connected
+    branch, ("value", literal) for a widget branch, or ("sentinel",
+    UNRESOLVED | UNKNOWN | NO_VALUE) when undecidable or provably empty."""
+    ct_l = str(node.get("class_type", "")).lower()
+    if "switch" not in ct_l and "ifelse" not in ct_l and "if_else" not in ct_l:
+        return None
+    inputs = node.get("inputs")
+    if not isinstance(inputs, dict):
+        return None
+    parts = _selector_switch_parts(sig)
+    if parts is None:
+        # parts is None both for known shapes the gate rejects (a trailing
+        # help/debug output, an extra mode flag) and for unsignatured
+        # classes; the numeric-suffix select widget still applies either way.
+        sel = inputs.get("select")
+        if isinstance(sel, (int, float)) and not isinstance(sel, bool):
+            numbered = False
+            for k, v in inputs.items():
+                m = re.search(r"(\d+)\s*$", k)
+                if not m:
+                    continue
+                numbered = True
+                if int(m.group(1)) == int(sel):
+                    if isinstance(v, list) and len(v) >= 1:
+                        return ("ref", v)
+                    if v is None:
+                        return ("sentinel", NO_VALUE)  # chosen slot unconnected
+                    return ("value", v)
+            if numbered:
+                # Numbered branches exist but none carries the selected
+                # number: the taken branch is unknowable from here.
+                return ("sentinel", UNRESOLVED)
+        return None
+    sel_name, branch_names = parts
+    sv = inputs.get(sel_name)
+    if isinstance(sv, list):
+        # The selector walks with its own copy of the visited set so its
+        # path never makes the chosen branch's walk trip the cycle guard.
+        sv = resolve_link(prompt, sv, registry, _depth + 1, set(_visited or ()))
+        if sv is UNKNOWN:
+            return ("sentinel", UNKNOWN)
+        if sv is UNRESOLVED or sv is NO_VALUE:
+            # The selection itself is not stored in the file (or the selector
+            # link provably carries nothing); guessing a branch would report
+            # a value the run may never have used.
+            return ("sentinel", UNRESOLVED)
+    if isinstance(sv, bool):
+        token = "true" if sv else "false"
+        want = [b for b in branch_names if token in b.lower()]
+    elif isinstance(sv, int):
+        want = []
+        for b in branch_names:
+            m = re.search(r"(\d+)\s*$", b)
+            if m and int(m.group(1)) == sv:
+                want.append(b)
+    else:
+        return None
+    if len(want) != 1:
+        return None  # names do not disambiguate this selector value
+    bv = inputs.get(want[0])
+    if isinstance(bv, list):
+        return ("ref", bv)
+    if bv is None:
+        return ("sentinel", NO_VALUE)  # chosen branch unconnected: nothing flows
+    return ("value", bv)
+
+
 def resolve_link(prompt: dict, ref: Any, registry: NodeRegistry,
                  _depth: int = 0, _visited: set | None = None):
-    """Resolve [node_id, slot] to a scalar value, UNRESOLVED, or UNKNOWN.
+    """Resolve [node_id, slot] to a scalar value, NO_VALUE, UNRESOLVED, or
+    UNKNOWN.
 
     UNKNOWN means the chain crossed a class the registry doesn't know, and
-    the caller should use the legacy resolver for this link.
+    the caller should use the legacy resolver for this link. NO_VALUE means
+    the link provably carries nothing at run time (see the sentinel's note);
+    callers treating the result as a scalar handle it like UNRESOLVED.
     """
     if _depth > 10:
         return UNRESOLVED
+    ref = demux_pipe_ref(prompt, ref)
+    if ref is NO_VALUE:
+        return NO_VALUE  # a pipe slot the chain provably never packs
     node, nid, slot = _node_of(prompt, ref)
     if node is None:
-        return UNRESOLVED
+        # Node absent from the executed prompt: pruned before execution, so it produced nothing.
+        return NO_VALUE
     _visited = _visited or set()
     vkey = f"{nid}:{slot}"
     if vkey in _visited:
@@ -316,6 +577,17 @@ def resolve_link(prompt: dict, ref: Any, registry: NodeRegistry,
             and slot > 0 and out_name):
         return _resolve_context_field(prompt, nid, out_name, registry, _depth + 1, _visited)
 
+    # Selector-driven switches (an if/else or index switch): the selector
+    # value designates the taken branch outright, so only it gets resolved.
+    # Must run BEFORE the purity gate, since branch inputs carry non-scalar
+    # types by design.
+    choice = _selector_switch_choice(prompt, node, sig, registry, _depth, _visited)
+    if choice is not None:
+        ckind, cval = choice
+        if ckind == "ref":
+            return resolve_link(prompt, cval, registry, _depth + 1, _visited)
+        return cval  # a widget literal on the chosen branch, or a sentinel
+
     # Purity: every CONNECTED input must be scalar-typed (or itself pure).
     # An IMAGE/LATENT/... input means the output is computed at runtime.
     tensor_connected = any(
@@ -327,27 +599,44 @@ def resolve_link(prompt: dict, ref: Any, registry: NodeRegistry,
 
     role = classify(ct, sig)
 
-    # Switches (rgthree Any Switch and friends): the FIRST connected input wins
-    # and literal widget fallbacks are ignored. So return the first connected
-    # branch that resolves; only if no branch resolves fall back to a literal.
+    # Switches (rgthree Any Switch and friends): at run time the FIRST input
+    # that carries a value wins; literal widget fallbacks are ignored. Skip
+    # NO_VALUE branches and settle on the first live one, even if that leaves
+    # the switch UNRESOLVED, rather than checking a later branch the run
+    # never took. An unknown-class branch defers to the legacy resolver
+    # unless a later live branch settles the value first.
     if role == "switch":
-        saw_unknown = False
+        saw_unknown = saw_connected = False
         for k, v in inputs.items():
             if isinstance(v, list):
-                r = resolve_link(prompt, v, registry, _depth + 1, _visited)
+                saw_connected = True
+                # Each branch walks with its own copy of the visited set:
+                # sibling branches converging on one upstream slot would
+                # otherwise trip the cycle guard and read as live.
+                r = resolve_link(prompt, v, registry, _depth + 1, set(_visited))
+                if r is NO_VALUE:
+                    continue  # provably empty branch: the switch skips it
                 if r is UNKNOWN:
-                    saw_unknown = True  # try the other branches before deferring
+                    saw_unknown = True
                     continue
                 if r is not UNRESOLVED and r is not None:
                     return r
+                # Live branch's value isn't in the file. An earlier
+                # unknown-pack branch may still be the taken one, so deferring
+                # to the legacy resolver beats a blank answer.
+                return UNKNOWN if saw_unknown else UNRESOLVED
         if saw_unknown:
             return UNKNOWN  # a branch crossed an unknown pack, so let legacy resolve
-        # No branch resolved, so fall back to a lone literal widget. Exclude bools:
-        # a switch's literal fallback carries a value rather than a control flag,
-        # and a stray bool returned where a numeric param is expected would be wrong.
+        # Every connected branch was provably empty, so the switch emits
+        # nothing, but a lone literal widget still counts as its fallback
+        # value. Exclude bools: a fallback carries a value rather than a
+        # control flag, and a stray bool here would be wrong for a numeric
+        # param.
         lits = [v for v in inputs.values()
                 if isinstance(v, (int, float, str)) and not isinstance(v, bool)]
-        return lits[0] if len(lits) == 1 else UNRESOLVED
+        if len(lits) == 1:
+            return lits[0]
+        return NO_VALUE if saw_connected else UNRESOLVED
 
     # Math-expression nodes: their computed result IS the value.
     from . import metadata as _md  # late import to avoid a cycle
@@ -398,7 +687,7 @@ def resolve_link(prompt: dict, ref: Any, registry: NodeRegistry,
             if chosen is None:
                 chosen = pref[0]
             v = _value_of(chosen)
-            if v not in (None, UNRESOLVED, UNKNOWN):
+            if v not in (None, UNRESOLVED, UNKNOWN, NO_VALUE):
                 return v
 
     # 3) "WxH" combo string for width/height-named outputs (JPS, CR Aspect…).
@@ -429,6 +718,32 @@ def resolve_link(prompt: dict, ref: Any, registry: NodeRegistry,
         return resolve_link(prompt, links[0], registry, _depth + 1, _visited)
 
     return UNRESOLVED
+
+
+def live_switch_branch(prompt: dict, node: Any, registry: NodeRegistry):
+    """The switch input link the run actually forwarded, or None.
+
+    Any branch except one that provably carries nothing (NO_VALUE) counts as
+    live; the first live branch wins. Falls back to the first connected
+    input when every branch is empty, keeping callers fail-open. Single
+    source of truth for switch branch selection, so other walks cannot drift
+    from resolve_link's behaviour."""
+    if not isinstance(node, dict) or not isinstance(node.get("inputs"), dict):
+        return None
+    sig = registry.sig(str(node.get("class_type", "")))
+    choice = _selector_switch_choice(prompt, node, sig, registry)
+    if choice is not None:
+        ckind, cval = choice
+        # A widget-literal branch, or an undecidable selector, leaves nothing to follow.
+        return cval if ckind == "ref" else None
+    first = None
+    for v in node["inputs"].values():
+        if isinstance(v, list) and len(v) >= 1:
+            if first is None:
+                first = v
+            if resolve_link(prompt, v, registry) is not NO_VALUE:
+                return v
+    return first
 
 
 # Pipeline model: generation resolution from the active sampler chain
@@ -792,7 +1107,7 @@ def resolve_dimension(prompt: dict, ref: Any, axis: int, registry: NodeRegistry,
     r = resolve_link(prompt, ref, registry)
     if r is UNKNOWN and legacy_fn is not None:
         return legacy_fn(ref, axis)
-    if r in (UNRESOLVED, UNKNOWN) or isinstance(r, bool):
+    if r in (UNRESOLVED, UNKNOWN, NO_VALUE) or isinstance(r, bool):
         return None
     if isinstance(r, (int, float)):
         return int(r)

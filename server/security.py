@@ -55,9 +55,9 @@ def safe_join(root_path: str, relpath: str) -> str:
         full_real = os.path.realpath(full)
         within = os.path.commonpath([full_real, root_real]) == root_real
     except OSError:
-        within = True  # realpath blocked (e.g. untrusted junction) -> rely on lexical check
+        within = True  # realpath blocked (e.g. untrusted junction), so rely on the lexical check
     except ValueError:
-        within = False  # different drives -> cannot be inside the root
+        within = False  # a path on another drive cannot be inside the root
     if not within:
         raise ValueError("Path escapes root")
     return full

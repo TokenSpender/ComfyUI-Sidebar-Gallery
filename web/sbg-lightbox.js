@@ -944,7 +944,7 @@ export function openLightbox(_initialItems, startItemOrIndex, openEvent) {
   let _prefetchTimer = null;
 
   // Step a paused video by one frame. The step uses the file's real frame
-  // rate when ffprobe extracted one, and 1/30s otherwise. A playing video
+  // rate when the indexer extracted one, and 1/30s otherwise. A playing video
   // pauses first so the step lands on a visible frame.
   function _frameStep(dir) {
     const v = currentMediaEl;
