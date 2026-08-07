@@ -6,9 +6,7 @@ import math
 import mimetypes
 import os
 import re
-import shutil
 import struct
-import subprocess
 import zlib
 from dataclasses import dataclass
 from typing import Any, Optional
@@ -22,7 +20,7 @@ PNG_SIGNATURE = b"\x89PNG\r\n\x1a\n"
 # Bump when the parser's output changes shape/coverage. Stored summaries are
 # cached in the DB; on startup a mismatch triggers a background re-extraction
 # so existing files pick up the new parser (see routes._check_parser_version).
-PARSER_VERSION = 42
+PARSER_VERSION = 51
 
 # Hard cap on any single captured node text/param string. "Show"/display nodes can
 # be wired to dump enormous blobs (e.g. a 600KB+ JSON of another image's metadata),
@@ -501,6 +499,23 @@ def _normalize_a1111_to_structured(summary: dict[str, Any]) -> None:
 
     # Normalize LoRAs to structured dicts
     loras = summary.get("loras")
+    if isinstance(loras, str):
+        # A quoted "Loras:" value carries the whole list as one string of
+        # "name: weight" pairs (same shape "Lora hashes" uses). A segment
+        # whose trailing colon part is non-numeric passes through as text
+        # so the "Name (weight)" parser below still gets a chance at it.
+        entries: list[Any] = []
+        for seg in loras.split(","):
+            seg = seg.strip()
+            if not seg:
+                continue
+            name, sep, weight = seg.rpartition(":")
+            strength = _safe_float(weight) if sep else None
+            if sep and name.strip() and strength is not None:
+                entries.append({"name": name.strip(), "strength_model": strength})
+            else:
+                entries.append(seg)
+        loras = summary["loras"] = entries
     if loras and isinstance(loras, list):
         structured_loras = []
         for l in loras:
@@ -973,72 +988,34 @@ def _resolve_ref(prompt: dict, ref: Any) -> dict | None:
 # slot 0 carrying the pipe itself and slot k carrying any_k. Walkers that
 # treat a ref as opaque dead-end on the unpacker, so refs into pipe slots
 # are demuxed back to the bundled source ref before following them.
-_PIPE_FROM_PATTERN = "pipe from any"
-_PIPE_TO_PATTERN = "pipe to/edit any"
+# Pipe bundle traversal lives in comfy_graph (shared with resolve_link, so
+# both demux identically); these names alias it for this module's call sites.
+_PIPE_FROM_PATTERN = comfy_graph.PIPE_FROM_PATTERN
+_PIPE_TO_PATTERN = comfy_graph.PIPE_TO_PATTERN
+_demux_pipe_ref = comfy_graph.demux_pipe_ref
 
 
-def _pipe_slot_source(prompt: dict, pipe_ref: Any, slot: int, max_hops: int = 12) -> Any:
-    """Walk a CPipeAny chain upstream to the nearest to/edit pipe that
-    connects any_<slot>, and return that bundled ref. Edit pipes override
-    slots selectively, so the walk continues through CPipeAny while the slot
-    is absent. Returns None when the chain never connects the slot."""
-    key = f"any_{slot}"
-    ref = pipe_ref
-    seen: set[str] = set()
-    for _ in range(max_hops):
-        if not (isinstance(ref, list) and len(ref) >= 1):
+def _guider_model_src(prompt: dict, g: Any) -> Any:
+    """The model ref a guider link leads to, or None. Demuxes pipe slots and
+    follows switches, since otherwise a routed guider would read as having
+    no model and MoE role detection would discard every role."""
+    for _ in range(8):
+        g = _demux_pipe_ref(prompt, g)
+        if not isinstance(g, list):
             return None
-        nid = str(ref[0])
-        if nid in seen:
+        gn = _resolve_ref(prompt, g)
+        if not isinstance(gn, dict):
             return None
-        seen.add(nid)
-        node = prompt.get(nid)
-        if not isinstance(node, dict):
-            return None
-        inputs = node.get("inputs")
-        if not isinstance(inputs, dict):
-            return None
-        ct_l = str(node.get("class_type", "")).lower()
-        if _PIPE_TO_PATTERN in ct_l:
-            v = inputs.get(key)
-            if isinstance(v, list) and len(v) >= 1:
-                return v
-            ref = inputs.get("CPipeAny")
-        elif _PIPE_FROM_PATTERN in ct_l:
-            ref = inputs.get("CPipeAny")
-        else:
-            return None
-    return None
-
-
-def _demux_pipe_ref(prompt: dict, ref: Any, max_hops: int = 8) -> Any:
-    """Resolve a ref pointing into a "Pipe from any" output slot to the
-    bundled source ref, repeating while the result is itself a pipe slot
-    (bundles routed through further pipes). Refs that do not point into a
-    pipe unpacker, and slots the pipe chain never connects, come back
-    unchanged so callers stay fail-open."""
-    for _ in range(max_hops):
-        if not (isinstance(ref, list) and len(ref) >= 2):
-            return ref
-        node = prompt.get(str(ref[0]))
-        if not isinstance(node, dict):
-            return ref
-        if _PIPE_FROM_PATTERN not in str(node.get("class_type", "")).lower():
-            return ref
-        inputs = node.get("inputs")
-        if not isinstance(inputs, dict):
-            return ref
+        ct = str(gn.get("class_type", ""))
         try:
-            slot = int(ref[1])
-        except (TypeError, ValueError):
-            return ref
-        if slot < 1:
-            return ref
-        got = _pipe_slot_source(prompt, inputs.get("CPipeAny"), slot)
-        if got is None:
-            return ref
-        ref = got
-    return ref
+            role = comfy_graph.classify(ct, comfy_graph.get_registry().sig(ct))
+        except Exception:
+            role = None
+        if role == "switch" or "switch" in ct.lower():
+            g = comfy_graph.live_switch_branch(prompt, gn, comfy_graph.get_registry())
+            continue
+        return (gn.get("inputs") or {}).get("model")
+    return None
 
 
 def _trace_model_shift(prompt: dict, model_ref: Any) -> float | None:
@@ -1113,8 +1090,8 @@ def _collect_model_chain_nids(prompt: dict, model_ref: Any, max_depth: int = 24)
                     break
         if not isinstance(nxt, list):
             # A model link routed through a switch/reroute carries no "model"-named
-            # input (rgthree Any Switch uses any_01/any_02/…). Follow the selected
-            # branch (the first connected input) so the walk reaches the loader
+            # input (rgthree Any Switch uses any_01/any_02/…). Follow the branch
+            # live_switch_branch designates so the walk reaches the loader
             # behind the switch, matching _walk_model_loaders / resolve_link.
             # Otherwise the chain dead-ends at the switch and a DiffusionModelLoader
             # behind it is never attributed to its sampler pass.
@@ -1124,10 +1101,24 @@ def _collect_model_chain_nids(prompt: dict, model_ref: Any, max_depth: int = 24)
                 _role = comfy_graph.classify(ct, comfy_graph.get_registry().sig(ct))
             except Exception:
                 _role = None
-            if _role in ("switch", "reroute") or "switch" in ct_l or "reroute" in ct_l:
+            if _role == "switch" or "switch" in ct_l:
+                # live_switch_branch decides which input the run forwarded,
+                # skipping a provably empty branch in favour of later ones.
+                nxt = comfy_graph.live_switch_branch(
+                    prompt, node, comfy_graph.get_registry())
+            elif _role == "reroute" or "reroute" in ct_l:
                 for v in inputs.values():
                     if isinstance(v, list) and len(v) >= 1:
                         nxt = v
+                        break
+            elif "context" in ct_l:
+                # rgthree Context/Context Big carry the model inside the bundle:
+                # a connected model input overrides, otherwise it inherits
+                # through the base context link. Without this the chain
+                # dead-ends at the carrier and loses loader attribution.
+                for _k in ("base_ctx", "ctx", "context"):
+                    if isinstance(inputs.get(_k), list):
+                        nxt = inputs.get(_k)
                         break
         ref = nxt
     return nids
@@ -1170,12 +1161,28 @@ def _compute_high_low_roles(prompt: dict, sampler_passes: list[dict],
         return {}
 
     # Resolve each pass's MODEL chain once, and the base-model loader(s) on it.
-    pass_chains = {p["nid"]: _collect_model_chain_nids(prompt, p.get("model_ref"))
+    # A custom-sampler pass has no model input of its own; its model arrives
+    # through the guider, so fall back to the guider's model source the same
+    # way _resolve_active_model_loaders does.
+    def _model_src(p: dict):
+        src = p.get("model_ref")
+        if not isinstance(src, list):
+            src = _guider_model_src(prompt, p.get("guider_ref"))
+        return src
+
+    pass_chains = {p["nid"]: _collect_model_chain_nids(prompt, _model_src(p))
                    for p in sampler_passes}
     hi_models: set[str] = set()
     lo_models: set[str] = set()
     for p in sampler_passes:
         models = {n for n in pass_chains[p["nid"]] if n in model_loader_ids}
+        if not models:
+            # A pass whose chain reaches no loader cannot be placed on either
+            # side; confirming MoE from the remaining passes risks pairing an
+            # unrelated pass's model against it (e.g. a post-process pass
+            # posing as the whole high side while the real one sits behind
+            # a dangling context link).
+            return {}
         (hi_models if roles[p["nid"]] == "high" else lo_models).update(models)
     # Require a confirmed SEPARATE base model on each side. If a base model feeds
     # both sides, or a side has no resolvable base model (e.g. hidden behind a
@@ -1203,11 +1210,11 @@ def _compute_high_low_roles(prompt: dict, sampler_passes: list[dict],
 
 def _walk_model_loaders(prompt: dict, start_ref: Any, model_loader_ids: dict[str, str],
                         max_nodes: int = 96) -> set[str]:
-    """BFS from a model link to the terminal model-loader node ids it actually
-    feeds. At a SWITCH only the first connected input (the selected branch) is
-    followed (matching comfy_graph.resolve_link's "first connected input wins"),
-    so a switch's unselected branch is excluded. Reroutes pass through; every
-    other node follows ALL its model-ish inputs (so model MERGES aren't lost)."""
+    """BFS from a model link to the terminal model-loader node ids it feeds.
+    At a SWITCH only the branch live_switch_branch selects is followed (the
+    first branch that carries anything at run time). Reroutes pass through;
+    every other node follows ALL its model-ish inputs so model MERGES
+    aren't lost."""
     found: set[str] = set()
     queue: list = [start_ref]
     seen: set[str] = set()
@@ -1236,22 +1243,38 @@ def _walk_model_loaders(prompt: dict, start_ref: Any, model_loader_ids: dict[str
             role = comfy_graph.classify(ct, comfy_graph.get_registry().sig(ct))
         except Exception:
             role = None
-        if role == "switch" or (role is None and "switch" in ct_l):
-            for v in inputs.values():               # selected branch = first connected input
-                if isinstance(v, list) and len(v) >= 1:
-                    queue.append(v)
-                    break
+        if role == "switch" or "switch" in ct_l:
+            # live_switch_branch skips a provably empty branch so a dead
+            # context carrier no longer masks the real chain. The name test
+            # also catches classes that classify as something else, keeping
+            # this gate aligned with the sibling walkers.
+            sel = comfy_graph.live_switch_branch(
+                prompt, node, comfy_graph.get_registry())
+            if sel is not None:
+                queue.append(sel)
         elif role == "reroute" or "reroute" in ct_l:
             for v in inputs.values():
                 if isinstance(v, list) and len(v) >= 1:
                     queue.append(v)
                     break
         else:
+            followed = False
             for k in ("model", "model1", "model2", "model_a", "model_b",
                       "MODEL", "patched_model", "unet"):
                 v = inputs.get(k)
                 if isinstance(v, list) and len(v) >= 1:
                     queue.append(v)
+                    followed = True
+            # rgthree Context/Context Big carry the model inside the bundle:
+            # a connected model input overrides, otherwise it inherits
+            # through the base context link. Without this the walk dead-ends
+            # at the carrier and the pass loses its loader chain.
+            if not followed and "context" in ct_l:
+                for k in ("base_ctx", "ctx", "context"):
+                    v = inputs.get(k)
+                    if isinstance(v, list) and len(v) >= 1:
+                        queue.append(v)
+                        break
     return found
 
 
@@ -1268,11 +1291,7 @@ def _resolve_active_model_loaders(prompt: dict, sampler_passes: list[dict],
     for p in sampler_passes:
         src = p.get("model_ref")
         if not isinstance(src, list):
-            g = p.get("guider_ref")
-            if isinstance(g, list):
-                gn = _resolve_ref(prompt, g)
-                if isinstance(gn, dict):
-                    src = (gn.get("inputs") or {}).get("model")
+            src = _guider_model_src(prompt, p.get("guider_ref"))
         if not isinstance(src, list):
             safe = False           # a sampler whose model source we can't even find
             continue
@@ -1365,7 +1384,8 @@ def _resolve_clip_source(prompt: dict, clip_ref: Any, max_nodes: int = 80) -> tu
 
     Returns (clip_names, baked_in, projection_names). Walks passthroughs
     (clip/clip1/clip2, rgthree Context base_ctx/ctx, Crystools pipe bundles,
-    switch first-connected, reroute) to the terminal source:
+    the switch branch live_switch_branch designates, reroute) to the
+    terminal source:
       - a checkpoint loader yields no name, since the CLIP is baked into the
         checkpoint with no separate file (baked_in=True);
       - a CLIP loader yields its clip_name / clip_name1..4; a DualCLIPLoader
@@ -1437,7 +1457,17 @@ def _resolve_clip_source(prompt: dict, clip_ref: Any, max_nodes: int = 80) -> tu
                 _role = comfy_graph.classify(ct, comfy_graph.get_registry().sig(ct))
             except Exception:
                 _role = None
-            if _role in ("switch", "reroute") or "switch" in ct_l or "reroute" in ct_l:
+            if _role == "switch" or "switch" in ct_l:
+                # live_switch_branch decides which input the run forwarded,
+                # skipping a provably empty branch. A recognized switch ends
+                # the walk here even when undecidable, since falling through
+                # to the leaf scan would read its own widgets as encoder files.
+                followed = True
+                sel = comfy_graph.live_switch_branch(
+                    prompt, node, comfy_graph.get_registry())
+                if sel is not None:
+                    queue.append(sel)
+            elif _role == "reroute" or "reroute" in ct_l:
                 for v in inputs.values():
                     if isinstance(v, list) and len(v) >= 1:
                         queue.append(v)
@@ -1522,7 +1552,14 @@ def _resolve_vae_source(prompt: dict, vae_ref: Any, max_nodes: int = 40) -> str 
                 _role = comfy_graph.classify(ct, comfy_graph.get_registry().sig(ct))
             except Exception:
                 _role = None
-            if _role in ("switch", "reroute") or "switch" in ct_l or "reroute" in ct_l:
+            if _role == "switch" or "switch" in ct_l:
+                # live_switch_branch decides which input the run forwarded,
+                # skipping a provably empty branch in favour of later ones.
+                sel = comfy_graph.live_switch_branch(
+                    prompt, node, comfy_graph.get_registry())
+                if sel is not None:
+                    queue.append(sel)
+            elif _role == "reroute" or "reroute" in ct_l:
                 for v in inputs.values():
                     if isinstance(v, list) and len(v) >= 1:
                         queue.append(v)
@@ -1927,7 +1964,7 @@ def _resolve_scalar_smart(prompt: dict, ref: Any) -> int | float | str | bool | 
     r = comfy_graph.resolve_link(prompt, ref, comfy_graph.get_registry())
     if r is comfy_graph.UNKNOWN:
         return _resolve_scalar_ref(prompt, ref)
-    if r is comfy_graph.UNRESOLVED:
+    if r is comfy_graph.UNRESOLVED or r is comfy_graph.NO_VALUE:
         return None
     return r
 
@@ -2112,32 +2149,15 @@ def _feeds_upscaler_first(prompt: dict, start_nid: str, max_steps: int = 400) ->
     return False
 
 
-def _switch_active_ref(node: dict) -> Any:
-    """The input ref a switch statically forwards, or None when the choice is
-    runtime-driven and every input must be treated as live. A scalar `select`
-    widget addresses its slot by number. rgthree's Any Switch forwards its
-    first non-empty input, and a muted producer is spliced out of the API
-    prompt, so first-connected mirrors the runtime choice for it. Condition
-    pickers (if/else nodes, boolean switches) stay unknown on purpose: a
-    linked condition resolves at runtime, and claiming a branch there once
-    dropped a real interpolation pass."""
-    inputs = node.get("inputs")
-    if not isinstance(inputs, dict):
-        return None
-    linked = [(k, v) for k, v in sorted(inputs.items())
-              if isinstance(v, list) and len(v) >= 2]
-    if not linked:
-        return None
-    sel = inputs.get("select")
-    if isinstance(sel, (int, float)) and not isinstance(sel, bool):
-        for k, v in linked:
-            m = re.search(r"(\d+)\s*$", k)
-            if m and int(m.group(1)) == int(sel):
-                return v
-        return None
-    if "any switch" in str(node.get("class_type", "")).lower():
-        return linked[0][1]
-    return None
+def _switch_active_ref(prompt: dict, node: dict) -> Any:
+    """The input ref a switch statically forwards, or None when the choice
+    cannot be decided and every input must be treated as live. Delegates to
+    comfy_graph.live_switch_branch so branch selection stays in one place:
+    a decidable selector designates its branch, an undecidable one comes
+    back None, and every other switch takes its first non-empty input
+    (falling back to the first connected input if all branches are empty)."""
+    ref = comfy_graph.live_switch_branch(prompt, node, comfy_graph.get_registry())
+    return ref if isinstance(ref, list) and len(ref) >= 1 else None
 
 
 def _switched_off_nids(prompt: dict, nids: set[str]) -> set[str]:
@@ -2188,7 +2208,7 @@ def _switched_off_nids(prompt: dict, nids: set[str]) -> set[str]:
                 if not isinstance(cnd, dict):
                     continue
                 if respect_switches and _is_switch(cnd):
-                    active = _switch_active_ref(cnd)
+                    active = _switch_active_ref(prompt, cnd)
                     if isinstance(active, list) and str(active[0]) != cur:
                         continue  # the switch forwards a different input
                 stack.append(cnid)
@@ -2464,8 +2484,11 @@ def _extract_from_comfyui_prompt(prompt: dict, summary: dict):
             if key.lower() in skip_names:
                 continue
             if isinstance(val, list) and len(val) >= 1:
+                # The demux returns NO_VALUE for a provably empty pipe slot, so
+                # re-check the shape before following the ref.
                 val = _demux_pipe_ref(prompt, val)
-                _trace_cond_chain(str(val[0]), mark, skip_names, visited)
+                if isinstance(val, list) and len(val) >= 1:
+                    _trace_cond_chain(str(val[0]), mark, skip_names, visited)
 
     for nid, ndata in prompt.items():
         if isinstance(ndata, dict) and "inputs" in ndata and isinstance(ndata["inputs"], dict):
@@ -2473,12 +2496,14 @@ def _extract_from_comfyui_prompt(prompt: dict, summary: dict):
                 neg_ref = ndata["inputs"].get(neg_name)
                 if isinstance(neg_ref, list) and len(neg_ref) >= 1:
                     neg_ref = _demux_pipe_ref(prompt, neg_ref)
-                    _trace_cond_chain(str(neg_ref[0]), negative_node_ids, _POSITIVE_INPUT_NAMES)
+                    if isinstance(neg_ref, list) and len(neg_ref) >= 1:
+                        _trace_cond_chain(str(neg_ref[0]), negative_node_ids, _POSITIVE_INPUT_NAMES)
             for pos_name in _POSITIVE_INPUT_NAMES:
                 pos_ref = ndata["inputs"].get(pos_name)
                 if isinstance(pos_ref, list) and len(pos_ref) >= 1:
                     pos_ref = _demux_pipe_ref(prompt, pos_ref)
-                    _trace_cond_chain(str(pos_ref[0]), positive_node_ids, _NEG_INPUT_NAMES)
+                    if isinstance(pos_ref, list) and len(pos_ref) >= 1:
+                        _trace_cond_chain(str(pos_ref[0]), positive_node_ids, _NEG_INPUT_NAMES)
 
     # Pre-scan: map ControlNet loader node_ids to model names (order-independent)
     cn_loader_map: dict[str, str] = {}
@@ -3266,6 +3291,10 @@ def _extract_from_comfyui_prompt(prompt: dict, summary: dict):
                 if isinstance(val, list):
                     # A pipe bundle can carry the fps; unwrap to the real source.
                     val = _demux_pipe_ref(prompt, val)
+                    if val is comfy_graph.NO_VALUE:
+                        # The pipe chain provably never packs this slot; a bare
+                        # sentinel must never land in the summary.
+                        continue
                 if val is not None and not isinstance(val, (list, dict)):
                     interp[key] = val
                 elif isinstance(val, list):
@@ -4805,146 +4834,107 @@ def read_video_sidecar(path: str) -> dict[str, Any] | None:
     return None
 
 
-_FFPROBE_CACHE: list = []  # memoized resolved path (or [None])
-
-
-def _find_ffprobe() -> str | None:
-    """Locate ffprobe even when it isn't on ComfyUI's process PATH.
-
-    ComfyUI is often launched from a venv/launcher whose PATH omits per-user dirs
-    (e.g. WinGet Links), so shutil.which() can return None even though ffprobe is
-    installed. Fall back to common install locations and the FFPROBE env var.
-    """
-    if _FFPROBE_CACHE:
-        return _FFPROBE_CACHE[0]
-    found = shutil.which("ffprobe") or os.environ.get("FFPROBE")
-    if not found:
-        exe = "ffprobe.exe" if os.name == "nt" else "ffprobe"
-        candidates = []
-        home = os.path.expanduser("~")
-        if os.name == "nt":
-            candidates += [
-                os.path.join(home, "AppData", "Local", "Microsoft", "WinGet", "Links", exe),
-                r"C:\ffmpeg\bin\ffprobe.exe",
-                r"C:\Program Files\ffmpeg\bin\ffprobe.exe",
-            ]
-        else:
-            candidates += ["/usr/bin/ffprobe", "/usr/local/bin/ffprobe", "/opt/homebrew/bin/ffprobe"]
-        for c in candidates:
-            if c and os.path.isfile(c):
-                found = c
-                break
-    _FFPROBE_CACHE.append(found)
-    return found
-
-
-def _read_video_ffprobe(path: str) -> dict[str, Any]:
-    """Extract video info (duration, resolution, codec, fps) and embedded metadata via ffprobe."""
-    ffprobe = _find_ffprobe()
-    if ffprobe is None:
-        return {}
+def _read_video_av(path: str) -> dict[str, Any]:
+    """Extract video info (duration, resolution, codec, fps) and embedded metadata.
+    Reads the container in process with PyAV (a ComfyUI dependency), so no
+    external command-line tool is needed. Returns an empty dict when PyAV is
+    unavailable or the file cannot be read as a video."""
     try:
-        cmd = [
-            ffprobe, "-v", "quiet",
-            "-print_format", "json",
-            "-show_format", "-show_streams",
-            path,
-        ]
-        result = subprocess.run(cmd, capture_output=True, text=True, timeout=10)
-        if result.returncode != 0:
-            return {}
-        data = json.loads(result.stdout)
+        import av
     except Exception:
         return {}
 
     info: dict[str, Any] = {}
 
-    # Duration from format
-    fmt = data.get("format", {})
-    dur = fmt.get("duration")
-    if dur:
-        try:
-            secs = float(dur)
-            mins, s = divmod(int(secs), 60)
-            hrs, mins = divmod(mins, 60)
-            if hrs:
-                info["duration"] = f"{hrs}:{mins:02d}:{s:02d}"
-            else:
-                info["duration"] = f"{mins}:{s:02d}"
-            info["duration_seconds"] = round(secs, 2)
-        except (ValueError, TypeError):
-            pass
+    def _set_duration(secs: float) -> None:
+        mins, s = divmod(int(secs), 60)
+        hrs, mins = divmod(mins, 60)
+        if hrs:
+            info["duration"] = f"{hrs}:{mins:02d}:{s:02d}"
+        else:
+            info["duration"] = f"{mins}:{s:02d}"
+        info["duration_seconds"] = round(secs, 2)
 
-    # Extract embedded metadata from container comment tag
-    # VHS_VideoCombine embeds {"prompt": ..., "workflow": ...} as JSON in format.tags.comment
-    # Note: mp4 uses lowercase "comment", webm/matroska uses uppercase "COMMENT"
-    tags = fmt.get("tags", {})
-    comment = tags.get("comment", "") or tags.get("COMMENT", "") or tags.get("Comment", "")
-    if not comment:
-        # Some savers write the metadata into per-stream tags instead of the
-        # container's format tags, so check those too (also try "description").
-        for stream in data.get("streams", []):
-            stags = stream.get("tags") or {}
-            comment = (stags.get("comment", "") or stags.get("COMMENT", "")
-                       or stags.get("description", "") or stags.get("DESCRIPTION", ""))
-            if comment:
-                break
-        if not comment:
-            comment = tags.get("description", "") or tags.get("DESCRIPTION", "")
-    if comment:
-        try:
-            comment_data = json.loads(comment)
-            if isinstance(comment_data, dict):
-                if "prompt" in comment_data:
-                    info["prompt"] = comment_data["prompt"]
-                if "workflow" in comment_data:
-                    info["workflow"] = comment_data["workflow"]
-        except (json.JSONDecodeError, ValueError):
-            pass
+    try:
+        # "replace" keeps tags whose bytes fail UTF-8 decoding; the default of
+        # "strict" would abort the whole open on one bad tag.
+        with av.open(path, metadata_errors="replace") as container:
+            # Container duration is measured in AV_TIME_BASE (microsecond) ticks.
+            if container.duration:
+                _set_duration(container.duration / 1_000_000)
 
-    # ComfyUI's core SaveVideo node writes "prompt" and "workflow" as their own
-    # metadata keys (mp4 mdta atoms) instead of a combined "comment" JSON -
-    # ffprobe surfaces them as format tags under those exact names.
-    for key in ("prompt", "workflow"):
-        if key in info:
-            continue
-        v = tags.get(key) or tags.get(key.upper())
-        if isinstance(v, str) and v.strip():
-            parsed_v = _json_best_effort(v)
-            if isinstance(parsed_v, dict):
-                info[key] = parsed_v
-
-    # Find video stream
-    for stream in data.get("streams", []):
-        if stream.get("codec_type") != "video":
-            continue
-        w = stream.get("width")
-        h = stream.get("height")
-        if w and h:
-            info["resolution"] = f"{w}×{h}"
-        codec = stream.get("codec_name")
-        if codec:
-            info["codec"] = codec
-        # FPS from r_frame_rate or avg_frame_rate
-        for fps_key in ("r_frame_rate", "avg_frame_rate"):
-            fps_str = stream.get(fps_key)
-            if fps_str and "/" in fps_str:
-                try:
-                    num, den = fps_str.split("/")
-                    fps = float(num) / float(den)
-                    if 0 < fps < 1000:
-                        info["fps"] = round(fps, 2)
+            # VHS_VideoCombine embeds {"prompt": ..., "workflow": ...} as JSON in
+            # the container comment tag. mp4 uses lowercase "comment", webm/
+            # matroska uses uppercase "COMMENT".
+            tags = dict(container.metadata or {})
+            comment = tags.get("comment", "") or tags.get("COMMENT", "") or tags.get("Comment", "")
+            if not comment:
+                # Some savers write the metadata into per-stream tags instead of the
+                # container's format tags, so check those too (also try "description").
+                for stream in container.streams:
+                    stags = dict(stream.metadata or {})
+                    comment = (stags.get("comment", "") or stags.get("COMMENT", "")
+                               or stags.get("description", "") or stags.get("DESCRIPTION", ""))
+                    if comment:
                         break
-                except (ValueError, ZeroDivisionError):
+                if not comment:
+                    comment = tags.get("description", "") or tags.get("DESCRIPTION", "")
+            if comment:
+                try:
+                    comment_data = json.loads(comment)
+                    if isinstance(comment_data, dict):
+                        if "prompt" in comment_data:
+                            info["prompt"] = comment_data["prompt"]
+                        if "workflow" in comment_data:
+                            info["workflow"] = comment_data["workflow"]
+                except (json.JSONDecodeError, ValueError):
                     pass
-        # Total frames
-        nb = stream.get("nb_frames")
-        if nb:
-            try:
-                info["total_frames"] = int(nb)
-            except (ValueError, TypeError):
-                pass
-        break  # Only first video stream
+
+            # ComfyUI's core SaveVideo node writes "prompt" and "workflow" as their
+            # own metadata keys (mp4 mdta atoms) rather than a combined "comment"
+            # JSON; libavformat surfaces them as container tags under those names.
+            for key in ("prompt", "workflow"):
+                if key in info:
+                    continue
+                v = tags.get(key) or tags.get(key.upper())
+                if isinstance(v, str) and v.strip():
+                    parsed_v = _json_best_effort(v)
+                    if isinstance(parsed_v, dict):
+                        info[key] = parsed_v
+
+            # First video stream: resolution, codec, frame rate, frame count.
+            vstreams = container.streams.video
+            if vstreams:
+                stream = vstreams[0]
+                w = stream.width
+                h = stream.height
+                if w and h:
+                    info["resolution"] = f"{w}×{h}"
+                # canonical_name is the format's own name (av1); codec_context.name
+                # is the decoder libavcodec picked (e.g. libdav1d), which varies
+                # with the installed wheel, so canonical_name is the stable choice.
+                cdesc = getattr(stream.codec_context, "codec", None)
+                codec = (getattr(cdesc, "canonical_name", None)
+                         or getattr(stream.codec_context, "name", None))
+                if codec:
+                    info["codec"] = codec
+                # base_rate is the stream's declared frame rate and
+                # average_rate its measured average. Prefer the declared rate,
+                # then fall back to the average.
+                for rate in (stream.base_rate, stream.average_rate):
+                    if rate:
+                        fps = float(rate)
+                        if 0 < fps < 1000:
+                            info["fps"] = round(fps, 2)
+                            break
+                nb = stream.frames
+                if nb:
+                    info["total_frames"] = int(nb)
+                # Duration fallback for containers that only stamp the stream.
+                if "duration_seconds" not in info and stream.duration and stream.time_base:
+                    _set_duration(float(stream.duration * stream.time_base))
+    except Exception:
+        return {}
 
     return info
 
@@ -4989,8 +4979,8 @@ def read_metadata_for_file(
         prompt = parsed.get("prompt") if isinstance(parsed, dict) else None
         workflow = parsed.get("workflow") if isinstance(parsed, dict) else None
     else:
-        # Video files: use ffprobe to extract both technical info and embedded metadata
-        video_info = _read_video_ffprobe(path)
+        # Video files: read technical info and embedded metadata from the container
+        video_info = _read_video_av(path)
         if video_info:
             parsed["video_info"] = video_info
             # Extract prompt/workflow from embedded comment tag

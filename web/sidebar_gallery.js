@@ -172,7 +172,7 @@ app.registerExtension({
         }
 
         const m = await api("/sidebar_gallery/metadata", { root_id, relpath });
-        if (!m?.workflow) { showToast("No workflow data in this image"); return; }
+        if (!m?.workflow) { showToast("No workflow data in this file"); return; }
         let wf = m.workflow;
         if (typeof wf === "string") wf = JSON.parse(wf);
         app.loadGraphData(wf);

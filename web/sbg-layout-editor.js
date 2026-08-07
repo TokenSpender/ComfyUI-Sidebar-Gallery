@@ -148,7 +148,7 @@ function _paintSwatch(el, colorObj, defaults) {
   const co = (colorObj && typeof colorObj === "object") ? colorObj : {};
   const d = defaults || {};
   const chan = (k) => co[k] || d[k] || "";
-  el.textContent = "";          // the stripes are the indicator, not an emoji
+  el.textContent = "";          // the stripes alone are the indicator
   el.style.background = "";
   // Fixed 22x14 inner swatch: the button has no intrinsic size, so a
   // percentage-height box would collapse it. A bordered box stays visible

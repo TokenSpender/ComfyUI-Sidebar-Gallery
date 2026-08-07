@@ -86,4 +86,4 @@ git clone https://github.com/TokenSpender/ComfyUI-Sidebar-Gallery.git ComfyUI-si
 
 Either way, it then appears as a **Gallery** tab in the sidebar.
 
-Video thumbnails work out of the box, via a bundled ffmpeg (the `imageio-ffmpeg` dependency). Reading video metadata (duration, codec, fps) additionally needs `ffprobe` on your `PATH`; without it, thumbnails still work and those fields are just left blank. Images need none of this.
+Video thumbnails work via imageio-ffmpeg. Video metadata (duration, codec, fps, embedded workflows) is read with PyAV, which is included with ComfyUI by default. Images need none of this.
