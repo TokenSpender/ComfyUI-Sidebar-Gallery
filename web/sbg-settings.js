@@ -7,7 +7,7 @@
 
 import {
   h, api, showToast,
-  getSetting, saveSetting, fmtBytes,
+  getSetting, saveSetting, fmtBytes, applyCustomThemeVars, confirmClick,
   parseColor, formatColor, formatRgba, checkerBg,
   _metaCache, _metaCacheAPI, _resetIdb,
   _thumbCacheAPI, _thumbMemCache, resetFailedThumbs,
@@ -42,15 +42,7 @@ export function _applyPresetKeys(keys) {
   }
 }
 
-/**
- * Open the Gallery Settings panel.
- * @param {Object} galleryCtx - Gallery-scope references
- * @param {Array} galleryCtx.allItems - Current list of all gallery items
- * @param {Function} galleryCtx.fetchAllItems - Function to re-fetch all items from server
- * @param {string} [defaultTab="layout"] - Which tab to open by default
- */
 export function openGallerySettings(galleryCtx, defaultTab = "layout") {
-// Full-screen overlay (like lightbox)
 const gsOverlay = h("div", { class: "sbg-gs-overlay" });
 const gsPanel = h("div", { class: "sbg-gs-panel" });
 
@@ -74,7 +66,7 @@ gsPanel.appendChild(tabBar);
 gsPanel.appendChild(content);
 gsOverlay.appendChild(gsPanel);
 
-// Append to sbg-root if it exists so we inherit native themes (dark/blue), otherwise fallback to document.body
+// Appending to sbg-root when present makes the panel inherit the native themes.
 const sbgRoot = document.querySelector(".sbg-root");
 if (sbgRoot) {
   sbgRoot.appendChild(gsOverlay);
@@ -96,7 +88,6 @@ gsClose.addEventListener("click", closeGS);
 gsOverlay.addEventListener("click", (e) => { if (e.target === gsOverlay) closeGS(); });
 document.addEventListener("keydown", _gsKey);
 
-// Cache sizes: placeholder when empty, otherwise the shared byte formatter.
 function _fmtCacheSize(bytes) {
   return !bytes || bytes <= 0 ? "—" : fmtBytes(bytes);
 }
@@ -149,7 +140,7 @@ async function refreshDiagStats(diagStatsContainer) {
       }
     } catch { }
 
-    diagStatsContainer.appendChild(h("div", { class: "sbg-diag-section__title", text: "Server Thumbnails", title: "JPEG thumbnails generated and stored on the server in the .thumbs folder. Shared across all browsers/clients. No in-memory cache - served directly from disk on each request.", style: "margin-top:10px" }));
+    diagStatsContainer.appendChild(h("div", { class: "sbg-diag-section__title", text: "Server Thumbnails", title: "JPEG thumbnails generated and stored on the server in the .thumbs folder. Shared across all browsers/clients. No in-memory cache. Served directly from disk on each request.", style: "margin-top:10px" }));
     diagStatsContainer.appendChild(h("div", { class: "sbg-diag-stat" }, [h("span", { class: "sbg-diag-stat__label", text: "Count" }), h("span", { class: "sbg-diag-stat__value", text: (st.thumbnails?.count || 0).toLocaleString() })]));
     diagStatsContainer.appendChild(h("div", { class: "sbg-diag-stat" }, [h("span", { class: "sbg-diag-stat__label", text: "Size" }), h("span", { class: "sbg-diag-stat__value", text: `${st.thumbnails?.size_mb || 0} MB` })]));
 
@@ -178,11 +169,6 @@ async function refreshDiagStats(diagStatsContainer) {
   }
 }
 
-function _writeSetting(id, value) {
-  saveSetting(id, value);
-}
-
-// Helper: make a setting row
 function _settingRow(label, input, tooltip) {
   const row = h("div", { class: "sbg-gs-row", title: tooltip || "" });
   row.appendChild(h("label", { class: "sbg-gs-label", text: label }));
@@ -194,14 +180,14 @@ function _toggle(id, fallback, label, tooltip) {
   const val = getSetting(id, fallback);
   const cb = h("input", { type: "checkbox" });
   cb.checked = !!val;
-  cb.addEventListener("change", () => _writeSetting(id, cb.checked));
+  cb.addEventListener("change", () => saveSetting(id, cb.checked));
   return _settingRow(label, cb, tooltip);
 }
 
 function _textInput(id, fallback, label, tooltip) {
   const val = getSetting(id, fallback);
   const inp = h("input", { type: "text", class: "sbg-gs-input", value: String(val || "") });
-  inp.addEventListener("change", () => _writeSetting(id, inp.value));
+  inp.addEventListener("change", () => saveSetting(id, inp.value));
   return _settingRow(label, inp, tooltip);
 }
 
@@ -244,7 +230,7 @@ function _colorInput(id, fallback, label, tooltip, callback, replaceChannel) {
     displayColor = color;
     swatch.style.background = checkerBg(color);
     text.value = _toRgba(color);
-    _writeSetting(id, color);
+    saveSetting(id, color);
     if (callback) callback(color);
     // A global colour changed, so drop the layout editor's cached swatch defaults
     // so its param/tab/section colour pickers re-read the new value.
@@ -256,7 +242,6 @@ function _colorInput(id, fallback, label, tooltip, callback, replaceChannel) {
     }
   }
 
-  // Clickable swatch (shows transparency over a checkerboard)
   const swatch = h("div", {
     class: "sbg-color-swatch",
     style: "width:28px;height:28px;border-radius:6px;border:2px solid var(--sbg-border);cursor:pointer;flex-shrink:0;transition:box-shadow 0.15s;"
@@ -265,16 +250,15 @@ function _colorInput(id, fallback, label, tooltip, callback, replaceChannel) {
   swatch.addEventListener("mouseenter", () => { swatch.style.boxShadow = "0 0 0 2px var(--sbg-accent)"; });
   swatch.addEventListener("mouseleave", () => { swatch.style.boxShadow = ""; });
 
-  // Colour text input (accepts hex or rgba)
+  // Accepts hex or rgba.
   const text = h("input", { type: "text", class: "sbg-gs-input sbg-gs-input--sm", value: _toRgba(displayColor) });
   text.addEventListener("change", () => {
     const v = text.value.trim();
     const pc = parseColor(v);
     if (pc) { applyColor(formatColor(pc.r, pc.g, pc.b, pc.a)); if (picker) { picker.destroy(); panel.removeChild(picker.panel); picker = null; } }
-    else { displayColor = v; swatch.style.background = checkerBg(v); _writeSetting(id, v); if (callback) callback(v); }
+    else { displayColor = v; swatch.style.background = checkerBg(v); saveSetting(id, v); if (callback) callback(v); }
   });
 
-  // Popover hosting the shared colour picker (created lazily on first open)
   const panel = h("div", { class: "sbg-color-panel", style: "display:none;position:fixed;z-index:9999;background:var(--sbg-surface,#1e1e1e);border:1px solid var(--sbg-border);border-radius:10px;padding:12px;box-shadow:0 12px 40px rgba(0,0,0,0.6);width:max-content;min-width:220px;" });
   let picker = null;
   function ensurePicker() {
@@ -295,7 +279,6 @@ function _colorInput(id, fallback, label, tooltip, callback, replaceChannel) {
     panel.style.top = top + "px";
   }
 
-  // Toggle popover
   swatch.addEventListener("click", (e) => {
     e.stopPropagation();
     const isOpen = panel.style.display !== "none";
@@ -327,21 +310,21 @@ function _comboInput(id, fallback, options, label, tooltip, callback) {
   const val = getSetting(id, fallback);
   const sel = h("select", { class: "sbg-gs-select" }, options.map(o => h("option", { value: o, text: o })));
   sel.value = val;
-  sel.addEventListener("change", () => { _writeSetting(id, sel.value); if (callback) callback(sel.value); });
+  sel.addEventListener("change", () => { saveSetting(id, sel.value); if (callback) callback(sel.value); });
   return _settingRow(label, sel, tooltip);
 }
 
 function _numberInput(id, fallback, label, tooltip) {
   const val = getSetting(id, fallback);
   const inp = h("input", { type: "number", class: "sbg-gs-input sbg-gs-input--sm", value: String(val || fallback) });
-  inp.addEventListener("change", () => _writeSetting(id, Number(inp.value)));
+  inp.addEventListener("change", () => saveSetting(id, Number(inp.value)));
   return _settingRow(label, inp, tooltip);
 }
 
 // Tab Renderers
 
 
-/* Layout Editor (extracted to sbg-layout-editor.js) */
+/* Layout Editor, rendered by sbg-layout-editor.js */
 
 
 
@@ -360,61 +343,51 @@ function _numberInput(id, fallback, label, tooltip) {
 function renderAppearance() {
   content.innerHTML = "";
   const wrap = h("div", { class: "sbg-gs-form" });
-  wrap.appendChild(h("div", { class: "sbg-gs-section-title", text: "Badge Colors" }));
-
-  // Helper: create a live preview badge chip
   function _badgePreview(text, color) {
     return h("span", { text, style: `display:inline-block;padding:2px 6px;border-radius:4px;font-size:10px;font-weight:600;color:#fff;background:${color};margin-right:4px;` });
   }
 
-  // HIGH Badge with live preview
-  const highBadge = _badgePreview("HIGH", getSetting(S.BADGE_HIGH_COLOR, "#f87171") || "#f87171");
-  const highRow = _colorInput(S.BADGE_HIGH_COLOR, "#f87171", "", "Color for HIGH/base KSampler and model badges", (c) => { highBadge.style.background = c; });
-  const highLabel = highRow.querySelector(".sbg-gs-label");
-  if (highLabel) { highLabel.innerHTML = ""; highLabel.appendChild(highBadge); highLabel.appendChild(document.createTextNode(" Badge")); }
-  wrap.appendChild(highRow);
+  // One builder for the colour rows: the preview chip sits in the label slot
+  // (with optional text around it) and re-colours through onColor as the
+  // input changes. onColor receives the raw picked value ("" = default).
+  function _chipRow(id, fallback, chip, opts) {
+    const row = _colorInput(id, fallback, "", opts.tooltip || "", opts.onColor);
+    const label = row.querySelector(".sbg-gs-label");
+    if (label) {
+      label.innerHTML = "";
+      if (opts.prefix) label.appendChild(document.createTextNode(opts.prefix));
+      label.appendChild(chip);
+      if (opts.caption) label.appendChild(document.createTextNode(opts.caption));
+    }
+    wrap.appendChild(row);
+  }
 
-  // LOW Badge with live preview
-  const lowBadge = _badgePreview("LOW", getSetting(S.BADGE_LOW_COLOR, "#60a5fa") || "#60a5fa");
-  const lowRow = _colorInput(S.BADGE_LOW_COLOR, "#60a5fa", "", "Color for LOW/refine KSampler and model badges", (c) => { lowBadge.style.background = c; });
-  const lowLabel = lowRow.querySelector(".sbg-gs-label");
-  if (lowLabel) { lowLabel.innerHTML = ""; lowLabel.appendChild(lowBadge); lowLabel.appendChild(document.createTextNode(" Badge")); }
-  wrap.appendChild(lowRow);
+  wrap.appendChild(h("div", { class: "sbg-gs-section-title", text: "Badge Colors" }));
 
-  // Video Badge with live preview
-  const vidBadge = _badgePreview("MP4", getSetting(S.VIDEO_BADGE_COLOR, "#facc15") || "#facc15");
-  vidBadge.style.color = "#000";
-  const vidRow = _colorInput(S.VIDEO_BADGE_COLOR, "#facc15", "", "Color for the format badge on video thumbnails", (c) => { vidBadge.style.background = c; });
-  const vidLabel = vidRow.querySelector(".sbg-gs-label");
-  if (vidLabel) { vidLabel.innerHTML = ""; vidLabel.appendChild(vidBadge); vidLabel.appendChild(document.createTextNode(" Badge")); }
-  wrap.appendChild(vidRow);
+  for (const [key, def, text, caption, tip] of [
+    [S.BADGE_HIGH_COLOR, "#f87171", "HIGH", " Badge", "Color for HIGH/base KSampler and model badges"],
+    [S.BADGE_LOW_COLOR, "#60a5fa", "LOW", " Badge", "Color for LOW/refine KSampler and model badges"],
+    [S.VIDEO_BADGE_COLOR, "#facc15", "MP4", " Badge", "Color for the format badge on video thumbnails"],
+    [S.SEARCH_TAG_COLOR, "#6495ed", "search", " Search Badge", "Color for search tag badges in the search bar"],
+    [S.SEARCH_TAG_NEG_COLOR, "#ef4444", "\u2212exclude", " Exclude Badge", "Color for negative/exclude search tag badges"],
+  ]) {
+    const chip = _badgePreview(text, getSetting(key, def) || def);
+    if (key === S.VIDEO_BADGE_COLOR) chip.style.color = "#000";
+    _chipRow(key, def, chip, { caption, tooltip: tip, onColor: (c) => { chip.style.background = c; } });
+  }
 
-  // Search Tag Badge with live preview
-  const searchBadge = _badgePreview("search", getSetting(S.SEARCH_TAG_COLOR, "#6495ed") || "#6495ed");
-  const searchRow = _colorInput(S.SEARCH_TAG_COLOR, "#6495ed", "", "Color for search tag badges in the search bar", (c) => { searchBadge.style.background = c; });
-  const searchLabel = searchRow.querySelector(".sbg-gs-label");
-  if (searchLabel) { searchLabel.innerHTML = ""; searchLabel.appendChild(searchBadge); searchLabel.appendChild(document.createTextNode(" Search Badge")); }
-  wrap.appendChild(searchRow);
-
-  // Negative Search Tag Badge with live preview
-  const negBadge = _badgePreview("−exclude", getSetting(S.SEARCH_TAG_NEG_COLOR, "#ef4444") || "#ef4444");
-  const negRow = _colorInput(S.SEARCH_TAG_NEG_COLOR, "#ef4444", "", "Color for negative/exclude search tag badges", (c) => { negBadge.style.background = c; });
-  const negLabel = negRow.querySelector(".sbg-gs-label");
-  if (negLabel) { negLabel.innerHTML = ""; negLabel.appendChild(negBadge); negLabel.appendChild(document.createTextNode(" Exclude Badge")); }
-  wrap.appendChild(negRow);
-
-  // Search Highlight with live preview
   wrap.appendChild(h("div", { class: "sbg-gs-section-title", text: "Highlight Color", style: "margin-top:16px" }));
   const hlColor = localStorage.getItem("SBG.GS.HighlightBg") || "rgba(250, 204, 21, 0.35)";
   const hlSample = h("span", { text: "Highlight", style: `background:${hlColor};padding:1px 4px;border-radius:2px;` });
-  const hlRow = _colorInput("HighlightBg", "rgba(250, 204, 21, 0.35)", "", "Background color for search match highlighting in metadata panel", (c) => {
-    localStorage.setItem("SBG.GS.HighlightBg", c);
-    document.documentElement.style.setProperty("--sbg-highlight-bg", c);
-    hlSample.style.background = c;
+  _chipRow("HighlightBg", "rgba(250, 204, 21, 0.35)", hlSample, {
+    prefix: "Search ",
+    tooltip: "Background color for search match highlighting in metadata panel",
+    onColor: (c) => {
+      localStorage.setItem("SBG.GS.HighlightBg", c);
+      document.documentElement.style.setProperty("--sbg-highlight-bg", c);
+      hlSample.style.background = c;
+    },
   });
-  const hlLabel = hlRow.querySelector(".sbg-gs-label");
-  if (hlLabel) { hlLabel.innerHTML = "Search "; hlLabel.appendChild(hlSample); }
-  wrap.appendChild(hlRow);
 
   wrap.appendChild(h("div", { class: "sbg-gs-section-title", text: "Theme", style: "margin-top:16px" }));
 
@@ -425,20 +398,7 @@ function renderAppearance() {
     if (rootEl) {
       if (val !== "comfyui") rootEl.setAttribute("data-theme", val);
       else rootEl.removeAttribute("data-theme");
-
-      if (val === "custom") {
-        rootEl.style.setProperty("--sbg-bg", getSetting("CUSTOM_BG", "#1a1a1a"));
-        rootEl.style.setProperty("--sbg-surface", getSetting("CUSTOM_SURFACE", "#222222"));
-        rootEl.style.setProperty("--sbg-border", getSetting("CUSTOM_BORDER", "#444444"));
-        rootEl.style.setProperty("--sbg-text", getSetting("CUSTOM_TEXT", "#e0e0e0"));
-        rootEl.style.setProperty("--sbg-accent", getSetting("CUSTOM_ACCENT", "#7c6aef"));
-      } else {
-        rootEl.style.removeProperty("--sbg-bg");
-        rootEl.style.removeProperty("--sbg-surface");
-        rootEl.style.removeProperty("--sbg-border");
-        rootEl.style.removeProperty("--sbg-text");
-        rootEl.style.removeProperty("--sbg-accent");
-      }
+      applyCustomThemeVars(rootEl, val);
     }
     customWrap.style.display = val === "custom" ? "block" : "none";
   }));
@@ -452,77 +412,50 @@ function renderAppearance() {
   customWrap.appendChild(_colorInput("CUSTOM_ACCENT", "#7c6aef", "Accent", "Primary accent color", (c) => applyVar("--sbg-accent", c)));
   wrap.appendChild(customWrap);
 
-  // Lightbox Button Colors with live preview buttons
   wrap.appendChild(h("div", { class: "sbg-gs-section-title", text: "Lightbox Button Colors", style: "margin-top:16px" }));
   wrap.appendChild(h("div", { class: "sbg-gs-desc", text: "Leave blank for default colors." }));
 
+  const _ACCENT = "var(--sbg-accent,#7c6aef)";
   function _btnPreview(text, color) {
-    return h("span", { text, style: `display:inline-block;padding:3px 8px;border-radius:6px;font-size:10px;font-weight:500;color:#fff;background:${color || "var(--sbg-accent,#7c6aef)"};cursor:default;` });
+    return h("span", { text, style: `display:inline-block;padding:3px 8px;border-radius:6px;font-size:10px;font-weight:500;color:#fff;background:${color || _ACCENT};cursor:default;` });
   }
 
-  const dlColor = getSetting(S.LB_COLOR_DOWNLOAD, "") || "var(--sbg-accent,#7c6aef)";
-  const dlBtn = _btnPreview("Download", dlColor);
-  const dlRow = _colorInput(S.LB_COLOR_DOWNLOAD, "", "", "Background color for download button", (c) => { dlBtn.style.background = c || "var(--sbg-accent,#7c6aef)"; });
-  const dlLabel = dlRow.querySelector(".sbg-gs-label");
-  if (dlLabel) { dlLabel.innerHTML = ""; dlLabel.appendChild(dlBtn); }
-  wrap.appendChild(dlRow);
+  for (const [key, text, tip] of [
+    [S.LB_COLOR_DOWNLOAD, "Download", "Background color for download button"],
+    [S.LB_COLOR_COPY_PROMPT, "Copy Prompt", "Background color for copy prompt button"],
+    [S.LB_COLOR_COPY_WF, "Copy WF", "Background color for copy workflow button"],
+    [S.LB_COLOR_LOAD_WF, "Load Workflow", "Background color for load workflow button"],
+  ]) {
+    const chip = _btnPreview(text, getSetting(key, ""));
+    _chipRow(key, "", chip, { tooltip: tip, onColor: (c) => { chip.style.background = c || _ACCENT; } });
+  }
 
-  const cpColor = getSetting(S.LB_COLOR_COPY_PROMPT, "") || "var(--sbg-accent,#7c6aef)";
-  const cpBtn = _btnPreview("Copy Prompt", cpColor);
-  const cpRow = _colorInput(S.LB_COLOR_COPY_PROMPT, "", "", "Background color for copy prompt button", (c) => { cpBtn.style.background = c || "var(--sbg-accent,#7c6aef)"; });
-  const cpLabel = cpRow.querySelector(".sbg-gs-label");
-  if (cpLabel) { cpLabel.innerHTML = ""; cpLabel.appendChild(cpBtn); }
-  wrap.appendChild(cpRow);
-
-  const cwColor = getSetting(S.LB_COLOR_COPY_WF, "") || "var(--sbg-accent,#7c6aef)";
-  const cwBtn = _btnPreview("Copy WF", cwColor);
-  const cwRow = _colorInput(S.LB_COLOR_COPY_WF, "", "", "Background color for copy workflow button", (c) => { cwBtn.style.background = c || "var(--sbg-accent,#7c6aef)"; });
-  const cwLabel = cwRow.querySelector(".sbg-gs-label");
-  if (cwLabel) { cwLabel.innerHTML = ""; cwLabel.appendChild(cwBtn); }
-  wrap.appendChild(cwRow);
-
-  const lwColor = getSetting(S.LB_COLOR_LOAD_WF, "") || "var(--sbg-accent,#7c6aef)";
-  const lwBtn = _btnPreview("Load Workflow", lwColor);
-  const lwRow = _colorInput(S.LB_COLOR_LOAD_WF, "", "", "Background color for load workflow button", (c) => { lwBtn.style.background = c || "var(--sbg-accent,#7c6aef)"; });
-  const lwLabel = lwRow.querySelector(".sbg-gs-label");
-  if (lwLabel) { lwLabel.innerHTML = ""; lwLabel.appendChild(lwBtn); }
-  wrap.appendChild(lwRow);
-
-  // App Badge Colors
   wrap.appendChild(h("div", { class: "sbg-gs-section-title", text: "App Badge Colors", style: "margin-top:16px" }));
   wrap.appendChild(h("div", { class: "sbg-gs-desc", text: "Customize the color of each source application badge. Leave blank for defaults." }));
 
-  // Rows derive from the single app registry in sbg-core.js, so the preview here,
-  // the boot-time CSS vars, and the lightbox badge all read the same defaults.
-  const _appBadges = APP_REGISTRY.map(a => (
-    { key: a.settingKey, label: a.label, default: a.defaultColor, cssVar: a.cssVar }));
-
-  for (const ab of _appBadges) {
-    const badgeEl = _badgePreview(ab.label, getSetting(ab.key, "") || ab.default);
-    const row = _colorInput(ab.key, ab.default, "", `Color for ${ab.label} source badge`, (c) => {
-      const color = c || ab.default;
-      badgeEl.style.background = color;
-      document.documentElement.style.setProperty(ab.cssVar, color);
+  // Rows derive from the single app registry in sbg-core.js, so the preview
+  // here, the boot-time CSS vars, and the lightbox badge read the same defaults.
+  for (const a of APP_REGISTRY) {
+    const chip = _badgePreview(a.label, getSetting(a.settingKey, "") || a.defaultColor);
+    _chipRow(a.settingKey, a.defaultColor, chip, {
+      tooltip: `Color for ${a.label} source badge`,
+      onColor: (c) => {
+        const color = c || a.defaultColor;
+        chip.style.background = color;
+        document.documentElement.style.setProperty(a.cssVar, color);
+      },
     });
-    const label = row.querySelector(".sbg-gs-label");
-    if (label) { label.innerHTML = ""; label.appendChild(badgeEl); }
-    // Apply initial CSS custom property
-    const saved = getSetting(ab.key, "");
-    if (saved) document.documentElement.style.setProperty(ab.cssVar, saved);
-    wrap.appendChild(row);
+    const saved = getSetting(a.settingKey, "");
+    if (saved) document.documentElement.style.setProperty(a.cssVar, saved);
   }
 
-  // Initial Image Tab Color
   wrap.appendChild(h("div", { class: "sbg-gs-section-title", text: "Initial Image Tab", style: "margin-top:16px" }));
   const initTabBadge = _badgePreview("Initial Image", getSetting(S.INITIAL_IMAGE_TAB_COLOR, "") || "#94a3b8");
-  const initTabRow = _colorInput(S.INITIAL_IMAGE_TAB_COLOR, "#94a3b8", "", "Color for the Initial Image tab button in the lightbox metadata panel", (c) => {
-    initTabBadge.style.background = c || "#94a3b8";
+  _chipRow(S.INITIAL_IMAGE_TAB_COLOR, "#94a3b8", initTabBadge, {
+    tooltip: "Color for the Initial Image tab button in the lightbox metadata panel",
+    onColor: (c) => { initTabBadge.style.background = c || "#94a3b8"; },
   });
-  const initTabLabel = initTabRow.querySelector(".sbg-gs-label");
-  if (initTabLabel) { initTabLabel.innerHTML = ""; initTabLabel.appendChild(initTabBadge); }
-  wrap.appendChild(initTabRow);
 
-  // Default pill colours
   wrap.appendChild(h("div", { class: "sbg-gs-section-title", text: "Default Pill Colors", style: "margin-top:16px" }));
   wrap.appendChild(h("div", { class: "sbg-gs-desc", text: "The default background, text and border for values shown as pills, used for any field you have not given its own colour. Leave a box empty for the theme default." }));
   const pillPreview = _badgePreview("Example Pill", getSetting(S.PILL_BG_COLOR, "") || "rgba(255,255,255,0.06)");
@@ -602,7 +535,7 @@ function renderSettings() {
   {
     const _sortAlias = { newest: "created_desc", oldest: "created_asc" };
     const _cur = getSetting(S.SORT, "created_desc");
-    if (_sortAlias[_cur]) _writeSetting(S.SORT, _sortAlias[_cur]);
+    if (_sortAlias[_cur]) saveSetting(S.SORT, _sortAlias[_cur]);
   }
   wrap.appendChild(_comboInput(S.SORT, "created_desc",
     ["created_desc", "created_asc", "modified_desc", "modified_asc", "name_asc", "name_desc", "size_desc", "size_asc"],
@@ -689,7 +622,6 @@ function renderSettings() {
   wrap.appendChild(_comboInput(S.MODEL_NAME_STYLE, "basename", ["basename", "relpath"], "Model Display", "Show model and LoRA names as just the filename (basename) or the full relative path."));
   wrap.appendChild(_toggle(S.META_TAB_PERSIST, false, "Remember Metadata Tab", "Keep the active metadata tab (Generated/Initial Image) when navigating between images."));
 
-  // Folders: extra media roots shown in the folder picker and indexed
   wrap.appendChild(h("div", { class: "sbg-gs-section-title", text: "Folders", style: "margin-top:16px" }));
   wrap.appendChild(h("div", { class: "sbg-gs-desc", text: "Extra folders to browse and index alongside ComfyUI's output folder. Paths are on the machine running ComfyUI." }));
   const foldersList = h("div", {});
@@ -746,7 +678,6 @@ function renderSettings() {
     foldersList.appendChild(addWrap);
   }
 
-  // Excluded folders: names skipped while scanning (+ optional hidden-folder skip)
   wrap.appendChild(h("div", { class: "sbg-gs-section-title", text: "Excluded folders", style: "margin-top:16px" }));
   wrap.appendChild(h("div", { class: "sbg-gs-desc", text: "Folder names to skip while scanning (e.g. thumbnails, backup). Matching is by folder name rather than full path, and ignores case. Changes take effect on the next scan." }));
   const excludedList = h("div", {});
@@ -763,7 +694,6 @@ function renderSettings() {
     if (!cfg) { try { cfg = await _loadCfg(); } catch { cfg = { excluded_dirs: [] }; } }
     const current = cfg.excluded_dirs || [];
 
-    // Toggle: include hidden (dot-prefixed) folders. Off by default, so hidden folders are skipped.
     const hiddenChk = h("input", { type: "checkbox" });
     hiddenChk.checked = !!cfg.index_hidden_dirs;
     hiddenChk.addEventListener("change", async () => {
@@ -850,12 +780,10 @@ function renderPresets() {
   wrap.appendChild(h("div", { class: "sbg-gs-section-title", text: "Presets" }));
   wrap.appendChild(h("div", { class: "sbg-gs-desc", text: "Save and load gallery configuration presets." }));
 
-  // Current presets list
   const PRESETS_KEY = "SBG.Presets";
   let presets = [];
   try { presets = JSON.parse(localStorage.getItem(PRESETS_KEY)) || []; } catch { }
 
-  // Save options: checkboxes for what to include
   const saveChecks = h("div", { class: "sbg-gs-preset-checks" });
   const incLayout = h("input", { type: "checkbox" }); incLayout.checked = true;
   const incColors = h("input", { type: "checkbox" }); incColors.checked = true;
@@ -867,12 +795,10 @@ function renderPresets() {
   saveChecks.appendChild(h("label", {}, [incKeys, document.createTextNode(" Keybindings")]));
   wrap.appendChild(saveChecks);
 
-  // Save button
-  const nameInput = h("input", { type: "text", class: "sbg-gs-input", placeholder: "Preset name" });
-  const saveBtn = h("button", { class: "sbg-btn sbg-btn--accent", text: "💾 Save Preset" });
-  saveBtn.addEventListener("click", () => {
-    const name = nameInput.value.trim();
-    if (!name) { showToast("Enter a preset name"); return; }
+  // The one capture and the one apply, shared by the local preset buttons and
+  // the server theme buttons, so the call sites cannot drift on what a
+  // preset contains or how it lands.
+  function capturePreset(name) {
     const preset = { name, created: Date.now() };
     if (incLayout.checked) {
       // The per-app x per-media section profiles ("SBG.Layouts", translation layer).
@@ -894,6 +820,34 @@ function renderPresets() {
       }
     }
     if (incKeys.checked) preset.keys = _capturePresetKeys();
+    return preset;
+  }
+
+  function applyPreset(p) {
+    if (p.layouts) {
+      saveSetting("SBG.Layouts", p.layouts);
+      document.dispatchEvent(new CustomEvent("sbg-layout-changed"));
+    }
+    if (p.colors) {
+      saveSetting(S.BADGE_HIGH_COLOR, p.colors.high);
+      saveSetting(S.BADGE_LOW_COLOR, p.colors.low);
+      saveSetting(S.VIDEO_BADGE_COLOR, p.colors.video);
+      if (p.colors.highlight) localStorage.setItem("SBG.GS.HighlightBg", p.colors.highlight);
+    }
+    if (p.settings) {
+      for (const [id, val] of Object.entries(p.settings)) {
+        if (val !== null) saveSetting(id, val);
+      }
+    }
+    if (p.keys) _applyPresetKeys(p.keys);
+  }
+
+  const nameInput = h("input", { type: "text", class: "sbg-gs-input", placeholder: "Preset name" });
+  const saveBtn = h("button", { class: "sbg-btn sbg-btn--accent", text: "💾 Save Preset" });
+  saveBtn.addEventListener("click", () => {
+    const name = nameInput.value.trim();
+    if (!name) { showToast("Enter a preset name"); return; }
+    const preset = capturePreset(name);
     presets = presets.filter(p => p.name !== name);
     presets.unshift(preset);
     localStorage.setItem(PRESETS_KEY, JSON.stringify(presets));
@@ -903,51 +857,18 @@ function renderPresets() {
   const saveRow = h("div", { class: "sbg-gs-preset-save" }, [nameInput, saveBtn]);
   wrap.appendChild(saveRow);
 
-  // Preset list
   if (presets.length > 0) {
     wrap.appendChild(h("div", { class: "sbg-gs-section-title", text: "Saved Presets", style: "margin-top:16px" }));
     for (const p of presets) {
       const row = h("div", { class: "sbg-gs-preset-item" });
       row.appendChild(h("span", { class: "sbg-gs-preset-name", text: p.name }));
       const loadBtn = h("button", { class: "sbg-btn sbg-btn--accent sbg-btn--sm", text: "Load" });
-      let loadConfirm = false;
-      loadBtn.addEventListener("click", () => {
-        if (!loadConfirm) {
-          loadConfirm = true;
-          loadBtn.textContent = "Sure?";
-          loadBtn.style.background = "var(--sbg-danger)";
-          setTimeout(() => { loadConfirm = false; loadBtn.textContent = "Load"; loadBtn.style.background = ""; }, 2000);
-          return;
-        }
-        if (p.layouts) {
-          saveSetting("SBG.Layouts", p.layouts);
-          document.dispatchEvent(new CustomEvent("sbg-layout-changed"));
-        }
-        if (p.colors) {
-          _writeSetting(S.BADGE_HIGH_COLOR, p.colors.high);
-          _writeSetting(S.BADGE_LOW_COLOR, p.colors.low);
-          _writeSetting(S.VIDEO_BADGE_COLOR, p.colors.video);
-          if (p.colors.highlight) localStorage.setItem("SBG.GS.HighlightBg", p.colors.highlight);
-        }
-        if (p.settings) {
-          for (const [id, val] of Object.entries(p.settings)) {
-            if (val !== null) _writeSetting(id, val);
-          }
-        }
-        if (p.keys) {
-          _applyPresetKeys(p.keys);
-        }
+      confirmClick(loadBtn, () => {
+        applyPreset(p);
         showToast(`Preset "${p.name}" loaded. Refresh gallery to apply.`);
-      });
+      }, { background: "var(--sbg-danger)" });
       const delBtn = h("button", { class: "sbg-btn sbg-btn--danger sbg-btn--sm", text: "✕" });
-      let delConfirm = false;
-      delBtn.addEventListener("click", () => {
-        if (!delConfirm) {
-          delConfirm = true;
-          delBtn.textContent = "Sure?";
-          setTimeout(() => { delConfirm = false; delBtn.textContent = "✕"; }, 2000);
-          return;
-        }
+      confirmClick(delBtn, () => {
         presets = presets.filter(x => x.name !== p.name);
         localStorage.setItem(PRESETS_KEY, JSON.stringify(presets));
         renderPresets();
@@ -967,7 +888,6 @@ function renderPresets() {
     }
   }
 
-  // Import button
   wrap.appendChild(h("div", { class: "sbg-gs-section-title", text: "Import", style: "margin-top:16px" }));
   const importBtn = h("button", { class: "sbg-btn", text: "📥 Import Preset" });
   importBtn.addEventListener("click", () => {
@@ -989,14 +909,12 @@ function renderPresets() {
   });
   wrap.appendChild(importBtn);
 
-  // Server-side themes (from the themes/ subfolder)
   wrap.appendChild(h("div", { class: "sbg-gs-section-title", text: "Server Themes", style: "margin-top:16px" }));
   wrap.appendChild(h("div", { class: "sbg-gs-desc", text: "Presets stored in the extension's themes/ folder. Persist across reinstalls." }));
   const serverList = h("div", { class: "sbg-gs-preset-list" });
   serverList.textContent = "Loading...";
   wrap.appendChild(serverList);
 
-  // Fetch server presets
   fetch("/sidebar_gallery/presets").then(r => r.json()).then(data => {
     serverList.innerHTML = "";
     if (!data.presets || data.presets.length === 0) {
@@ -1007,50 +925,17 @@ function renderPresets() {
       const row = h("div", { class: "sbg-gs-preset-item" });
       row.appendChild(h("span", { class: "sbg-gs-preset-name", text: sp.name }));
       const loadBtn = h("button", { class: "sbg-btn sbg-btn--accent sbg-btn--sm", text: "Load" });
-      let loadServerConfirm = false;
-      loadBtn.addEventListener("click", async () => {
-        if (!loadServerConfirm) {
-          loadServerConfirm = true;
-          loadBtn.textContent = "Sure?";
-          loadBtn.style.background = "var(--sbg-danger)";
-          setTimeout(() => { loadServerConfirm = false; loadBtn.textContent = "Load"; loadBtn.style.background = ""; }, 2000);
-          return;
-        }
+      confirmClick(loadBtn, async () => {
         try {
           const resp = await fetch(`/sidebar_gallery/preset?filename=${encodeURIComponent(sp.filename)}`);
           if (!resp.ok) throw new Error(`HTTP ${resp.status}`);
           const p = await resp.json();
-          // Apply preset (same logic as local presets).
-          if (p.layouts) {
-            saveSetting("SBG.Layouts", p.layouts);
-            document.dispatchEvent(new CustomEvent("sbg-layout-changed"));
-          }
-          if (p.colors) {
-            _writeSetting(S.BADGE_HIGH_COLOR, p.colors.high);
-            _writeSetting(S.BADGE_LOW_COLOR, p.colors.low);
-            _writeSetting(S.VIDEO_BADGE_COLOR, p.colors.video);
-            if (p.colors.highlight) localStorage.setItem("SBG.GS.HighlightBg", p.colors.highlight);
-          }
-          if (p.settings) {
-            for (const [id, val] of Object.entries(p.settings)) {
-              if (val !== null) _writeSetting(id, val);
-            }
-          }
-          if (p.keys) {
-            _applyPresetKeys(p.keys);
-          }
+          applyPreset(p);
           showToast(`Server theme "${sp.name}" loaded. Refresh gallery to apply.`);
         } catch (e) { showToast("Error loading theme: " + e.message); }
-      });
+      }, { background: "var(--sbg-danger)" });
       const delBtn = h("button", { class: "sbg-btn sbg-btn--danger sbg-btn--sm", text: "\u2715" });
-      let delServerConfirm = false;
-      delBtn.addEventListener("click", async () => {
-        if (!delServerConfirm) {
-          delServerConfirm = true;
-          delBtn.textContent = "Sure?";
-          setTimeout(() => { delServerConfirm = false; delBtn.textContent = "\u2715"; }, 2000);
-          return;
-        }
+      confirmClick(delBtn, async () => {
         await fetch("/sidebar_gallery/presets", {
           method: "POST",
           headers: { "Content-Type": "application/json" },
@@ -1064,32 +949,11 @@ function renderPresets() {
     }
   }).catch(() => { serverList.textContent = "Could not load server themes."; });
 
-  // Save to server button
   const saveServerBtn = h("button", { class: "sbg-btn", text: "💾 Save to Server", style: "margin-top:8px" });
   saveServerBtn.addEventListener("click", async () => {
     const name = nameInput.value.trim();
     if (!name) { showToast("Enter a preset name first"); return; }
-    const preset = { name, created: Date.now() };
-    if (incLayout.checked) {
-      // The per-app x per-media section profiles ("SBG.Layouts", translation layer).
-      preset.layouts = getSetting("SBG.Layouts", null);
-    }
-    if (incColors.checked) {
-      preset.colors = {
-        high: getSetting(S.BADGE_HIGH_COLOR, "#f87171"),
-        low: getSetting(S.BADGE_LOW_COLOR, "#60a5fa"),
-        video: getSetting(S.VIDEO_BADGE_COLOR, "#facc15"),
-        highlight: localStorage.getItem("SBG.GS.HighlightBg") || "",
-      };
-    }
-    if (incSettings.checked) {
-      preset.settings = {};
-      for (const [k, id] of Object.entries(S)) {
-        if (k.startsWith("KEY_")) continue;
-        preset.settings[id] = getSetting(id, null);
-      }
-    }
-    if (incKeys.checked) preset.keys = _capturePresetKeys();
+    const preset = capturePreset(name);
     try {
       await fetch("/sidebar_gallery/presets", {
         method: "POST",
@@ -1112,7 +976,6 @@ function renderDiagnosticsTab() {
 
   const actionRow = h("div", { style: "display:flex;gap:8px;margin-bottom:16px;flex-wrap:wrap" });
 
-  // Refresh Gallery button
   const diagGalleryRefreshBtn = h("button", { class: "sbg-btn sbg-btn--accent", text: "🔃 Refresh", title: "Re-fetch all items from the server and refresh the gallery view" });
   diagGalleryRefreshBtn.addEventListener("click", async () => {
     diagGalleryRefreshBtn.disabled = true;
@@ -1129,19 +992,9 @@ function renderDiagnosticsTab() {
     }
   });
 
-  // Rebuild DB Index with two-click confirmation
   const diagRefreshBtn = h("button", { class: "sbg-btn sbg-btn--accent", text: "🔄 Rebuild DB Index", title: "Rescan all roots and rebuild metadata/tag index on server" });
-  let _rebuildConfirm = false;
-  diagRefreshBtn.addEventListener("click", async () => {
-    if (!_rebuildConfirm) {
-      _rebuildConfirm = true;
-      diagRefreshBtn.textContent = "Sure?";
-      diagRefreshBtn.style.background = "#f59e0b"; diagRefreshBtn.style.color = "#000";
-      setTimeout(() => { _rebuildConfirm = false; diagRefreshBtn.textContent = "🔄 Rebuild DB Index"; diagRefreshBtn.style.background = ""; diagRefreshBtn.style.color = ""; }, 2000);
-      return;
-    }
+  confirmClick(diagRefreshBtn, async () => {
     diagRefreshBtn.disabled = true;
-    diagRefreshBtn.style.background = ""; diagRefreshBtn.style.color = "";
     diagRefreshBtn.textContent = "🔄 Rebuilding DB... (0%)";
     try {
       await fetch("/sidebar_gallery/rebuild_index", { method: "POST" });
@@ -1169,7 +1022,7 @@ function renderDiagnosticsTab() {
         unsub();
         diagRefreshBtn.textContent = sawRunning
           ? "🔄 DB Indexed Successfully!"
-          : "Couldn't start - another scan is running";
+          : "Couldn't start. Another scan is running";
         setTimeout(() => {
           diagRefreshBtn.disabled = false;
           diagRefreshBtn.textContent = "🔄 Rebuild DB Index";
@@ -1180,7 +1033,7 @@ function renderDiagnosticsTab() {
         }
       }
     });
-  });
+  }, { background: "#f59e0b", color: "#000" });
 
   const diagCacheMetaBtn = h("button", { class: "sbg-btn", text: "📦 Cache All Metadata", title: "Fetch and cache metadata summaries for all files to IndexedDB" });
   diagCacheMetaBtn.addEventListener("click", async () => {
@@ -1251,35 +1104,19 @@ function renderDiagnosticsTab() {
   });
 
   const diagClearMetaBtn = h("button", { class: "sbg-btn sbg-btn--danger", text: "🗑️ Clear Meta Cache", title: "Clear browser IndexedDB metadata cache" });
-  let clearMetaConfirm = false;
-  diagClearMetaBtn.addEventListener("click", async () => {
-    if (!clearMetaConfirm) {
-      clearMetaConfirm = true;
-      diagClearMetaBtn.textContent = "Sure?";
-      diagClearMetaBtn.style.background = "#f59e0b"; diagClearMetaBtn.style.color = "#000";
-      setTimeout(() => { clearMetaConfirm = false; diagClearMetaBtn.textContent = "🗑️ Clear Meta Cache"; diagClearMetaBtn.style.background = ""; diagClearMetaBtn.style.color = ""; }, 2000);
-      return;
-    }
+  confirmClick(diagClearMetaBtn, async () => {
     try {
-      await _metaCacheAPI.clear();
+      const ok = await _metaCacheAPI.clear();
       _metaCache.clear();
-      showToast("Metadata cache cleared");
+      showToast(ok ? "Metadata cache cleared" : "Could not clear the meta cache (browser storage unavailable)");
       await refreshDiagStats(diagStatsContainer);
     } catch (e) { showToast("Error clearing meta cache: " + e.message); }
-  });
+  }, { background: "#f59e0b", color: "#000" });
 
   const diagClearThumbBtn = h("button", { class: "sbg-btn sbg-btn--danger", text: "🗑️ Clear Thumb Cache", title: "Clear browser IndexedDB thumbnails cache" });
-  let clearThumbConfirm = false;
-  diagClearThumbBtn.addEventListener("click", async () => {
-    if (!clearThumbConfirm) {
-      clearThumbConfirm = true;
-      diagClearThumbBtn.textContent = "Sure?";
-      diagClearThumbBtn.style.background = "#f59e0b"; diagClearThumbBtn.style.color = "#000";
-      setTimeout(() => { clearThumbConfirm = false; diagClearThumbBtn.textContent = "🗑️ Clear Thumb Cache"; diagClearThumbBtn.style.background = ""; diagClearThumbBtn.style.color = ""; }, 2000);
-      return;
-    }
+  confirmClick(diagClearThumbBtn, async () => {
     try {
-      await _thumbCacheAPI.clear();
+      const ok = await _thumbCacheAPI.clear();
       // Also drop the in-memory blob cache and the failed-URL blacklist, so
       // thumbnails that failed to load (e.g. requests that timed out during a
       // DB rebuild) can be retried after the cache is cleared.
@@ -1291,31 +1128,21 @@ function renderDiagnosticsTab() {
         _thumbMemCache.delete(url);
       }
       resetFailedThumbs();
-      showToast("Thumbnails cache cleared");
+      showToast(ok ? "Thumbnails cache cleared" : "Could not clear the thumbnail cache (browser storage unavailable)");
       await refreshDiagStats(diagStatsContainer);
     } catch (e) { showToast("Error clearing thumb cache: " + e.message); }
-  });
+  }, { background: "#f59e0b", color: "#000" });
 
-  // Nuclear option: delete entire IDB database + clear version tracking
   const diagNukeBtn = h("button", { class: "sbg-btn sbg-btn--danger", text: "💣 Nuclear Clear All", title: "Delete ALL browser cache databases (including legacy), reset version tracking, clean up old settings keys, and reload. Fixes any corruption." });
-  let nukeConfirm = false;
-  diagNukeBtn.addEventListener("click", () => {
-    if (!nukeConfirm) {
-      nukeConfirm = true;
-      diagNukeBtn.textContent = "⚠️ Sure? This will reload the page";
-      diagNukeBtn.style.background = "#ef4444"; diagNukeBtn.style.color = "#fff";
-      setTimeout(() => { nukeConfirm = false; diagNukeBtn.textContent = "💣 Nuclear Clear All"; diagNukeBtn.style.background = ""; diagNukeBtn.style.color = ""; }, 3000);
-      return;
-    }
+  confirmClick(diagNukeBtn, () => {
     // Nuke IDB: current + legacy databases
     try { _resetIdb(); } catch (e) { /* ignore */ }
     try { indexedDB.deleteDatabase("sbg-cache"); } catch (e) { /* ignore */ }
     try { indexedDB.deleteDatabase("sbg-gallery-cache"); } catch (e) { /* ignore */ }
 
-    // Nuke localStorage: version tracking + legacy SBGGS.* keys
     localStorage.removeItem("SBG._dbVersion");
     localStorage.removeItem("SBG._cacheEpoch");
-    // Clean up legacy settings keys (old system used SBGGS.* prefix)
+    // SBGGS.* is the settings key prefix used by an older version.
     const keysToRemove = [];
     for (let i = 0; i < localStorage.length; i++) {
       const k = localStorage.key(i);
@@ -1326,7 +1153,7 @@ function renderDiagnosticsTab() {
     _metaCache.clear();
     showToast(`All caches cleared (${keysToRemove.length} legacy keys removed). Reloading…`);
     setTimeout(() => location.reload(true), 500);
-  });
+  }, { label: "⚠️ Sure? This will reload the page", armMs: 3000, background: "#ef4444", color: "#fff" });
 
   actionRow.appendChild(diagGalleryRefreshBtn);
   actionRow.appendChild(diagRefreshBtn);
@@ -1353,7 +1180,6 @@ for (const btn of tabBtns) {
     TAB_RENDERERS[btn.dataset.tab]?.();
   });
 }
-// Default: start on requested tab using string param
 const defaultBtn = [...tabBtns].find(b => b.dataset.tab === defaultTab) || tabBtns[0];
 defaultBtn.classList.add("sbg-gs-tab--active");
 if (TAB_RENDERERS[defaultTab]) {

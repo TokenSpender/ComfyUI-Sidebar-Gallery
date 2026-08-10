@@ -41,7 +41,6 @@ let _activeProfileKey = "";
 let _uidCounter = 0;
 function uid(prefix = "s") { return `${prefix}_${Date.now().toString(36)}_${(_uidCounter++).toString(36)}`; }
 
-// Default layout
 // A fresh install opens with the default ComfyUI panel layout defined in
 // web/sbg-default-layout.js. Each call returns a deep copy so callers can
 // mutate the result freely without touching the shared constant.
@@ -221,7 +220,6 @@ export function profileKey(app, isVideo) {
   return `${a}_${isVideo ? "video" : "image"}`;
 }
 
-/** Return the section array for an (app, media), creating a default if absent. */
 export function getActiveProfile(app, isVideo) {
   const profiles = getProfiles();
   const key = profileKey(app, isVideo);
@@ -791,7 +789,7 @@ function _renderFlat(section, summary, ctx) {
         applyParamColor(d, p);
         wrap.appendChild(d);
       } else if (pstyle === "title") {
-        // Mirror _renderOneCard so "title" works in flat sections/tabs too (not just cards).
+        // Mirror _renderOneCard so "title" works in flat sections and tabs too.
         const t = h("div", { class: "sbg-meta-card__title", text: String(val) });
         applyParamColor(t, p);
         wrap.appendChild(t);
@@ -931,7 +929,6 @@ function _renderTabbedUsable(section, usable, summary, ctx) {
       // inTab guards against the positive_prompt auto-toggle re-entering here.
       const el = renderSection(sub, summary, { ...ctx, inTab: true });
       if (el) host.appendChild(el);
-      // Per-tab background/colour (optional).
       host.style.cssText = "";
       if (sub.color) applyParamColor(host, { color: sub.color });
       [...pillRow.children].forEach((c, i) => c.classList.toggle("sbg-prompt-pill--active", i === idx));
@@ -939,7 +936,6 @@ function _renderTabbedUsable(section, usable, summary, ctx) {
 
     usable.forEach((u, i) => {
       const btn = h("button", { class: "sbg-prompt-pill", text: u.tab.label || `Tab ${i + 1}` });
-      // Per-tab pill colour (customised in the layout editor).
       if (u.tab.pillColor) applyColor(btn, u.tab.pillColor);
       btn.addEventListener("click", () => { idx = i; try { localStorage.setItem(lsKey, u.tab.label || ""); } catch { } render(); });
       pillRow.appendChild(btn);
@@ -1270,7 +1266,6 @@ function _renderHighLowPairs(section, elements, wrap, summary, source = section.
     for (let i = 0; i < n; i++) _emitPair(section, highs[i], lows[i], wrap, summary, source);
     // Unmatched classified entries may still pair across bases (stage 3).
     leftovers.push(...highs.slice(n), ...lows.slice(n));
-    // Unclassified entries just render as plain cards.
     for (const el of plains) { const card = _renderOneCard(section, el, summary, false, source); if (card) wrap.appendChild(card); }
   }
 

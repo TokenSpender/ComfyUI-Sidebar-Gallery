@@ -1,6 +1,5 @@
-// Curated default layout: the project's ComfyUI panel layout, shown on a fresh
-// install before any customisation. This is a hand-maintained snapshot of a
-// layout-editor profile (no generator produces it), so edit it directly.
+// Curated default layout, shown on a fresh install before any customisation.
+// A hand-maintained snapshot of a layout-editor profile, so edit it directly.
 // Sections tied to specific custom nodes auto-hide when their data is absent.
 export const DEFAULT_IMAGE_LAYOUT = [
   {

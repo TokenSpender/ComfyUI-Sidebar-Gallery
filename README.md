@@ -83,7 +83,3 @@ Dragging a thumbnail onto the ComfyUI canvas loads its workflow. Dragging it ont
 cd ComfyUI/custom_nodes
 git clone https://github.com/TokenSpender/ComfyUI-Sidebar-Gallery.git ComfyUI-sidebar-gallery
 ```
-
-Either way, it then appears as a **Gallery** tab in the sidebar.
-
-Video thumbnails work via imageio-ffmpeg. Video metadata (duration, codec, fps, embedded workflows) is read with PyAV, which is included with ComfyUI by default. Images need none of this.

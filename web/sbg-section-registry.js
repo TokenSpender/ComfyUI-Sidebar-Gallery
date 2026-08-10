@@ -1,18 +1,12 @@
 /**
  * sbg-section-registry.js: Search-field name mapping (between display, canonical, and backend names)
  *
- * The metadata-section SCHEMA and rendering now live in section_catalog.json and
- * sbg-translation-layer.js (the translation-layer rewrite). This module retains
- * ONLY the search-naming lookups the gallery uses to translate a user-typed
- * search field into the backend field name (and back, for match-badge labels).
- *
- * The former render engine (resolveValue / mergeSpec / getParamStyle /
- * hasSectionData / getOrderedSections / isSectionEnabled / _buildReverseMap / …)
- * and the per-section render specs were dead after the rewrite and have been
- * removed.
+ * The metadata-section SCHEMA and rendering live in section_catalog.json and
+ * sbg-translation-layer.js. This module holds ONLY the search-naming lookups the
+ * gallery uses to translate a user-typed search field into the backend field name
+ * (and back, for match-badge labels).
  */
 
-// Backend search field per canonical section name (+ optional legacy display name).
 // ORDER MATTERS: the gallery builds a searchField-to-name map with "last wins"
 // for match-badge labels, so "prompt" labels as Negative Prompt and
 // "workflow_nodes" as Prompt Enhancer.
@@ -37,7 +31,6 @@ const SECTION_DEFS = {
   "Raw Workflow JSON": { searchField: null },
 };
 
-// Search field name aliases, mapping what users/old code may type to the canonical name.
 const SEARCH_FIELD_ALIASES = {
   "file info": "File Info", "fileinfo": "File Info", "file_info": "File Info",
   "models": "Models", "model": "Models",
@@ -64,12 +57,9 @@ const SectionRegistry = {
   getCanonicalName(displayName, renames) {
     if (!displayName) return null;
     const dn = displayName.trim();
-    // Direct match
     if (SECTION_DEFS[dn]) return dn;
-    // Search field aliases
     const aliased = SEARCH_FIELD_ALIASES[dn.toLowerCase()];
     if (aliased) return aliased;
-    // Layout-editor renames (the reverse direction: user title back to canonical).
     // Only canonicals with a registry entry resolve; a retitled section that has
     // no backend search field must not turn into a bogus search tag.
     if (renames) {
@@ -77,7 +67,7 @@ const SectionRegistry = {
         if (renamed.toLowerCase() === dn.toLowerCase() && SECTION_DEFS[canonical]) return canonical;
       }
     }
-    return null; // Unknown section
+    return null;
   },
 
   /** Display name for a canonical section (applies renames + legacy displayName default). */
@@ -88,7 +78,6 @@ const SectionRegistry = {
     return canonicalName;
   },
 
-  /** Backend search field name for a canonical section. */
   getSearchField(canonicalSection) {
     const def = SECTION_DEFS[canonicalSection];
     if (!def) return canonicalSection.toLowerCase();

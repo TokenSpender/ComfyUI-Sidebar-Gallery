@@ -317,7 +317,6 @@
   align-items: center;
 }
 
-/* Clear stays muted; refresh uses the user's accent colour (Appearance tab). */
 .sbg-search-clear { color: var(--sbg-text-dim); }
 .sbg-search-refresh { color: var(--sbg-accent); }
 
@@ -366,7 +365,7 @@
   font-size: 10px;
   line-height: 1;
   transition: opacity var(--sbg-transition);
-  /* Never let a long term clip/cover the ✕ - keep it sized and on top. */
+  /* Keep the ✕ sized and on top so a long term cannot cover it. */
   flex: 0 0 auto;
   padding: 2px 4px;
   margin: -2px -2px -2px 0;
@@ -444,7 +443,6 @@
   border-color: var(--sbg-accent);
 }
 
-/* Subfolder dropdown: limit height so it doesn't cover the entire screen */
 .sbg-select--subfolder {
   max-width: 150px;
 }
@@ -605,7 +603,6 @@
   text-align: center;
 }
 
-/* Indeterminate animation when we don't have progress */
 .sbg-progress__fill--indeterminate {
   width: 30% !important;
   animation: sbg-shimmer 1.5s ease-in-out infinite;
@@ -840,7 +837,6 @@
   min-height: 100%;
 }
 
-/* Legacy CSS grid mode (non-virtual) */
 .sbg-grid:not(.sbg-grid--virtual) {
   display: grid;
   grid-template-columns: repeat(auto-fill, minmax(var(--sbg-thumb-size, 110px), 1fr));
@@ -874,7 +870,6 @@
   overflow: hidden;
 }
 
-/* In virtual scroll mode, thumb wraps fill available space above the info area */
 .sbg-card--virtual .sbg-card__thumb-wrap {
   flex: 1;
   min-height: 0;
@@ -899,7 +894,6 @@
   max-height: 60px;
 }
 
-/* Match badges flow inline in the info area. */
 .sbg-card--virtual .sbg-card__match-badge {
   max-width: calc(100% - 8px);
   overflow: hidden;
@@ -929,7 +923,6 @@
   position: relative;
 }
 
-/* Square thumbnails (default) */
 .sbg-card__thumb-wrap--square {
   aspect-ratio: 1/1;
 }
@@ -1574,7 +1567,7 @@
 }
 
 /* Firefox-style resize grip: a TRIANGLE of diagonal lines in the bottom-right
-   corner (not a filled square). The gradient axis runs to the bottom-right (135deg)
+   corner. The gradient axis runs to the bottom-right (135deg)
    and all the line stops sit in its second half (>52%), so the lines only appear in
    the bottom-right triangle and shorten toward the corner. The 11px gutter above
    gives the corner room so it looks the same with or without a scrollbar. */
@@ -1657,7 +1650,6 @@
 
 /* Metadata panel components */
 
-/* Group container */
 .sbg-meta-group {
   display: flex;
   flex-direction: column;
@@ -2051,8 +2043,6 @@
   margin-left: 4px;
 }
 
-/* Diagnostics DB path value styling */
-
 .sbg-diag-stat__value--path {
   font-family: monospace;
   font-size: 9px;
@@ -2075,8 +2065,6 @@
   border-radius: 0 0 var(--sbg-radius-sm) var(--sbg-radius-sm);
 }
 
-/* Textbox resize ceiling (prompt text auto-shrink + scroll at max) */
-/* Main styles defined above; JS applySize() handles height management */
 textarea.sbg-prompt-text {
   width: 100%;
   border: none;
@@ -2086,8 +2074,6 @@ textarea.sbg-prompt-text {
   color: inherit;
   box-sizing: border-box;
 }
-
-/* Rebuild button text overflow fix */
 
 .sbg-btn--accent {
   white-space: nowrap;
@@ -2512,7 +2498,7 @@ textarea.sbg-prompt-text {
   flex-shrink: 0;
 }
 
-/* DRAG GHOST (smooth real-time drag-and-drop) */
+/* DRAG GHOST */
 
 /* Sortable placeholder: shows where the dragged item will land */
 .sbg-sortable-placeholder {
@@ -2654,10 +2640,10 @@ textarea.sbg-prompt-text {
   display: none;
 }
 
-/* The filename chips on the images already say what is shown; the bottom
-   bar's "name (n / total)" text would repeat it, so it hides in compare.
-   visibility (not display): the name is the flex-1 spacer that keeps the
-   action buttons pinned to the bottom-right. */
+/* The filename chips on the images already say what is shown, so the bottom
+   bar's "name (n / total)" text hides in compare. It uses visibility to keep
+   the name occupying the flex-1 space that pins the action buttons to the
+   bottom-right. */
 .sbg-lb__media-area--compare .sbg-lb__bottom-name {
   visibility: hidden;
 }
@@ -2788,7 +2774,6 @@ textarea.sbg-prompt-text {
 .sbg-iconbtn:hover { background: rgba(255,255,255,0.1); }
 .sbg-iconbtn--danger:hover { background: rgba(239,68,68,0.25); }
 
-/* "Hidden" eye toggle: greyed out with a diagonal strike. */
 /* Tabs editor (any section): stacked rows mirroring the section-row pattern */
 .sbg-ly3-tabsed { margin-top: 6px; padding-top: 6px; border-top: 1px dashed var(--sbg-border, #444); }
 .sbg-ly3-tabsed-head { display: flex; align-items: center; justify-content: space-between; margin-bottom: 4px; }

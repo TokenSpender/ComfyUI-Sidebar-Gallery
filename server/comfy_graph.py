@@ -1,8 +1,8 @@
 """ComfyUI node-signature registry, structural classification, and the
 pure-value link resolver.
 
-This replaces the parser's name-pattern guessing with ComfyUI's own knowledge
-of every installed node: input names/types, output names/types, category.
+Node roles come from ComfyUI's own knowledge of every installed node (input
+names and types, output names and types, category) instead of name patterns.
 
 - NodeRegistry: live mode reads ComfyUI's NODE_CLASS_MAPPINGS in-process;
   snapshot mode loads an /object_info-shaped JSON snapshot so everything
@@ -29,8 +29,8 @@ import os
 import re
 from typing import Any
 
-# Tensor-ish type names: a node with a CONNECTED input of one of these kinds
-# computes its output at runtime, so its value is not in the file.
+# Scalar type names. A node with a CONNECTED input of any OTHER kind computes
+# its output at run time, so that value is not stored in the file.
 _SCALAR_TYPE_NAMES = {"INT", "FLOAT", "STRING", "BOOLEAN", "NUMBER", "COMBO"}
 
 _DIM_STRING_RE = re.compile(r"(\d{2,5})\s*[x×]\s*(\d{2,5})")
@@ -869,7 +869,7 @@ def _aspect_combo_size_node(node: Any) -> tuple[int, int] | None:
     for v in inputs.values():
         if not isinstance(v, str):
             continue
-        m = re.search(r"(\d{2,5})\s*[x×]\s*(\d{2,5})", v)
+        m = _DIM_STRING_RE.search(v)
         if m:
             w, h = int(m.group(1)), int(m.group(2))
             if str(inputs.get("swap_dimensions", "")).strip().lower() in (
@@ -977,7 +977,6 @@ def find_generation_resolution(prompt: dict, registry: NodeRegistry,
                                               (not s_sig and sk in ("pixels", "image")))
                     for sk, sv in s_inputs.items())
                 if s_role == "sampler" or has_latent_in:
-                    # another sampler or a latent op, so keep walking up
                     return latent_source(src_id, depth + 1, seen)
                 if takes_pixels and not ("width" in s_inputs or "height" in s_inputs):
                     return "img2img"  # VAEEncode: the size is not in the file
@@ -1078,9 +1077,9 @@ def dead_node_ids(prompt: dict, registry: NodeRegistry) -> set[str]:
     if not output_ids:
         return set()
     # A node is LIVE if it (transitively) feeds an output. ONE reverse walk from
-    # the outputs to their producers marks every such node in O(N+E), replacing
-    # a separate forward BFS per node (O(N·(N+E)), whose old depth cap also
-    # dropped live nodes far upstream of the save node). dead = the rest.
+    # the outputs to their producers marks every such node in O(N+E), and it
+    # carries no depth cap, which would drop live nodes far upstream of the save
+    # node. Everything left over is dead.
     live: set[str] = set()
     queue = list(output_ids)
     while queue:

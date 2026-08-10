@@ -47,15 +47,14 @@ def safe_join(root_path: str, relpath: str) -> str:
     # an unhandled OSError surfacing as HTTP 500 (and hit HEVC playback hardest, since it
     # fires far more range requests). The lexical commonpath check above has
     # already proven the path doesn't escape the root textually, so if realpath is
-    # unavailable we fall back to trusting that (the pre-hardening behaviour)
-    # instead of denying the file. The link-escape hardening still applies whenever
-    # realpath succeeds.
+    # unavailable we fall back to trusting that instead of denying the file. The
+    # link-escape check still applies whenever realpath succeeds.
     try:
         root_real = os.path.realpath(root_abs)
         full_real = os.path.realpath(full)
         within = os.path.commonpath([full_real, root_real]) == root_real
     except OSError:
-        within = True  # realpath blocked (e.g. untrusted junction), so rely on the lexical check
+        within = True  # realpath blocked, so rely on the lexical check
     except ValueError:
         within = False  # a path on another drive cannot be inside the root
     if not within:

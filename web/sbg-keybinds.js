@@ -33,8 +33,8 @@ const _MOUSE_BUTTONS = { middleclick: 1, mouse4: 3, mouse5: 4 };
 // chunks and "+" joins modifiers.
 const _KEY_ALIASES = { comma: ",", plus: "+" };
 
-/** Parse one binding chunk. Returns { key, button, mods, explicit } where
- *  exactly one of key/button is set, or null for an empty chunk. */
+/** Returns { key, button, mods, explicit } where exactly one of key/button is
+ *  set, or null for an empty chunk. */
 export function parseChunk(raw) {
   const chunk = String(raw || "").trim();
   if (!chunk) return null;
@@ -54,16 +54,14 @@ export function parseChunk(raw) {
   return { key: _KEY_ALIASES[rest.toLowerCase()] || rest, button: null, mods, explicit };
 }
 
-/** Parse a comma-separated binding string into chunk objects. A binding
- *  that is exactly "," reads as the comma key: the comma splits into empty
- *  chunks and would otherwise be impossible to bind. */
+/** A binding that is exactly "," reads as the comma key: the comma splits
+ *  into empty chunks and would otherwise be impossible to bind. */
 export function parseBindings(str) {
   const raw = String(str || "");
   if (raw.trim() === ",") return [parseChunk("Comma")];
   return raw.split(",").map(parseChunk).filter(Boolean);
 }
 
-/** Normalize a KeyboardEvent into a matchable descriptor. */
 export function descFromKeyEvent(e) {
   return {
     key: e.key, button: null,
@@ -71,8 +69,8 @@ export function descFromKeyEvent(e) {
   };
 }
 
-/** Normalize a MouseEvent into a matchable descriptor. Carries the pointer
- *  position so actions like reset zoom can aim at the clicked pane. */
+/** Carries the pointer position so actions like reset zoom can aim at the
+ *  clicked pane. */
 export function descFromMouseEvent(e) {
   return {
     key: null, button: e.button,
@@ -87,8 +85,7 @@ function _chunkTargets(chunk, desc) {
   return chunk.key.toLowerCase() === desc.key.toLowerCase();
 }
 
-/** True when any chunk WITH explicit modifiers matches the descriptor.
- *  Explicit chunks require the exact modifier state they name: unlisted
+/** Explicit chunks require the exact modifier state they name: unlisted
  *  modifiers must be up. */
 export function matchExplicit(binding, desc) {
   return parseBindings(binding).some((c) => c.explicit && _chunkTargets(c, desc)
@@ -96,16 +93,14 @@ export function matchExplicit(binding, desc) {
     && c.mods.alt === !!desc.alt && c.mods.meta === !!desc.meta);
 }
 
-/** True when any chunk WITHOUT explicit modifiers matches the descriptor
- *  under the given mods policy ("shift", "none", or "any"). */
 export function matchBare(binding, desc, mods = "shift") {
   if (mods !== "any" && (desc.ctrl || desc.alt || desc.meta)) return false;
   if (mods === "none" && desc.shift) return false;
   return parseBindings(binding).some((c) => !c.explicit && _chunkTargets(c, desc));
 }
 
-/** Single-action convenience: explicit or bare match. Sites with several
- *  actions should run their own two-pass loop so combos win across actions. */
+/** Single-action convenience. Sites with several actions should run their own
+ *  two-pass loop so combos win across actions. */
 export function matchAny(binding, desc, mods = "shift") {
   return matchExplicit(binding, desc) || matchBare(binding, desc, mods);
 }

@@ -1,18 +1,14 @@
 /**
  * sidebar_gallery.js: Entry point for the SBG ComfyUI extension
  *
- * This module is the thin shell that:
- *   - Registers the ComfyUI sidebar extension
- *   - Applies global CSS variables from saved settings
- *   - Installs global keyboard shortcuts and drag-drop handlers
- *   - Delegates gallery rendering to sbg-gallery.js
- *   - Bridges auto-refresh events from ComfyUI to the gallery
+ * Thin shell: registers the sidebar tab, applies saved CSS variables, installs the
+ * global keybindings and drag-drop handlers, and bridges ComfyUI's execution events
+ * to the gallery. All rendering lives in sbg-gallery.js.
  */
 
 import { app } from "../../scripts/app.js";
 import { api as comfyApi } from "../../scripts/api.js";
 
-/* Imports from extracted modules */
 import {
   EXT_NAME, CSS_URL,
   _dataCache, ensureCss, h, api, showToast,
@@ -46,7 +42,6 @@ app.registerExtension({
       document.documentElement.style.setProperty(a.cssVar, saved || a.defaultColor);
     }
 
-    // Pill/badge custom colors
     const pillBg = getSetting(S.PILL_BG_COLOR, "");
     const pillText = getSetting(S.PILL_TEXT_COLOR, "");
     const pillBorder = getSetting(S.PILL_BORDER_COLOR, "");
@@ -54,7 +49,6 @@ app.registerExtension({
     if (pillText) document.documentElement.style.setProperty("--sbg-pill-text", pillText);
     if (pillBorder) document.documentElement.style.setProperty("--sbg-pill-border", pillBorder);
 
-    // Prompt padding
     const promptPad = getSetting(S.PROMPT_PADDING, "");
     if (promptPad) document.documentElement.style.setProperty("--sbg-prompt-padding", promptPad + "px");
 
@@ -81,7 +75,6 @@ app.registerExtension({
         }
       } catch { }
     }, true);
-    /** Clear ComfyUI's blue per-node drag-over highlight and redraw. */
     function _clearComfyDragHighlight() {
       try {
         if (app.dragOverNode) app.dragOverNode = null;
@@ -89,7 +82,6 @@ app.registerExtension({
       } catch { }
     }
 
-    /** Find the litegraph node under a drop event, or null. */
     function _nodeUnderDrop(e) {
       try {
         const c = app.canvas;
@@ -106,7 +98,6 @@ app.registerExtension({
       } catch { return null; }
     }
 
-    /** True if a node accepts an image (LoadImage and friends). */
     function _isImageLoaderNode(node) {
       if (!node) return false;
       if (/load.?image|image.?load|loadimagemask/i.test(node.type || node.comfyClass || "")) return true;
@@ -152,7 +143,7 @@ app.registerExtension({
       const isOnGraph = target.closest?.(".litegraph, canvas, .comfyui-body-center, .graph-canvas-container, #graph-canvas")
         || target.tagName === "CANVAS";
       if (!isOnGraph) {
-        return; // not over the canvas, so don't intercept
+        return;
       }
 
       e.preventDefault();
@@ -220,7 +211,6 @@ app.registerExtension({
           }, defaultTab);
         }
 
-        /* Init gallery */
         const galleryApi = initGallery(mountEl, {
           openLightbox,
           openGallerySettings,
@@ -240,9 +230,9 @@ app.registerExtension({
 
     const _bindingOf = (settingId) => getSetting(settingId, _keyDefaults[settingId] || "");
 
-    // Toggle gallery sidebar. The aria-label form matches current ComfyUI
-    // frontends directly; the id and data-tooltip forms cover older
-    // frontends, and the icon scan below remains as the last resort.
+    // The aria-label form matches current ComfyUI frontends directly; the id and
+    // data-tooltip forms cover older frontends, and the icon scan below remains
+    // as the last resort.
     function _toggleGallery() {
       try {
         const tabBtns = document.querySelectorAll('button[aria-label="Sidebar Gallery"], [id*="sidebarGallery"], [data-tooltip*="Gallery"], [data-tooltip*="Sidebar Gallery"]');

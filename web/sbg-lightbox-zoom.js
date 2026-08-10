@@ -88,8 +88,6 @@ export function createZoomPanController({
     return _paneFor(half === cmp.leftHalf ? "left" : "right");
   }
 
-  // Direct pane lookup by key, with the media validity checks every caller
-  // needs (attached, sized, and past the pending swap-in stage).
   function _paneFor(key) {
     const cmp = getCompareElements();
     let media, host;
@@ -109,7 +107,6 @@ export function createZoomPanController({
   const _lastMouse = { x: null, y: null };
   function onMouseTrack(e) { _lastMouse.x = e.clientX; _lastMouse.y = e.clientY; _physCtrl = e.ctrlKey === true; }
 
-  // Pane at an absolute screen point, resolved through the live DOM.
   function paneAtPoint(x, y) {
     if (x == null || y == null) return null;
     const el = document.elementFromPoint(x, y);
@@ -188,9 +185,6 @@ export function createZoomPanController({
     _syncVideoShield(pane);
   }
 
-  // In synced compare mode, mirror a pane's state onto the other side:
-  // same scale, proportional pan (both show the same relative region even
-  // when the fitted sizes differ).
   function mirrorIfSynced(pane, st) {
     if (pane.key === "single" || settings.compareZoom !== "synced") return;
     const cmp = getCompareElements();

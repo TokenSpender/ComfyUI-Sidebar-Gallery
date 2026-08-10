@@ -1,14 +1,6 @@
 /**
  * sbg-gallery.js: Gallery grid, search, virtual scrolling, and data management
  *
- * This module owns:
- *   - Gallery grid rendering (virtual scroll)
- *   - Search bar, tags, autocomplete, server/client search
- *   - Folder navigation (root picker, subfolder tree)
- *   - Sort/filter controls
- *   - Data fetching (list_all, list_new, delta refresh)
- *   - First-time indexing modal
- *
  * Entry point: initGallery(mountEl, config) returns { state, fetchAllItems, ... }
  */
 
@@ -20,7 +12,7 @@ import {
   _thumbMemCache, _thumbCacheAPI, _metaCacheAPI, _resetIdb,
   initThumbObserver, getThumbObserver, resetThumbObserver, resetFailedThumbs,
   PLAY_SVG, VIDEO_ICON, IMG_ICON, IMG_FILTER_ICON, SEARCH_SVG, GEAR_SVG,
-  S, getSetting,
+  S, getSetting, applyCustomThemeVars,
   progressPoller, formatProgress,
 } from "./sbg-core.js";
 
@@ -39,19 +31,10 @@ const SEARCH_PREFIXES = [
 
    Instead of creating DOM nodes for every image in the library, cards are
    positioned absolutely inside the grid container and only those within
-   the visible viewport (plus a buffer) exist in the DOM at any time.
-
-   Key pieces:
-     _cardMap           - Map<itemIndex, cardEl>  (currently mounted cards)
-     _visRange          - { first, last } item indices currently mounted
-     _metrics           - { colCount, rowH, colW } computed from container
-     _scrollRafId       - rAF id for throttled scroll handler */
+   the visible viewport (plus a buffer) exist in the DOM at any time. */
 
 const DEFAULT_BUFFER_ROWS = 12; // extra rows rendered above/below viewport
 
-/**
- * Compute grid layout metrics from container dimensions and thumb size.
- */
 function _computeMetrics(container, thumbSize, gap, searchActive, perRow = 0) {
   const cw = container.clientWidth;
   if (cw <= 0) return null;
@@ -89,14 +72,12 @@ function _computeMasonryLayout(items, metrics, fixedPerRow = 0) {
 
   const arOf = (it) => {
     let ar = (it && it.w && it.h && it.h > 0) ? it.w / it.h : 1;
-    return Math.max(0.4, Math.min(2.5, ar));  // clamp extremes
+    return Math.max(0.4, Math.min(2.5, ar));
   };
 
   let y = 0;
   let i = 0;
   while (i < items.length) {
-    // Fill a row: exactly fixedPerRow cards, or greedily until the cards
-    // (at target height) span the container.
     const row = [];
     let sumAR = 0;
     while (i < items.length) {
@@ -177,8 +158,8 @@ function _masonryVisibleRange(positions, topEdge, bottomEdge) {
  * Initialize the gallery inside the given mount element.
  *
  * @param {HTMLElement} mountEl - the sidebar container element
- * @param {object} config - { openLightbox, openGallerySettings, app }
- * @returns {object} - public API: { state, fetchAllItems, fetchNewItems, refilter }
+ * @param {object} config - { openLightbox, openGallerySettings }
+ * @returns {object} - public API: { state, fetchAllItems, fetchNewItems, refilter, refreshConfig }
  */
 export function initGallery(mountEl, config) {
   const { openLightbox, openGallerySettings } = config;
@@ -218,7 +199,6 @@ export function initGallery(mountEl, config) {
   const defaultSort = _SORT_ALIAS[_rawSort] || _rawSort;
   const theme = getSetting(S.THEME, "comfyui");
 
-  // Apply badge colors as CSS variables
   const highColor = getSetting(S.BADGE_HIGH_COLOR, "#f87171");
   const lowColor = getSetting(S.BADGE_LOW_COLOR, "#60a5fa");
   mountEl.style.setProperty("--sbg-badge-high", highColor);
@@ -241,7 +221,6 @@ export function initGallery(mountEl, config) {
     displayedCount: 0,
     pageSize: 120,
     loading: false,
-    // Search
     searchTags: [],
     searchMode: "AND",
     _searchMatches: null,
@@ -270,16 +249,13 @@ export function initGallery(mountEl, config) {
   function applyFilters() {
     let items = state.allItems;
 
-    // Subfolder filter
     if (state.subfolder) {
       items = items.filter(it => it.subfolder === state.subfolder || it.subfolder.startsWith(state.subfolder + "/"));
     }
 
-    // Kind filter
     if (state.kind === "image") items = items.filter(it => it.kind === "image");
     else if (state.kind === "video") items = items.filter(it => it.kind === "video");
 
-    // Search
     if (state._searchMatches) {
       items = items.filter(it => {
         const rp = it.relpath.replace(/\\/g, "/");
@@ -351,7 +327,6 @@ export function initGallery(mountEl, config) {
     folderNav.innerHTML = "";
     const rootLabel = (state.roots.find(r => r.id === state.rootId) || {}).label || state.rootId;
 
-    // Root button (only shown if multiple roots)
     if (state.roots.length > 1) {
       const rootBtn = h("button", { class: "sbg-crumb sbg-crumb--root", text: rootLabel, title: "Click to change root" });
       rootBtn.addEventListener("click", () => {
@@ -374,7 +349,6 @@ export function initGallery(mountEl, config) {
       folderNav.appendChild(rootBtn);
     }
 
-    // Folder dropdown button
     if (state.subfolders.length > 0) {
       const currentLabel = state.subfolder || "All folders";
       const pickBtn = h("button", { class: "sbg-crumb sbg-crumb--pick", text: "📂 " + currentLabel, title: "Browse folders" });
@@ -427,7 +401,6 @@ export function initGallery(mountEl, config) {
     }
   }
 
-  // Kind toggle buttons
   const VID_FILTER_ICON = `<svg viewBox="0 0 24 24" width="14" height="14" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><polygon points="23 7 16 12 23 17 23 7"/><rect x="1" y="5" width="15" height="14" rx="2" ry="2"/></svg>`;
   const kindBtnAll = h("button", { class: "sbg-kind-btn sbg-kind-btn--active", text: "All", "data-kind": "", title: "Show all files" });
   const kindBtnImg = h("button", { class: "sbg-kind-btn", html: IMG_FILTER_ICON, "data-kind": "image", title: "Images only" });
@@ -451,8 +424,6 @@ export function initGallery(mountEl, config) {
 
   const qInput = h("input", { class: "sbg-input", placeholder: "Search all fields… (name: for filename only)", title: "Search across all metadata fields. Press Enter to add as a tag. Use name: for filename-only, model: lora: prompt: keyword: sampler: controlnet: for specific fields" });
   const searchClear = h("button", { class: "sbg-search-clear", text: "✕", title: "Clear search" });
-  // Refresh button shown in the same slot when the search is empty; swaps to the
-  // clear "✕" once a query/tags are active. Rescans disk without opening Diagnostics.
   const searchRefresh = h("button", { class: "sbg-search-refresh", text: "⟳", title: "Refresh gallery (rescan disk)" });
   searchRefresh.addEventListener("click", () => { fetchAllItems({ rescan: true }); });
   const _syncSearchBtns = () => {
@@ -474,7 +445,6 @@ export function initGallery(mountEl, config) {
 
   const inputFlexBox = h("div", { style: "display:flex;align-items:center;flex:1;min-width:0;gap:4px;flex-wrap:wrap;" }, [searchTagsWrap, qInput]);
 
-  // Autocomplete dropdown
   const autoCompleteDropdown = h("div", { class: "sbg-search-autocomplete" });
   autoCompleteDropdown.style.display = "none";
   let _acSelectedIdx = -1;
@@ -604,7 +574,7 @@ export function initGallery(mountEl, config) {
     searchClear,
     autoCompleteDropdown,
   ]);
-  _syncSearchBtns(); // an empty query shows the refresh button
+  _syncSearchBtns();
 
   /* Progress bar */
 
@@ -717,11 +687,8 @@ export function initGallery(mountEl, config) {
   let _cardMap = new Map();   // card elements, keyed by item index
   let _scrollRafId = null;
   let _resizeObserver = null;
-  let _emptyMsg = null;       // empty state placeholder
+  let _emptyMsg = null;
 
-  /**
-   * Build a tooltip string for a card.
-   */
   function buildTooltip(it) {
     const parts = [];
     if (getSetting(S.TOOLTIP_NAME, true)) parts.push(it.relpath);
@@ -731,9 +698,9 @@ export function initGallery(mountEl, config) {
   }
 
   /**
-   * Create the card element for an item. For virtual scrolling, cards are
-   * positioned absolutely. Always builds a fresh card; reusing unmounted
-   * card elements would need careful src/event cleanup.
+   * Always builds a fresh card; reusing unmounted card elements would need
+   * careful src/event cleanup. Cards are positioned absolutely for the
+   * virtual scroll.
    */
   function _createCard(it, index) {
     const shapeClass = thumbShape === "ar" ? "sbg-card__thumb-wrap--ar" : "sbg-card__thumb-wrap--square";
@@ -759,13 +726,11 @@ export function initGallery(mountEl, config) {
         },
       });
 
-      // L1: sync memory cache
       const memUrl = _thumbCacheAPI.tryGetSync(it.thumb_url);
       if (memUrl) {
         thumbImg.src = memUrl;
         thumbWrap.appendChild(thumbImg);
       } else {
-        // L2+: async IDB then network
         _thumbCacheAPI.tryGet(it.thumb_url).then(blobUrl => {
           // Liveness guard, mirroring the observer path: after a re-render
           // this continuation must not write into a detached card.
@@ -811,7 +776,6 @@ export function initGallery(mountEl, config) {
       ]),
     ]);
 
-    // Search match badges
     if (it._matchedFields && state._searchMatches) {
       const _renames = getSectionRenames();
       const _BADGE_FALLBACK = { pos_prompt: "POSITIVE", neg_prompt: "NEGATIVE", filename: "FILENAME", keyword: "KEYWORD", app: "APP", any: "ANY" };
@@ -834,7 +798,6 @@ export function initGallery(mountEl, config) {
       }
     }
 
-    // Drag-and-drop workflow loading
     card.draggable = true;
     card.addEventListener("dragstart", (e) => {
       e.dataTransfer.setData("application/x-sbg-workflow", JSON.stringify({ root_id: it.root_id, relpath: it.relpath }));
@@ -850,14 +813,9 @@ export function initGallery(mountEl, config) {
     return card;
   }
 
-  /**
-   * Position a card at the correct grid slot based on item index.
-   * In AR mode, uses pre-computed masonry positions.
-   */
   function _positionCard(card, index) {
     if (!_metrics) return;
 
-    // Masonry mode: use pre-computed positions
     if (_masonryData && _masonryData.positions[index]) {
       const pos = _masonryData.positions[index];
       card.style.position = "absolute";
@@ -865,14 +823,12 @@ export function initGallery(mountEl, config) {
       card.style.left = `${pos.x}px`;
       card.style.width = `${pos.w}px`;
       card.style.height = `${pos.h}px`;
-      // Set thumb wrap height to match the AR
       const thumbWrap = card.querySelector(".sbg-card__thumb-wrap");
       if (thumbWrap) thumbWrap.style.height = `${pos.thumbH}px`;
       card.style.display = "";
       return;
     }
 
-    // Grid mode: uniform positioning
     const { colCount, rowH, colW, gap, infoH } = _metrics;
     const row = Math.floor(index / colCount);
     const col = index % colCount;
@@ -885,87 +841,23 @@ export function initGallery(mountEl, config) {
     card.style.display = "";
   }
 
-  /**
-   * Core virtual scroll render: mount/unmount cards based on scroll position.
-   * Supports both uniform grid (square) and masonry (AR) layouts.
-   */
-  function _renderVirtual() {
-    _scrollRafId = null;
-    if (!_metrics || state.filteredItems.length === 0) return;
-
-    const scrollTop = body.scrollTop;
-    const viewH = body.clientHeight;
-    const bufferPx = Math.max(2, Math.min(30, Number(getSetting(S.VSCROLL_BUFFER, DEFAULT_BUFFER_ROWS)) || DEFAULT_BUFFER_ROWS)) * (_metrics.rowH || 150);
-
-    let firstIdx, lastIdx;
-
-    if (_masonryData) {
-      // Masonry (justified-rows) mode
-      // Items are placed in strict top-to-bottom, left-to-right reading order
-      // (see _computeMasonryLayout), so positions are sorted by Y and the visible
-      // items form a CONTIGUOUS index range. Binary-search it (O(log n)) instead
-      // of scanning all N positions on every scroll frame.
-      const topEdge = Math.max(0, scrollTop - bufferPx);
-      const bottomEdge = scrollTop + viewH + bufferPx;
-      const [first, last] = _masonryVisibleRange(_masonryData.positions, topEdge, bottomEdge);
-
-      // Unmount cards now outside the visible range.
-      for (const [idx, card] of _cardMap) {
-        if (idx < first || idx >= last) {
-          card.remove();
-          _cardMap.delete(idx);
-        }
-      }
-      // Mount visible cards.
-      for (let i = first; i < last; i++) {
-        const it = state.filteredItems[i];
-        if (!it) continue;
-        const existing = _cardMap.get(i);
-        if (existing) {
-          // If the list shifted (e.g. a delta refresh prepended items), index i may
-          // now point to a different item, or the same item modified in place (a new
-          // mtime and thus a new thumb URL). Rebuild when the bound identity no longer matches
-          // so a card never shows another item's or a stale thumbnail.
-          if (existing.dataset.key === `${it.relpath}\x00${it.mtime_real ?? it.mtime ?? 0}`) continue;
-          existing.remove(); _cardMap.delete(i);
-        }
-        const card = _createCard(it, i);
-        _positionCard(card, i);
-        grid.appendChild(card);
-        _cardMap.set(i, card);
-      }
-
-      state.displayedCount = state.filteredItems.length;
-      updateStatus();
-      return;
-    } else {
-      // Grid mode: uniform row-based calculation
-      const { colCount, rowH } = _metrics;
-      const bufferRows = Math.max(2, Math.min(30, Number(getSetting(S.VSCROLL_BUFFER, DEFAULT_BUFFER_ROWS)) || DEFAULT_BUFFER_ROWS));
-      const firstRow = Math.max(0, Math.floor(scrollTop / rowH) - bufferRows);
-      const lastRow = Math.ceil((scrollTop + viewH) / rowH) + bufferRows;
-      const totalRows = Math.ceil(state.filteredItems.length / colCount);
-      firstIdx = firstRow * colCount;
-      lastIdx = Math.min((Math.min(lastRow, totalRows)) * colCount, state.filteredItems.length);
-    }
-
-    // Unmount cards outside the new range
+  // Cull cards outside [firstIdx, lastIdx) and mount the missing ones. A card
+  // whose bound identity (relpath + mtime) no longer matches its index is
+  // rebuilt: the list shifted (a delta refresh prepended items), or the same
+  // file was overwritten in place (new mtime, so a new thumb URL). Without the
+  // rebuild a card shows another item's, or a stale, thumbnail.
+  function _syncCardWindow(firstIdx, lastIdx) {
     for (const [idx, card] of _cardMap) {
       if (idx < firstIdx || idx >= lastIdx) {
         card.remove();
         _cardMap.delete(idx);
       }
     }
-
-    // Mount cards in the new range
     for (let i = firstIdx; i < lastIdx; i++) {
       const it = state.filteredItems[i];
       if (!it) continue;
       const existing = _cardMap.get(i);
       if (existing) {
-        // Rebuild if index i now maps to a different item (list shifted) or the
-        // same item modified in place (a new mtime and thus a new thumb URL), so a card
-        // never displays a stale or wrong thumbnail (image/video mismatch).
         if (existing.dataset.key === `${it.relpath}\x00${it.mtime_real ?? it.mtime ?? 0}`) continue;
         existing.remove(); _cardMap.delete(i);
       }
@@ -974,9 +866,41 @@ export function initGallery(mountEl, config) {
       grid.appendChild(card);
       _cardMap.set(i, card);
     }
+  }
 
-    // Update displayed count for status
-    state.displayedCount = Math.min(lastIdx, state.filteredItems.length);
+  function _renderVirtual() {
+    _scrollRafId = null;
+    if (!_metrics || state.filteredItems.length === 0) return;
+
+    const scrollTop = body.scrollTop;
+    const viewH = body.clientHeight;
+    const bufferRows = Math.max(2, Math.min(30, Number(getSetting(S.VSCROLL_BUFFER, DEFAULT_BUFFER_ROWS)) || DEFAULT_BUFFER_ROWS));
+
+    let firstIdx, lastIdx;
+    if (_masonryData) {
+      // Items are placed in strict top-to-bottom, left-to-right reading order
+      // (see _computeMasonryLayout), so positions are sorted by Y and the visible
+      // items form a CONTIGUOUS index range. Binary-search it (O(log n)) instead
+      // of scanning all N positions on every scroll frame.
+      const bufferPx = bufferRows * (_metrics.rowH || 150);
+      const topEdge = Math.max(0, scrollTop - bufferPx);
+      const bottomEdge = scrollTop + viewH + bufferPx;
+      [firstIdx, lastIdx] = _masonryVisibleRange(_masonryData.positions, topEdge, bottomEdge);
+    } else {
+      const { colCount, rowH } = _metrics;
+      const firstRow = Math.max(0, Math.floor(scrollTop / rowH) - bufferRows);
+      const lastRow = Math.ceil((scrollTop + viewH) / rowH) + bufferRows;
+      const totalRows = Math.ceil(state.filteredItems.length / colCount);
+      firstIdx = firstRow * colCount;
+      lastIdx = Math.min((Math.min(lastRow, totalRows)) * colCount, state.filteredItems.length);
+    }
+
+    _syncCardWindow(firstIdx, lastIdx);
+    // Masonry renders the whole list's worth of rows, so it reports the full
+    // count; the grid reports the window's end.
+    state.displayedCount = _masonryData
+      ? state.filteredItems.length
+      : Math.min(lastIdx, state.filteredItems.length);
     updateStatus();
   }
 
@@ -985,14 +909,10 @@ export function initGallery(mountEl, config) {
     _scrollRafId = requestAnimationFrame(_renderVirtual);
   }
 
-  /**
-   * Full re-render: update spacer height, reset card map, render visible.
-   */
   // Masonry layout data (null when in square/grid mode)
   let _masonryData = null;
 
   function renderFromScratch() {
-    // Recompute metrics
     _metrics = _computeMetrics(grid, thumbSize, GAP, !!state._searchMatches, thumbPerRow);
     // Reserve the extra info row (for match badges) only while a search is active.
     grid.classList.toggle("sbg-grid--search", !!state._searchMatches);
@@ -1006,7 +926,6 @@ export function initGallery(mountEl, config) {
     for (const stray of grid.querySelectorAll(".sbg-card")) stray.remove();
     _masonryData = null;
 
-    // Remove empty message if present
     if (_emptyMsg) { _emptyMsg.remove(); _emptyMsg = null; }
 
     if (!_metrics || state.filteredItems.length === 0) {
@@ -1023,17 +942,14 @@ export function initGallery(mountEl, config) {
     }
 
     if (thumbShape === "ar") {
-      // Masonry mode: pre-compute all positions
       _masonryData = _computeMasonryLayout(state.filteredItems, _metrics, thumbPerRow);
       spacer.style.height = `${_masonryData.totalHeight}px`;
     } else {
-      // Grid mode: uniform rows
       const { colCount, rowH } = _metrics;
       const totalRows = Math.ceil(state.filteredItems.length / colCount);
       spacer.style.height = `${totalRows * rowH}px`;
     }
 
-    // Render visible cards
     _renderVirtual();
   }
 
@@ -1122,7 +1038,6 @@ export function initGallery(mountEl, config) {
     const newMetrics = _computeMetrics(grid, thumbSize, GAP, !!state._searchMatches, thumbPerRow);
     if (newMetrics && _metrics &&
         (newMetrics.colCount !== _metrics.colCount || Math.abs(newMetrics.rowH - _metrics.rowH) > 1)) {
-      // Column count or row height changed: full re-layout
       _metrics = newMetrics;
       renderFromScratch();
     } else if (newMetrics && !_metrics) {
@@ -1140,10 +1055,6 @@ export function initGallery(mountEl, config) {
     diagBtn.disabled = v;
     if (v) statusLeft.classList.add("sbg-loading");
     else statusLeft.classList.remove("sbg-loading");
-  }
-
-  function rebuildRoots() {
-    renderFolderNav();
   }
 
   async function loadSubfolders() {
@@ -1171,7 +1082,7 @@ export function initGallery(mountEl, config) {
     if (!state.roots.find(r => r.id === state.rootId)) {
       switchRoot("output");
     } else {
-      rebuildRoots();
+      renderFolderNav();
     }
   }
 
@@ -1201,7 +1112,6 @@ export function initGallery(mountEl, config) {
       state.allItems = _dataCache.items[newRootId];
       applyFilters();
       renderFromScratch();
-      // Paint from the in-memory cache, then version-gated poll.
       _pollAndReconcile();
       if (state.searchTags.length > 0) _triggerMultiSearch();
     } else {
@@ -1238,7 +1148,7 @@ export function initGallery(mountEl, config) {
 
   // Single write path for the IndexedDB snapshot: always the per-root cached
   // items with the per-root version they reflect, and a record of what was
-  // written so unchanged fetches can skip the multi-MB rewrite entirely.
+  // written so unchanged fetches can skip the rewrite entirely.
   function _persistSnapshot(rid) {
     const items = _dataCache.items[rid];
     if (!items) return;
@@ -1311,10 +1221,10 @@ export function initGallery(mountEl, config) {
       const CACHE_EPOCH = "3";
       if (localStorage.getItem("SBG._cacheEpoch") !== CACHE_EPOCH) {
         _metaCache.clear();
-        try { _resetIdb(); indexedDB.deleteDatabase("sbg-cache"); } catch (e) { /* ignore */ }
-        try { indexedDB.deleteDatabase("sbg-gallery-cache"); } catch (e) { /* ignore */ }
+        try { _resetIdb(); indexedDB.deleteDatabase("sbg-cache"); } catch (e) { }
+        try { indexedDB.deleteDatabase("sbg-gallery-cache"); } catch (e) { }
         localStorage.setItem("SBG._cacheEpoch", CACHE_EPOCH);
-        cacheReset = true; // data-shape change: force a fresh repaint below
+        cacheReset = true;
       }
       _checkMetaEpoch(data.meta_epoch);
 
@@ -1341,10 +1251,10 @@ export function initGallery(mountEl, config) {
 
       _dataCache.items[rid] = newItems;
       // Persist items + the DB version they reflect (drives the reopen version
-      // gate), but skip the multi-MB IndexedDB rewrite when neither the items nor
-      // the version changed since the last write (the common startup case). The
-      // debounced path keeps the multi-MB structured-clone put off this render's
-      // critical path (it also coalesces a burst of refetches into one write).
+      // gate), but skip the IndexedDB rewrite when neither the items nor the
+      // version changed since the last write (the common startup case). The
+      // debounced path keeps the structured-clone put off this render's critical
+      // path (it also coalesces a burst of refetches into one write).
       if (!noChange || _dataCache._persistedVersion[rid] !== _dataCache.itemsVersion[rid]) {
         _schedulePersist(rid);
       }
@@ -1435,7 +1345,7 @@ export function initGallery(mountEl, config) {
             // writer, or it died before reporting): recover the buttons instead of
             // sitting on a disabled "Starting…" forever.
             modalActive = false; unsub();
-            progressTextM.textContent = "Couldn't start - another scan is still running. Try again in a moment.";
+            progressTextM.textContent = "Couldn't start. Another scan is still running; try again in a moment.";
             startBtn.disabled = false;
             startBtn.textContent = "🚀 Start Indexing";
             skipBtn.style.display = "";
@@ -1532,7 +1442,7 @@ export function initGallery(mountEl, config) {
     const ac = new AbortController();
     window._sbgRefreshAbort = ac;
     const maybePoll = (eager = false) => {
-      if (document.visibilityState !== "visible") return;      // don't scan while hidden
+      if (document.visibilityState !== "visible") return;
       if (!(_dataCache._mountEl && _dataCache._mountEl.isConnected)) return;
       _pollAndReconcile(eager);
     };
@@ -1545,7 +1455,7 @@ export function initGallery(mountEl, config) {
     document.addEventListener("visibilitychange", () => {
       if (document.visibilityState === "visible") maybePoll(true);
     }, { signal: ac.signal });
-    if (!interval || interval <= 0) return; // 0 = no periodic polling
+    if (!interval || interval <= 0) return;
     const ms = Math.max(5, interval) * 1000;
     window._sbgPollTimer = setInterval(() => maybePoll(false), ms);
   }
@@ -1671,7 +1581,6 @@ export function initGallery(mountEl, config) {
       if (!isCurrent) return;
 
       if (state._searchMatches) {
-        // Active search: delta search new items
         const newRelpaths = added.map(a => a.relpath);
         try {
           const resp2 = await fetch("/sidebar_gallery/search", {
@@ -1679,7 +1588,7 @@ export function initGallery(mountEl, config) {
             headers: { "Content-Type": "application/json" },
             body: JSON.stringify({
               root_id: state.rootId,
-              tags: state.searchTags.map(t => ({ field: t.field, value: t.value, exclude: t.exclude || false, ...(t.node_classes ? { node_classes: t.node_classes } : {}) })),
+              tags: _tagsPayload(),
               mode: state.searchMode,
               relpaths: newRelpaths,
             }),
@@ -1711,6 +1620,17 @@ export function initGallery(mountEl, config) {
 
   let qTimer = null;
   let _searchAbort = null;
+
+  // The wire shape of the active tags, shared by the full search and the
+  // new-file delta search so the two requests can never drift. A function
+  // declaration so it hoists like its callers and can never hit the
+  // temporal dead zone from an earlier synchronous call path.
+  function _tagsPayload() {
+    return state.searchTags.map(t => ({
+      field: t.field, value: t.value, exclude: t.exclude || false,
+      ...(t.node_classes ? { node_classes: t.node_classes } : {}),
+    }));
+  }
 
   function renderSearchTags() {
     searchTagsWrap.innerHTML = "";
@@ -1798,7 +1718,6 @@ export function initGallery(mountEl, config) {
       return;
     }
 
-    // Name-only: client-side filtering
     const allNameOnly = state.searchTags.every(t => t.field === "name");
     if (allNameOnly) {
       _dataCache.searchTags = [...state.searchTags];
@@ -1835,7 +1754,7 @@ export function initGallery(mountEl, config) {
           headers: { "Content-Type": "application/json" },
           body: JSON.stringify({
             root_id: state.rootId,
-            tags: state.searchTags.map(t => ({ field: t.field, value: t.value, exclude: t.exclude || false, ...(t.node_classes ? { node_classes: t.node_classes } : {}) })),
+            tags: _tagsPayload(),
             mode: state.searchMode
           }),
           signal: ctrl.signal,
@@ -1979,22 +1898,7 @@ export function initGallery(mountEl, config) {
   const root = h("div", { class: "sbg-root" }, [toolbar, statusBar, bodyWrap]);
   if (theme !== "comfyui") root.setAttribute("data-theme", theme);
 
-  function _applyCustomThemeVars(r, t) {
-    if (t === "custom") {
-      r.style.setProperty("--sbg-bg", getSetting("CUSTOM_BG", "#1a1a1a"));
-      r.style.setProperty("--sbg-surface", getSetting("CUSTOM_SURFACE", "#222222"));
-      r.style.setProperty("--sbg-border", getSetting("CUSTOM_BORDER", "#444444"));
-      r.style.setProperty("--sbg-text", getSetting("CUSTOM_TEXT", "#e0e0e0"));
-      r.style.setProperty("--sbg-accent", getSetting("CUSTOM_ACCENT", "#7c6aef"));
-    } else {
-      r.style.removeProperty("--sbg-bg");
-      r.style.removeProperty("--sbg-surface");
-      r.style.removeProperty("--sbg-border");
-      r.style.removeProperty("--sbg-text");
-      r.style.removeProperty("--sbg-accent");
-    }
-  }
-  _applyCustomThemeVars(root, theme);
+  applyCustomThemeVars(root, theme);
 
   mountEl.appendChild(root);
 
@@ -2005,6 +1909,22 @@ export function initGallery(mountEl, config) {
   _dataCache._fetchNewItems = fetchNewItems;
   _dataCache._refilter = refilter;
   _startAutoRefresh();
+
+  // One reconcile after any cached first paint: an in-memory or snapshot
+  // paint can hide external deletions/renames made while no panel was open.
+  // A generation that finished while the panel was closed left its files in
+  // _pendingFiles (the executed listener is module-level), so drain them
+  // through the targeted delta first; either way poll eagerly, since only an
+  // awaited scan can reveal files that appeared while no open panel was
+  // around to trigger one.
+  function _reconcileAfterPaint() {
+    if (_dataCache.stale) {
+      _dataCache.stale = false;
+      fetchNewItems().finally(() => _pollAndReconcile(true));
+    } else {
+      _pollAndReconcile(true);
+    }
+  }
 
   (async () => {
     try {
@@ -2031,7 +1951,7 @@ export function initGallery(mountEl, config) {
           }
         }
 
-        rebuildRoots();
+        renderFolderNav();
         for (const b of [kindBtnAll, kindBtnImg, kindBtnVid]) {
           b.classList.toggle("sbg-kind-btn--active", b.dataset.kind === state.kind);
         }
@@ -2041,20 +1961,9 @@ export function initGallery(mountEl, config) {
         applyFilters();
         await new Promise(r => requestAnimationFrame(r));
         renderFromScratch();
-        _restoreScrollPos(); // reopening returns to where you were
+        _restoreScrollPos();
 
-        // Warm remount always reconciles once: the in-memory paint can hide external
-        // deletions/renames made while the panel was closed. If a generation finished
-        // while closed, run the targeted delta first (fast path for the new files),
-        // then the eager form of the version-gated poll, so the server answers
-        // after a snappy-cooldown scan instead of from a DB that hasn't looked
-        // at the disk since the panel was last open.
-        if (_dataCache.stale) {
-          _dataCache.stale = false;
-          fetchNewItems().finally(() => _pollAndReconcile(true));
-        } else {
-          _pollAndReconcile(true);
-        }
+        _reconcileAfterPaint();
       } else {
         const persisted = await _loadPersistedItems(state.rootId);
         if (persisted && persisted.items.length > 0) {
@@ -2071,18 +1980,7 @@ export function initGallery(mountEl, config) {
           await new Promise(r => requestAnimationFrame(r));
           renderFromScratch();
           Promise.all([refreshConfig(), loadSubfolders()]).catch(() => { });
-          // Paint from the snapshot, then reconcile by the same rules as the
-          // warm remount above: generations that finished BEFORE this first
-          // mount are sitting in _pendingFiles (the executed listener is
-          // module-level), so drain them; either way poll eagerly, since only
-          // an awaited scan can reveal files that appeared while no open panel
-          // was around to trigger one.
-          if (_dataCache.stale) {
-            _dataCache.stale = false;
-            fetchNewItems().finally(() => _pollAndReconcile(true));
-          } else {
-            _pollAndReconcile(true);
-          }
+          _reconcileAfterPaint();
         } else {
           _dataCache.stale = false;
           await Promise.all([refreshConfig(), loadSubfolders(), fetchAllItems({ rescan: true })]);

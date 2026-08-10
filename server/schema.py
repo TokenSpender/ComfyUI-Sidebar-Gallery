@@ -1,20 +1,15 @@
 """Single source of truth for the SBG metadata-section schema.
 
-This module loads ``section_catalog.json`` and derives the tables that
-would otherwise be hardcoded in six separate places:
+This module loads ``section_catalog.json`` and derives the tables that would
+otherwise be hardcoded in each consumer:
 
   - ``known_summary_keys()`` feeds ``_KNOWN_SUMMARY_KEYS`` in metadata.py
-  - ``search_fields()`` feeds the ``_match_summary`` field set in routes.py
   - ``meta_key_buckets()`` feeds the ``get_all_meta_keys`` buckets in db.py
-  - ``default_layout()`` feeds the sbg-translation-layer.js default layout
-  - ``search_alias_map()`` feeds the sbg-section-registry.js search-name map
-  - the section ids feed PATH_GROUPS in sbg-layout-editor.js
+  - ``section_titles()`` and the non-bindable key sets are served to the
+    frontend by routes.py
 
-The catalog is the single definition; each consumer derives its tables
-from here instead of keeping a hardcoded copy.
-
-Pure stdlib (json + pathlib) so it is importable anywhere, including a
-bare test environment without ComfyUI.
+Pure stdlib (json + pathlib) so it is importable anywhere, including an
+environment without ComfyUI.
 """
 from __future__ import annotations
 
@@ -28,22 +23,16 @@ _CATALOG_PATH = Path(__file__).resolve().parents[1] / "section_catalog.json"
 
 @lru_cache(maxsize=1)
 def load_catalog() -> dict[str, Any]:
-    """Load and cache the raw catalog document."""
     with open(_CATALOG_PATH, encoding="utf-8") as f:
         return json.load(f)
 
 
 def sections() -> list[dict[str, Any]]:
-    """Return the list of section entries."""
     return load_catalog().get("sections", [])
 
 
 def known_summary_keys() -> set[str]:
-    """Every top-level key the parser is allowed to emit on a summary.
-
-    Union of each section's ``summary_keys`` plus the catalog ``flags``.
-    Mirror of ``metadata._KNOWN_SUMMARY_KEYS``.
-    """
+    """Every top-level key the parser is allowed to emit on a summary."""
     keys: set[str] = set()
     for entry in sections():
         keys.update(entry.get("summary_keys", []))
@@ -52,10 +41,8 @@ def known_summary_keys() -> set[str]:
 
 
 def meta_key_buckets() -> dict[str, str]:
-    """Map each section's primary summary key to its kind.
-
-    Used to drive ``db.get_all_meta_keys`` bucketing (array-of-dict
-    sections collect item param keys; object sections collect dict keys).
+    """Drives ``db.get_all_meta_keys`` bucketing: array-of-dict sections
+    collect item param keys, object sections collect dict keys.
     """
     return {e["key"]: e["kind"] for e in sections()}
 
@@ -83,18 +70,16 @@ def non_bindable_element_keys() -> dict[str, list[str]]:
 
 
 def search_fields() -> set[str]:
-    """The set of backend search field names the catalog declares.
+    """The backend search field names the catalog declares.
 
-    Must be a subset of the fields handled by ``routes._match_summary``.
+    Must be a subset of the fields handled by ``search.match_summary``.
     """
     return {e["search_field"] for e in sections() if e.get("search_field")}
 
 
 def search_alias_map() -> dict[str, str]:
-    """Map user-typed names (id, title, aliases) to the backend search field.
-
-    Replacement for the registry's ``SEARCH_FIELD_ALIASES`` +
-    ``getSearchField`` chain.
+    """Map user-typed names (key, section id, title, aliases) to the backend
+    search field.
     """
     out: dict[str, str] = {}
     for e in sections():
@@ -121,12 +106,7 @@ def section_titles() -> dict[str, str]:
 
 
 def default_layout(media: str = "image") -> list[dict[str, Any]]:
-    """Build the default section profile for a media kind from the catalog.
-
-    Mirror of TL ``defaultImageLayout`` / ``defaultVideoLayout``. Consumed
-    by the front-end in a later stage; provided here so the catalog is the
-    single definition.
-    """
+    """Build the default section profile for a media kind from the catalog."""
     layout: list[dict[str, Any]] = []
     for e in sections():
         if media not in e.get("media", ["image", "video"]):

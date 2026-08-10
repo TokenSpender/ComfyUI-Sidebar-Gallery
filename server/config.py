@@ -15,20 +15,19 @@ CONFIG_FILENAME = "sidebar_gallery_config.json"
 
 
 def config_path() -> Path:
-    """The config file's location, for callers that watch it for changes."""
     return _package_root() / CONFIG_FILENAME
 
 
 @dataclass(frozen=True)
 class SidebarGalleryConfig:
     extra_roots: list[str]
-    # Folder NAMES (not paths) to skip while scanning, e.g. "thumbnails".
-    # Stored lowercased; matched case-insensitively against each directory name.
+    # Names of folders to skip while scanning, e.g. "thumbnails". Stored
+    # lowercased; matched case-insensitively against each directory name.
     excluded_dirs: list[str] = field(default_factory=list)
-    # When False (default) the scanner skips folders whose names start with a
-    # dot (e.g. ".thumbs"); set True to index hidden folders too.
+    # When False the scanner skips folders whose names start with a dot,
+    # e.g. ".thumbs".
     index_hidden_dirs: bool = False
-    # Auto-refresh: seconds between background polls for external file changes
+    # Seconds between background polls for external file changes
     # (delete/move/rename) while the gallery is open. 0 disables polling.
     auto_refresh_interval_s: int = 15
     default_limit: int = 120
@@ -48,7 +47,6 @@ def _normalize_dir(p: str) -> str:
 
 
 def _safe_int(val: Any, fallback: int) -> int:
-    """Safely cast a value to int, returning fallback on failure."""
     try:
         return int(val)
     except (ValueError, TypeError):
@@ -65,10 +63,9 @@ def _norm_refresh_interval(n: int) -> int:
 def _clean_str_list(raw_list: Any, *, lower: bool = False, dedupe: bool = False) -> list[str]:
     """Normalise a raw value into a list of non-empty, trimmed strings.
 
-    Non-strings and blanks are dropped. With ``lower`` each entry is lowercased;
-    with ``dedupe`` the first occurrence wins and later duplicates are skipped.
-    Returns [] for any non-list input. Shared by load/save so excluded-dir names
-    are normalised identically on read and write.
+    Returns [] for any non-list input; ``dedupe`` keeps the first occurrence.
+    Shared by load/save so excluded-dir names are normalised identically on
+    read and write.
     """
     out: list[str] = []
     if not isinstance(raw_list, list):
@@ -86,7 +83,7 @@ def _clean_str_list(raw_list: Any, *, lower: bool = False, dedupe: bool = False)
 
 
 def load_config() -> SidebarGalleryConfig:
-    path = _package_root() / CONFIG_FILENAME
+    path = config_path()
     if not path.exists():
         return SidebarGalleryConfig.defaults()
     try:
@@ -139,9 +136,9 @@ def save_config(data: dict[str, Any]) -> SidebarGalleryConfig:
     else:
         extra_roots = list(cfg.extra_roots)
 
-    # Excluded dirs are plain folder NAMES (never paths), so there is no
-    # normalisation or isdir check. Lowercased + de-duplicated; saved list
-    # preserved if absent/malformed.
+    # Excluded dirs are plain folder names, so there is no path normalisation
+    # or isdir check. The saved list is preserved when the key is absent or
+    # malformed.
     excluded_in = data.get("excluded_dirs")
     if isinstance(excluded_in, list):
         excluded_dirs = _clean_str_list(excluded_in, lower=True, dedupe=True)
@@ -168,8 +165,7 @@ def save_config(data: dict[str, Any]) -> SidebarGalleryConfig:
         ),
     )
 
-    path = _package_root() / CONFIG_FILENAME
-    path.write_text(
+    config_path().write_text(
         json.dumps(
             {
                 "extra_roots": out.extra_roots,

@@ -16,7 +16,7 @@ from collections import deque
 from concurrent.futures import ThreadPoolExecutor
 from dataclasses import dataclass, field
 from pathlib import Path
-from typing import Any, Callable
+from typing import Callable
 
 from .schema import meta_key_buckets
 from .security import AllowedRoot, safe_join
@@ -99,7 +99,7 @@ def _bump_version(conn: sqlite3.Connection, root_id: str) -> None:
 
 
 def get_meta_value(key: str) -> str | None:
-    """Read a value from the sbg_meta key/value table (None if absent)."""
+    """Returns None when the key is absent or the read fails."""
     try:
         with _get_conn() as conn:
             row = conn.execute("SELECT value FROM sbg_meta WHERE key = ?", (key,)).fetchone()
@@ -109,7 +109,7 @@ def get_meta_value(key: str) -> str | None:
 
 
 def set_meta_value(key: str, value: str) -> None:
-    """Write a value to the sbg_meta key/value table (best-effort)."""
+    """Best-effort: a failed write is swallowed."""
     try:
         with _get_conn() as conn:
             conn.execute(
@@ -140,7 +140,8 @@ def bump_meta_epoch() -> None:
 
 
 def has_any_files() -> bool:
-    """True if at least one media file is indexed."""
+    """A LIMIT 1 probe, so this never counts the whole table. Returns False
+    when the read fails."""
     try:
         with _get_conn() as conn:
             return conn.execute("SELECT 1 FROM media_files LIMIT 1").fetchone() is not None
@@ -151,9 +152,7 @@ def has_any_files() -> bool:
 # Connection management
 
 def _get_conn() -> sqlite3.Connection:
-    """Open a new SQLite connection with WAL mode.
-
-    Opened per call, with no thread-local reuse or pooling. Callers either close it explicitly
+    """Opened per call, with no thread-local reuse or pooling. Callers either close it explicitly
     (long scans) or rely on GC after a short `with conn:` block. WAL mode plus
     the 30s busy timeout make concurrent use safe.
     """
@@ -166,7 +165,6 @@ def _get_conn() -> sqlite3.Connection:
 
 
 def init_db():
-    """Create tables and indexes if they don't exist."""
     with _get_conn() as conn:
         conn.executescript("""
             CREATE TABLE IF NOT EXISTS media_files (
@@ -200,10 +198,10 @@ def init_db():
             # Backfill: set ctime = mtime for existing rows until real ctime is read from the filesystem
             conn.execute("UPDATE media_files SET ctime = mtime WHERE ctime = 0 OR ctime IS NULL")
             conn.commit()
-        # Create ctime index (safe to run whether column was just added or already existed)
+        # Safe to run whether the column was just added or already existed.
         conn.execute("CREATE INDEX IF NOT EXISTS idx_root_ctime ON media_files(root_id, ctime DESC)")
         conn.commit()
-        # Restore the persisted DB version counter (survives server restarts).
+        # Restore the persisted counters so versions survive a restart.
         try:
             row = conn.execute("SELECT value FROM sbg_meta WHERE key = 'db_version'").fetchone()
             if row and row["value"] is not None:
@@ -223,7 +221,6 @@ def init_db():
             conn.commit()
         except Exception:
             pass
-        # Restore the metadata epoch too (read on every list_all; kept in memory).
         try:
             row = conn.execute("SELECT value FROM sbg_meta WHERE key = 'meta_epoch'").fetchone()
             if row and row["value"] is not None:
@@ -240,10 +237,10 @@ _MIGRATION_NODE_TEXT_CAP = 4000
 
 def _migrate_trim_node_text_bloat() -> None:
     """One-time cleanup: an uncapped 'show'-node text override could store a huge
-    blob (600KB+ JSON) into a single workflow_nodes entry, ballooning the DB and
-    making search take tens of seconds. Trim any oversized node-param string in
-    already-indexed rows so search is fast again without a full reindex. Idempotent
-    via PRAGMA user_version (runs once). Best-effort: any failure is swallowed."""
+    blob into a single workflow_nodes entry, ballooning the DB and slowing search.
+    Trims any oversized node-param string in already-indexed rows, so no full
+    reindex is needed. Idempotent via PRAGMA user_version. Best-effort: any
+    failure is swallowed."""
     try:
         with _get_conn() as conn:
             if conn.execute("PRAGMA user_version").fetchone()[0] >= 1:
@@ -300,7 +297,6 @@ def upsert_file(
     metadata_json: str | None = None,
     ctime: float = 0,
 ):
-    """Insert or update a single file record."""
     filename = os.path.basename(relpath)
     subfolder = os.path.dirname(relpath).replace("\\", "/")
     # The DO UPDATE ... WHERE clauses make an upsert that changes nothing a
@@ -359,31 +355,13 @@ def get_rows_since(root_id: str, since: float) -> list[dict]:
     return [dict(r) for r in rows]
 
 
-def get_all(root_id: str) -> list[dict]:
-    """Return all files for a root, sorted by ctime desc (creation time).
-
-    Uses ctime instead of mtime for sort order to prevent files from
-    jumping to the top after merely being viewed, since some file managers
-    update mtime on viewing.
-
-    Includes extracted width/height from metadata for AR thumbnail support.
-    """
-    with _get_conn() as conn:
-        rows = conn.execute(
-            """SELECT root_id, relpath, filename, subfolder, ext, kind,
-                      size, mtime, ctime,
-                      json_extract(metadata_json, '$.width') as w,
-                      json_extract(metadata_json, '$.height') as h
-               FROM media_files
-               WHERE root_id = ?
-               ORDER BY ctime DESC, relpath DESC""",
-            (root_id,),
-        ).fetchall()
-    return [dict(r) for r in rows]
-
-
 def get_all_with_version(root_id: str) -> tuple[int, list[dict]]:
     """Return (root_version, rows) read inside one transaction.
+
+    Rows sort by ctime desc: sorting on mtime would let files jump to the top
+    after merely being viewed, since some file managers update mtime on
+    viewing. Width and height come from the metadata for the aspect-ratio
+    layout.
 
     WAL gives both reads a single snapshot, so the version provably matches the
     row set. Without this, a concurrently-committing scan could produce a
@@ -439,7 +417,6 @@ def mark_meta_attempted(root_id: str, relpath: str) -> None:
 
 
 def get_all_with_metadata(root_id: str) -> list[dict]:
-    """Return files with metadata_json, for search."""
     with _get_conn() as conn:
         rows = conn.execute(
             """SELECT root_id, relpath, metadata_json
@@ -458,7 +435,6 @@ _IN_CHUNK = 900
 
 
 def get_items_with_metadata(root_id: str, relpaths: list[str]) -> list[dict]:
-    """Return metadata for specific relpaths only (for delta search)."""
     if not relpaths:
         return []
     out: list[dict] = []
@@ -477,7 +453,6 @@ def get_items_with_metadata(root_id: str, relpaths: list[str]) -> list[dict]:
 
 
 def get_file(root_id: str, relpath: str) -> dict | None:
-    """Return a single file record or None."""
     with _get_conn() as conn:
         row = conn.execute(
             """SELECT root_id, relpath, filename, subfolder, ext, kind,
@@ -490,7 +465,6 @@ def get_file(root_id: str, relpath: str) -> dict | None:
 
 
 def get_subfolders(root_id: str) -> list[str]:
-    """Return distinct non-empty subfolder paths for a root."""
     with _get_conn() as conn:
         rows = conn.execute(
             """SELECT DISTINCT subfolder FROM media_files
@@ -502,7 +476,6 @@ def get_subfolders(root_id: str) -> list[str]:
 
 
 def get_count(root_id: str) -> int:
-    """Return the number of indexed files for a root."""
     with _get_conn() as conn:
         row = conn.execute(
             "SELECT COUNT(*) as cnt FROM media_files WHERE root_id = ?",
@@ -512,8 +485,7 @@ def get_count(root_id: str) -> int:
 
 
 def delete_file(conn: sqlite3.Connection, root_id: str, relpath: str) -> bool:
-    """Delete a single file record (requires existing connection). Returns
-    whether a row was actually removed. Announcing the deletion to the delta
+    """Returns whether a row was actually removed. Announcing the deletion to the delta
     buffer is the caller's job, via record_removals() AFTER the transaction
     commits, so a rollback can never leave an announcement for rows that are
     still present."""
@@ -722,7 +694,7 @@ def get_progress() -> dict:
         }
 
 
-# Incremental scan (fast)
+# Incremental scan
 
 def _filter_scan_dirs(dirnames: list[str], excluded: set[str], *, skip_hidden: bool = True) -> None:
     """Prune the os.walk subtree in place so the scanner skips whole folders.
@@ -742,7 +714,8 @@ def _filter_scan_dirs(dirnames: list[str], excluded: set[str], *, skip_hidden: b
 def _iter_media_files(base_abs, excluded, skip_hidden, errors: _ScanErrors | None = None):
     """Yield (rel, ext, kind, size, mtime, ctime) for every media file under
     base_abs, using os.scandir so DirEntry.stat() reuses the directory listing
-    (no extra per-file stat syscall on Windows, the big win on network shares).
+    (no extra per-file stat syscall on Windows, which matters most on network
+    shares).
     Mirrors os.walk + _filter_scan_dirs directory pruning.
 
     OSErrors are swallowed (a scan must survive a locked folder) but counted
@@ -781,7 +754,6 @@ def _iter_media_files(base_abs, excluded, skip_hidden, errors: _ScanErrors | Non
             rel = os.path.relpath(entry.path, base_abs).replace("\\", "/")
             kind = "video" if ext in VIDEO_EXTS else "image"
             yield rel, ext, kind, int(st.st_size), float(st.st_mtime), float(st.st_ctime)
-        # Prune subdirs exactly like os.walk + _filter_scan_dirs, then recurse.
         _filter_scan_dirs(subdirs, excluded, skip_hidden=skip_hidden)
         for name in subdirs:
             stack.append(os.path.join(dirpath, name))
@@ -857,8 +829,8 @@ def _read_and_upsert_batches(
 
 
 # Cached (root_version, {relpath: mtime}) per root. The auto-refresh poll scans
-# frequently, and re-SELECTing tens of thousands of rows just to conclude
-# "nothing changed" is wasteful. The per-root version key keeps the cache exact
+# frequently, and re-SELECTing every row just to conclude "nothing changed" is
+# wasteful. The per-root version key keeps the cache exact
 # (every material write bumps it).
 _mtimes_cache: dict[str, tuple[int, dict[str, float]]] = {}
 
@@ -872,12 +844,9 @@ def incremental_scan(
     report_progress: bool = False,
     cancel_event: threading.Event | None = None,
 ) -> ScanResult:
-    """Fast incremental scan: only update new/changed files.
-
-    1. Walk the filesystem and collect all files + mtime/size
-    2. Compare against DB mtime and only upsert new/changed files
-    3. Delete DB records for files no longer on disk. SKIPPED when the
-       enumeration was incomplete (see the sweep guard below)
+    """Only new and changed files are upserted. Records for files no longer on
+    disk are deleted, and that sweep is SKIPPED when the enumeration was
+    incomplete (see the sweep guard below).
 
     `report_progress` is decided by the caller (routes knows whether the root
     ever completed an index via the "indexed:<rid>" marker). A first index
@@ -921,7 +890,6 @@ def _incremental_scan_impl(root, base_abs, rid, token, *, read_metadata_fn,
     if not os.path.isdir(base_abs):
         raise OSError(f"root path not accessible: {base_abs}")
 
-    # Existing DB records for this root (mtime keyed by relpath), cached per version.
     cur_version = get_root_version(rid)
     cached = _mtimes_cache.get(rid)
     if cached is not None and cached[0] == cur_version:
@@ -935,7 +903,6 @@ def _incremental_scan_impl(root, base_abs, rid, token, *, read_metadata_fn,
         db_mtimes = {r["relpath"]: r["mtime"] for r in db_rows}
         _mtimes_cache[rid] = (cur_version, db_mtimes)
 
-    # Collect all current files from filesystem.
     disk_files: dict[str, tuple[str, str, int, float, float]] = {}  # keyed by relpath: (ext, kind, size, mtime, ctime)
     excluded = excluded_dirs or set()
     skip_hidden = not index_hidden_dirs
@@ -949,7 +916,6 @@ def _incremental_scan_impl(root, base_abs, rid, token, *, read_metadata_fn,
     if token is not None:
         update_progress(rid, token, total=len(disk_files), phase="indexing")
 
-    # Files that are new or whose mtime changed need an upsert (+ metadata read).
     changed_items = [
         (rel, ext, kind, size, mtime, ctime)
         for rel, (ext, kind, size, mtime, ctime) in disk_files.items()
@@ -1022,7 +988,7 @@ def full_reindex(
     excluded_dirs: set[str] | None = None,
     index_hidden_dirs: bool = False,
 ) -> int:
-    """Full reindex: scan every file, parse every file's metadata.
+    """Re-parses every file's metadata, whatever its mtime says.
 
     Runs synchronously (call from a background thread). Reports into the
     progress registry under _FULL_KEY. Returns total files indexed.
@@ -1038,8 +1004,8 @@ def full_reindex(
         if not os.path.isdir(base_abs):
             raise OSError(f"root path not accessible: {base_abs}")
 
-        # Phase 1: scan filesystem, with a live found-count so the UI shows
-        # motion instead of sitting at "0/0" for the whole walk.
+        # A live found-count keeps the UI moving instead of sitting at "0/0"
+        # for the whole walk.
         disk_files: list[tuple[str, str, str, int, float, float]] = []
         excluded = excluded_dirs or set()
         skip_hidden = not index_hidden_dirs
@@ -1051,8 +1017,8 @@ def full_reindex(
 
         update_progress(_FULL_KEY, token, total=len(disk_files), phase="indexing")
 
-        # Phase 2: insert all records using a single connection, then delete old
-        # ones, so the gallery always has data and never sees an empty DB.
+        # Insert every record before deleting the old ones, so the gallery
+        # always has data and never sees an empty DB.
         conn = _get_conn()
         try:
             new_relpaths = {it[0] for it in disk_files}
@@ -1065,8 +1031,8 @@ def full_reindex(
             # Delete records for files no longer on disk, with the same partial-
             # enumeration guard as incremental_scan (missing subtrees from a
             # flaky share must not be treated as deletions). Uses delete_file
-            # (not a raw executemany) so each removal bumps the root version;
-            # otherwise clients never learn reindex-swept files are gone.
+            # rather than a raw executemany so each removal bumps the root
+            # version; otherwise clients never learn swept files are gone.
             swept: list[str] = []
             v_before = get_root_version(rid)
             if errors.dir_errors == 0 and os.path.isdir(base_abs):
@@ -1123,27 +1089,12 @@ def full_reindex(
         raise
 
 
-# is_empty check
-
-def is_empty() -> bool:
-    """Return True if the DB has no indexed files at all. A LIMIT 1 probe
-    answers this without counting the whole table."""
-    try:
-        with _get_conn() as conn:
-            row = conn.execute("SELECT 1 FROM media_files LIMIT 1").fetchone()
-        return row is None
-    except Exception:
-        return True
-
-
 # Layout Editor: aggregate all metadata keys
 
 def get_all_meta_keys() -> dict:
-    """Scan ALL indexed files and return all unique metadata keys.
-
-    Aggregated over every row and cached by db_version so the layout editor's
-    parameter picker is deterministic (not a random sample that changes which
-    workflow-node params appear on every call).
+    """Aggregated over every row and cached by db_version so the layout editor's
+    parameter picker is deterministic: the workflow-node params it offers stay
+    the same from call to call.
 
     Returns:
         {
@@ -1205,9 +1156,6 @@ def _compute_all_meta_keys() -> dict:
 
     try:
         with _get_conn() as conn:
-            # Aggregate over every indexed file rather than a random sample,
-            # so the result is deterministic. Stream the cursor (no fetchall)
-            # so all metadata blobs aren't pulled into memory at once.
             cur = conn.execute(
                 """SELECT metadata_json FROM media_files
                    WHERE metadata_json IS NOT NULL AND metadata_json != ''"""
@@ -1236,9 +1184,8 @@ def _compute_all_meta_keys() -> dict:
                     elif kind == "object" and dest is not None and isinstance(val, dict):
                         dest.update(val.keys())
 
-                    # Collect workflow node types and their params. Key by
-                    # class_type (not title) so renaming a node in the workflow
-                    # does not create a duplicate entry in the editor.
+                    # Key by class_type rather than title, so renaming a node in
+                    # the workflow does not create a duplicate editor entry.
                     elif key == "workflow_nodes" and isinstance(val, list):
                         per_type_index: dict[str, int] = {}
                         for node in val:
@@ -1251,14 +1198,14 @@ def _compute_all_meta_keys() -> dict:
                             if isinstance(params, dict):
                                 for pk in params:
                                     workflow_nodes[node_name].add(pk)
-                            # Remember the human-facing node title (e.g. "JoyCaption
-                            # Output") so the layout editor can label nodes by title,
-                            # not just the cryptic class_type ("easy showAnything").
+                            # Remember the human-facing node title so the layout
+                            # editor can label a node with it instead of the
+                            # class_type alone.
                             title = node.get("title")
                             if title and title != node_name and node_name not in workflow_node_titles:
                                 workflow_node_titles[node_name] = title
-                            # Instance info: merged across sampled rows by identity
-                            # key (title > _from > index-within-this-file).
+                            # Instance info merges across rows by identity key:
+                            # title, else _from, else index within this file.
                             idx = per_type_index.get(node_name, 0)
                             per_type_index[node_name] = idx + 1
                             from_ctx = node.get("_from")

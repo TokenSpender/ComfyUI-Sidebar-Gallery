@@ -15,7 +15,7 @@
  * server-side via the translation layer.
  */
 
-import { h, showToast, parseColor, formatColor, checkerBg, copyRenderProps } from "./sbg-core.js";
+import { h, showToast, parseColor, formatColor, checkerBg, copyRenderProps, confirmClick } from "./sbg-core.js";
 import * as TL from "./sbg-translation-layer.js";
 import { initSortable } from "./sbg-sortable.js";
 import { createColorPicker } from "./sbg-color-picker.js";
@@ -74,7 +74,8 @@ function instanceLabel(ct, inst) {
   return `${ct} #${(inst.index || 0) + 1}`;
 }
 
-/** Most-specific instance matcher: title > from > index (see TL.filterNodesByMatch). */
+/** Most-specific instance matcher, preferring title, then from, then index
+ *  (see TL.filterNodesByMatch). */
 function matchForInstance(inst) {
   if (inst.title) return { title: inst.title };
   if (inst.from) return { from: inst.from };
@@ -120,7 +121,6 @@ function expandPathItems(pth) {
 
 const _matchKey = (pth, match) => pth + "|" + JSON.stringify(match || null);
 
-/** Short chip text for a param's instance matcher. */
 function matchChipText(match) {
   if (!match) return "";
   if (match.title) return `“${match.title}”`;
@@ -140,10 +140,9 @@ function _normColor(c) {
   return formatColor(pc.r, pc.g, pc.b, pc.a);
 }
 
-// Paint a colour-button as three sub-swatches (background / text / border) so all
-// three channels are visible at a glance. Each channel falls back to the
-// element's computed default when unset; translucent colours render over a
-// checkerboard so transparency reads correctly.
+// Each channel falls back to the element's computed default when unset;
+// translucent colours render over a checkerboard so transparency reads
+// correctly.
 function _paintSwatch(el, colorObj, defaults) {
   const co = (colorObj && typeof colorObj === "object") ? colorObj : {};
   const d = defaults || {};
@@ -158,14 +157,10 @@ function _paintSwatch(el, colorObj, defaults) {
     [stripe(chan("bg")), stripe(chan("text")), stripe(chan("border"))]));
 }
 
-// Build the "Cards from:" source row for a cards section/tab: a clear label, an
-// autocomplete (datalist) input listing the common sources, and a VISIBLE one-line
-// hint (not just a tooltip). `obj` is the section or tab; onChange persists/re-renders;
-// extraEl (optional) is appended inline after the input (e.g. the high/low toggle).
-// Attach the gallery-style options popup (.sbg-crumb-popup) to a text input:
-// click/focus opens it under the input, picking an option fills the input and
-// fires its change handler, typing custom values still works. Native datalist
-// dropdowns are NOT used, because they render as out-of-place browser UI.
+// Gallery-style options popup (.sbg-crumb-popup) for a text input. Picking an
+// option fills the input and fires its change handler, and typing custom values
+// still works. Native datalist dropdowns are avoided, since they render as
+// out-of-place browser UI.
 function _attachOptionsPopup(inp, getOptions) {
   let popup = null;
   const close = () => { if (popup) { popup.remove(); popup = null; } };
@@ -214,11 +209,10 @@ function _buildCardSourceUI(obj, body, onChange, extraEl) {
   body.appendChild(wrap);
 }
 
-// Build the "Show when:" row for a tab/section: controls when it appears in the
-// metadata panel. Empty = Auto (show only when the data most of its fields read
-// from exists, so e.g. a tab of mostly controlnet.* fields hides on images without
-// ControlNet). "always" disables the gate; any summary path (e.g. upscaling, or
-// workflow_nodes.SeedVR2LoadDiTModel) shows the tab only when that path has data.
+// Empty showWhen means Auto: show only when the data most of its fields read
+// from exists, so a tab of mostly controlnet.* fields hides on images without
+// ControlNet. "always" disables the gate; any summary path shows the tab only
+// when that path has data.
 function _buildShowWhenUI(obj, body, onChange) {
   const help = "When should this tab appear? Auto = only when the data its fields mostly read from exists. Always = whenever any field has a value (old behaviour). Or type a data source (controlnet, upscaling, mmaudio, … or workflow_nodes.<NodeType>) to show it only when that exists.";
   const wrap = h("div", { class: "sbg-ly3-src" });
@@ -315,7 +309,7 @@ function _swatchDefaults(kind, sec, tab) {
 
 // View memory: which app/media tab, which sections/tabs were expanded, tray
 // open state. Module-level so closing and reopening the editor in the same
-// page session restores exactly the view you left (one tiny object, no I/O).
+// page session restores the view you left.
 const _viewMemory = { app: "comfyui", media: "image", expanded: new Set(), trayOpen: false, fresh: true };
 
 export function renderLayout(content, galleryCtx, closeGS) {
@@ -729,7 +723,6 @@ export function renderLayout(content, galleryCtx, closeGS) {
   content.appendChild(topBar);
   content.appendChild(split);
 
-  // Top bar
   function renderTopBar() {
     topBar.innerHTML = "";
     const appWrap = h("div", { class: "sbg-ly3-tabs" });
@@ -768,23 +761,19 @@ export function renderLayout(content, galleryCtx, closeGS) {
     xfer.addEventListener("click", openTransferDialog);
     actions.appendChild(xfer);
     const reset = h("button", { class: "sbg-btn sbg-btn--sm", text: "↺ Reset" });
-    let rc = false;
-    reset.addEventListener("click", () => {
-      if (!rc) { rc = true; reset.textContent = "Sure?"; reset.classList.add("sbg-btn--danger"); setTimeout(() => { rc = false; reset.textContent = "↺ Reset"; reset.classList.remove("sbg-btn--danger"); }, 2000); return; }
+    confirmClick(reset, () => {
       delete profiles[activeKey()]; persist(); render(); showToast("Profile reset to default");
-    });
+    }, { armClass: "sbg-btn--danger" });
     actions.appendChild(reset);
     topBar.appendChild(actions);
   }
 
-  // Full render
   function render() {
     renderTopBar();
     renderEditor();
     refreshPreview();
   }
 
-  // Left pane: editable section list + field tray
   function renderEditor() {
     leftPane.innerHTML = "";
     leftPane.appendChild(h("div", { class: "sbg-ly3-hint", text: "Drag ⋮⋮ to reorder. Expand a section to edit its fields, or drag fields in from the tray below. The right pane previews your panel live." }));
@@ -828,8 +817,7 @@ export function renderLayout(content, galleryCtx, closeGS) {
 
     head.appendChild(mkSelect(SECTION_STYLES, sec.style || "flat", (v) => { sec.style = v; persist(); renderEditor(); refreshPreview(); }, "Section render style"));
 
-    // Section background / colour (e.g. green Positive, red Negative). Seeds the
-    // default so the picker's Background tab shows the real current colour.
+    // Seeding the default colour makes the picker open on the real current colour.
     const secColorBtn = h("button", { class: "sbg-iconbtn", title: "Section background / colours", text: "🎨" });
     _paintSwatch(secColorBtn, sec.color, _swatchDefaults("section", sec));
     secColorBtn.addEventListener("click", () => {
@@ -845,9 +833,7 @@ export function renderLayout(content, galleryCtx, closeGS) {
     head.appendChild(openLbl);
 
     const del = h("button", { class: "sbg-iconbtn sbg-iconbtn--danger", title: "Delete section", text: "🗑" });
-    let dc = false;
-    del.addEventListener("click", () => {
-      if (!dc) { dc = true; del.textContent = "Sure?"; setTimeout(() => { dc = false; del.textContent = "🗑"; }, 2000); return; }
+    confirmClick(del, () => {
       const l = activeLayout(); const i = l.indexOf(sec); if (i >= 0) l.splice(i, 1); expanded.delete(sec.id); persist(); render();
     });
     head.appendChild(del);
@@ -864,7 +850,6 @@ export function renderLayout(content, galleryCtx, closeGS) {
       // When tabs are in use they own the content (each tab has its own source /
       // fields), so hide the section-level source row and field list.
       if (sec.style === "cards" && !hasTabs) {
-        // High/Low pairing toggle (MoE), shown inline in the source row.
         const hlLbl = h("label", { class: "sbg-ly3-openlbl", title: "Pair high-noise / low-noise models side-by-side (Wan2.2-style MoE)" });
         const hlCb = h("input", { type: "checkbox" });
         const autoOn = sec.highlow == null && HIGHLOW_SOURCES.has(sec.source);
@@ -944,8 +929,9 @@ export function renderLayout(content, galleryCtx, closeGS) {
 
     const lbl = h("input", { type: "text", class: "sbg-ly3-fieldlabel", value: p.label || "", placeholder: labelize(p.path) });
     lbl.title = p.path;
-    // Keep an explicitly-cleared name as "" (not undefined) so the panel shows the
-    // value with NO "Label:" prefix. (Untouched fields keep their auto-name.)
+    // An explicitly-cleared name stays an empty string rather than undefined, so
+    // the panel shows the value with NO "Label:" prefix. Untouched fields keep
+    // their auto-name.
     lbl.addEventListener("input", () => { p.label = lbl.value; persist(); refreshPreview(); });
     row.appendChild(lbl);
 
@@ -980,7 +966,6 @@ export function renderLayout(content, galleryCtx, closeGS) {
       fmt.addEventListener("input", () => { p.format = fmt.value.trim() || undefined; persist(); refreshPreview(); });
       tools.appendChild(fmt);
     }
-    // Colour picker, available for every visible style (pill/kv/detail/title/text).
     if (effStyle !== "hidden") {
       // Pass the actual style so the picker's default colours probe the kind's
       // real rendered element.
@@ -990,7 +975,6 @@ export function renderLayout(content, galleryCtx, closeGS) {
       colorBtn.addEventListener("click", () => openPillColorPicker(colorBtn, p, hostSec, "color", _ckind, hostTab));
       tools.appendChild(colorBtn);
     }
-    // Find
     const { field: searchField, value: searchValue } = pathToSearch(p.path);
     if (searchField !== "prompt" && searchField !== "app") {
       const findBtn = h("button", { class: "sbg-iconbtn", title: "Find all items with this field", text: "🔍" });
@@ -1032,10 +1016,6 @@ export function renderLayout(content, galleryCtx, closeGS) {
     return row;
   }
 
-  // Tabs editor (any section)
-  // Each tab is a mini-section, rendered as a stacked row that mirrors the
-  // SECTION row pattern (grip-drag to reorder, inline rename, expand to edit
-  // fields, style/colour controls), so it behaves like everything else.
   function _normalizeTab(t) {
     // Upgrade a legacy {label, path} tab to the subsection shape in place.
     // Returns true if anything changed, so the caller can persist once (a tab's
@@ -1092,8 +1072,7 @@ export function renderLayout(content, galleryCtx, closeGS) {
     return wrap;
   }
 
-  // One tab row. Mirrors buildSectionEditor's row (grip / expand / rename /
-  // style / pill-colour / bg-colour / delete) + an expandable field list.
+  // Mirrors buildSectionEditor's row, so a tab behaves like a section.
   function buildTabRow(sec, t, list, onTabDrop) {
     const isOpen = expanded.has(t.id);
     const row = h("div", { class: "sbg-ly3-tabrow" });
@@ -1158,6 +1137,25 @@ export function renderLayout(content, galleryCtx, closeGS) {
     return row;
   }
 
+  // The grouped, filtered, instance-expanded path list shared by the field
+  // tray and the add-field picker: one call per non-empty group with its
+  // capped items. Returns how many items were emitted. `excluded` skips
+  // already-mapped keys (the picker's use).
+  function forEachPathGroup(filter, cap, excluded, emit) {
+    const all = serverPaths || buildServerPaths(null);
+    let shown = 0;
+    for (const grp of PATH_GROUPS) {
+      const inGrp = all.filter(pth => grp.test(pth)).flatMap(expandPathItems)
+        .filter(it => (!excluded || !excluded.has(_matchKey(it.path, it.match)))
+          && (!filter || it.path.toLowerCase().includes(filter) || it.label.toLowerCase().includes(filter)));
+      if (!inGrp.length) continue;
+      const capped = inGrp.slice(0, cap);
+      emit(grp, capped);
+      shown += capped.length;
+    }
+    return shown;
+  }
+
   // Field tray ("All Fields / Nodes")
   function buildTray() {
     const tray = h("div", { class: "sbg-ly3-tray" + (trayOpen ? " sbg-ly3-tray--open" : "") });
@@ -1172,22 +1170,14 @@ export function renderLayout(content, galleryCtx, closeGS) {
 
     function renderTrayList() {
       body.innerHTML = "";
-      const all = serverPaths || buildServerPaths(null);
-      const filter = search.value.toLowerCase();
-      let shown = 0;
-      for (const grp of PATH_GROUPS) {
-        const inGrp = all.filter(pth => grp.test(pth)).flatMap(expandPathItems)
-          .filter(it => !filter || it.path.toLowerCase().includes(filter) || it.label.toLowerCase().includes(filter));
-        if (!inGrp.length) continue;
+      const shown = forEachPathGroup(search.value.toLowerCase(), 300, null, (grp, items) => {
         body.appendChild(h("div", { class: "sbg-ly3-traygrp", text: grp.label }));
-        for (const it of inGrp.slice(0, 300)) {
-          shown++;
+        for (const it of items) {
           const item = h("div", { class: "sbg-ly3-palitem", title: it.path + (it.match ? ` (${matchChipText(it.match)})` : "") });
           item.dataset.path = it.path;
           if (it.match) item.dataset.match = JSON.stringify(it.match);
           item.appendChild(h("span", { class: "sbg-grip sbg-ly3-palgrip", text: "⋮⋮" }));
           item.appendChild(h("span", { class: "sbg-ly3-palname", text: it.label }));
-          // click also adds to the first expanded section (or first section) as a shortcut
           item.addEventListener("click", (e) => { if (e.target.closest(".sbg-grip")) return; addPathToSection(it.path, _shortcutSection(), it.match); });
           initSortable(body, item.querySelector(".sbg-ly3-palgrip"), item, {
             type: "param", itemSelector: ".sbg-ly3-palitem", dropContainerSelector: ".sbg-ly3-fields, .sbg-ly3-tabfields",
@@ -1195,7 +1185,7 @@ export function renderLayout(content, galleryCtx, closeGS) {
           });
           body.appendChild(item);
         }
-      }
+      });
       if (!shown) body.appendChild(h("div", { class: "sbg-ly3-empty", text: "No fields match." }));
     }
     search.addEventListener("input", renderTrayList);
@@ -1224,7 +1214,6 @@ export function renderLayout(content, galleryCtx, closeGS) {
     persist(); render(); showToast("Added to “" + (sec.title || "section") + "”");
   }
 
-  // A tray item was dragged. If it landed inside a section's field list, add it there.
   function onTrayDrop(movedItem) {
     const pth = movedItem && movedItem.dataset ? movedItem.dataset.path : null;
     if (pth) {
@@ -1238,7 +1227,6 @@ export function renderLayout(content, galleryCtx, closeGS) {
         if (idx >= 0 && idx < arr.length) arr.splice(idx, 0, param); else arr.push(param);
         persist();
       };
-      // Dropped into a TAB's field list: add to that tab.
       const tabFieldsEl = movedItem.closest(".sbg-ly3-tabfields");
       const fieldsEl = movedItem.closest(".sbg-ly3-fields");
       if (tabFieldsEl) {
@@ -1253,7 +1241,6 @@ export function renderLayout(content, galleryCtx, closeGS) {
     render(); // rebuild: discards the relocated tray node and restores the tray intact
   }
 
-  // Add-field picker (click "+ field")
   // onPick: optional. When given, clicking a field invokes onPick(path) and
   // closes the picker (used for choosing a tab's path) instead of adding a param.
   function openAddFieldPicker(anchor, sec, onPick) {
@@ -1266,17 +1253,9 @@ export function renderLayout(content, galleryCtx, closeGS) {
     const mapped = new Set(onPick ? [] : (sec.params || []).map(p => _matchKey(p.path, p.match)));
     function renderList() {
       list.innerHTML = "";
-      const all = serverPaths || buildServerPaths(null);
-      const filter = search.value.toLowerCase();
-      let shown = 0;
-      for (const grp of PATH_GROUPS) {
-        const inGrp = all.filter(pth => grp.test(pth)).flatMap(expandPathItems)
-          .filter(it => !mapped.has(_matchKey(it.path, it.match))
-            && (!filter || it.path.toLowerCase().includes(filter) || it.label.toLowerCase().includes(filter)));
-        if (!inGrp.length) continue;
+      const shown = forEachPathGroup(search.value.toLowerCase(), 200, mapped, (grp, items) => {
         list.appendChild(h("div", { class: "sbg-ly3-pickgrp", text: grp.label }));
-        for (const it of inGrp.slice(0, 200)) {
-          shown++;
+        for (const it of items) {
           const item = h("div", { class: "sbg-ly3-pickitem" }, [
             h("span", { class: "sbg-ly3-pickname", text: it.label }),
             h("span", { class: "sbg-ly3-pickpath", text: it.path + (it.match ? ` · ${matchChipText(it.match)}` : "") }),
@@ -1289,7 +1268,7 @@ export function renderLayout(content, galleryCtx, closeGS) {
           });
           list.appendChild(item);
         }
-      }
+      });
       if (!shown) list.appendChild(h("div", { class: "sbg-ly3-empty", text: "No more fields match." }));
     }
     search.addEventListener("input", renderList);
@@ -1298,13 +1277,10 @@ export function renderLayout(content, galleryCtx, closeGS) {
     setTimeout(() => search.focus(), 0);
   }
 
-  // Pill HSL colour picker (bg / text / border)
   // colorKey: which property of `p` to edit ("color" by default; tabs also use
   // "pillColor"). kind: which rendered element supplies the DEFAULT colours shown
-  // when nothing is set yet ("pill" | "section" | "text"). tab: the enclosing tab
-  // when `p` is a field inside one, so the defaults probe the full ancestry. Lets
-  // one picker drive multiple colourable targets and always show the real
-  // current colour.
+  // when nothing is set yet. tab: the enclosing tab when `p` is a field inside
+  // one, so the defaults probe the full ancestry.
   function openPillColorPicker(anchor, p, sec, colorKey = "color", kind = "section", tab = null) {
     // Close any open popover WITH cleanup: a bare .remove() would orphan its
     // outside-click listener, which then closes THIS picker on the next click.
@@ -1396,7 +1372,6 @@ export function renderLayout(content, galleryCtx, closeGS) {
     }
     if (!any) rightPane.appendChild(h("div", { class: "sbg-ly3-empty", text: "No sections configured. Add a section to preview it here." }));
     else rightPane.appendChild(panel);
-    // note about hidden sections
     const hiddenCount = activeLayout().filter(s => s.hidden).length;
     if (hiddenCount) rightPane.appendChild(h("div", { class: "sbg-ly3-prevnote", text: `${hiddenCount} hidden section${hiddenCount > 1 ? "s" : ""} not shown.` }));
   }
@@ -1434,7 +1409,6 @@ export function renderLayout(content, galleryCtx, closeGS) {
     // red Negative) are keyed off this attribute in CSS, so the preview shows the
     // exact same styling as the real panel.
     secEl.dataset.sectionTitle = sec.title || "";
-    // Custom section background/colour (overrides the CSS default when set).
     if (sec.color) TL.applyColor(secEl, sec.color);
     return secEl;
   }
@@ -1648,8 +1622,7 @@ export function renderLayout(content, galleryCtx, closeGS) {
           pending--;
           resolved++;
           // Show the preview quickly: as soon as the common sources are covered,
-          // or a dozen items have merged, or all are done. (Late results keep
-          // enriching `merged` in place even after the first render.)
+          // or a dozen items have merged, or all are done.
           if (allCovered() || resolved >= 12 || pending <= 0) finish();
           scheduleRefresh();
         });
@@ -1672,10 +1645,9 @@ export function renderLayout(content, galleryCtx, closeGS) {
       _nodeTitles = (keys && keys.workflow_node_titles) || {};
       _nodeInstances = (keys && keys.workflow_node_instances) || {};
       serverPaths = buildServerPaths(keys);
-      // The server now returns the COMPLETE, deterministic key set (aggregated
-      // over every file, cached by db_version) instead of a random 500-row
-      // sample, so the param picker is consistent across opens. Repaint so the
-      // freshly-loaded list shows without needing a re-search.
+      // The server returns the complete key set, aggregated over every file and
+      // cached by db_version, so the param picker is consistent across opens.
+      // Repaint so the freshly-loaded list shows without needing a re-search.
       if (trayOpen) renderEditor();
     })
     .catch(() => { serverPaths = buildServerPaths(null); if (trayOpen) renderEditor(); });

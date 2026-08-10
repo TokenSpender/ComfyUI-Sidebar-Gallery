@@ -45,7 +45,7 @@ async function _resolveInitMeta(imgPath, curRoot, srcType) {
   // keeps a same-relpath pair under different annotations apart too.
   const ck = "initmeta:" + (curRoot || "") + ":" + imgPath + (srcType ? "|" + srcType : "");
   const l1 = _metaCache.get(ck);
-  if (l1) return l1;                           // cached hit (misses are NOT cached)
+  if (l1) return l1;
   // Concurrent callers (compare mode renders both sides in one tick; several
   // blocks can reference one image) share a single probe chain.
   return singleFlight(ck, () => _resolveInitMetaUncached(ck, imgPath, curRoot, srcType));
@@ -152,13 +152,11 @@ export function openLightbox(_initialItems, startItemOrIndex, openEvent) {
   const copyPromptBtn = h("button", { class: "sbg-btn sbg-btn--sm", text: "Copy Prompt", title: "Copy positive prompt", disabled: "true" });
   const copyWfBtn = h("button", { class: "sbg-btn sbg-btn--sm", text: "Copy WF", title: "Copy workflow JSON", disabled: "true" });
 
-  // Apply lightbox button visibility settings
   if (!getSetting(S.LB_SHOW_DOWNLOAD, true)) dlBtn.style.display = "none";
   if (!getSetting(S.LB_SHOW_COPY_PROMPT, true)) copyPromptBtn.style.display = "none";
   if (!getSetting(S.LB_SHOW_COPY_WF, true)) copyWfBtn.style.display = "none";
   if (!getSetting(S.LB_SHOW_LOAD_WF, true)) loadWfBtn.style.display = "none";
 
-  // Apply lightbox button colors
   const _lbcDl = getSetting(S.LB_COLOR_DOWNLOAD, "");
   const _lbcCp = getSetting(S.LB_COLOR_COPY_PROMPT, "");
   const _lbcWf = getSetting(S.LB_COLOR_COPY_WF, "");
@@ -167,7 +165,6 @@ export function openLightbox(_initialItems, startItemOrIndex, openEvent) {
   if (_lbcCp) copyPromptBtn.style.background = _lbcCp;
   if (_lbcWf) copyWfBtn.style.background = _lbcWf;
   if (_lbcLw) loadWfBtn.style.background = _lbcLw;
-  // Compare button
   const compareBtn = h("button", { class: "sbg-btn sbg-btn--sm", text: "⚖ Compare", title: `Compare with another image${keyCompare ? ` (${keyCompare})` : ""}` });
 
   const bottomBar = h("div", { class: "sbg-lb__bottom" }, [
@@ -186,8 +183,7 @@ export function openLightbox(_initialItems, startItemOrIndex, openEvent) {
   const savedMetaWidth = localStorage.getItem("SBG.MetaPanelWidth");
   const _metaHeaderBadge = h("span", { class: "sbg-source-app" }); // placeholder, filled by renderMeta
 
-  // Tab bar for Generated / Initial Image.
-  // Tabs are hidden by default and only shown when initial_image data exists.
+  // The tab bar is only shown when initial_image data exists.
   const _tabGenerated = h("button", { class: "sbg-lb__meta-tab sbg-lb__meta-tab--active", text: "Generated" });
   const _tabInitialImage = h("button", { class: "sbg-lb__meta-tab", text: "Initial Image" });
   const initTabColor = getSetting(S.INITIAL_IMAGE_TAB_COLOR, "");
@@ -196,17 +192,24 @@ export function openLightbox(_initialItems, startItemOrIndex, openEvent) {
     _tabInitialImage.style.borderBottomColor = initTabColor;
   }
   const _metaTabs = h("div", { class: "sbg-lb__meta-tabs" }, [_tabGenerated, _tabInitialImage]);
-  _metaTabs.style.display = "none"; // hide entire tab bar by default
+  _metaTabs.style.display = "none";
 
-  let _generatedMetaContent = null; // cached DOM for generated tab
-  let _initialImageContent = null;  // cached DOM for initial image tab (built lazily)
+  let _generatedMetaContent = null;
+  let _initialImageContent = null;
   let _pendingInitialArgs = null;   // {s, rootId} for on-demand build on tab activation
   let _activeMetaTab = "generated"; // "generated" or "initial"
 
-  function _switchMetaTab(tab) {
+  // State-only setter: flips the highlight without rebuilding the panel, so
+  // the reset paths (mid-renderMeta, the compare fallback) can use it without
+  // _switchMetaTab's re-render side effects.
+  function _setActiveMetaTab(tab) {
     _activeMetaTab = tab;
     _tabGenerated.classList.toggle("sbg-lb__meta-tab--active", tab === "generated");
     _tabInitialImage.classList.toggle("sbg-lb__meta-tab--active", tab === "initial");
+  }
+
+  function _switchMetaTab(tab) {
+    _setActiveMetaTab(tab);
     metaBody.innerHTML = "";
     if (_compareActive && _compareSummary) {
       // One router owns compare rendering, so tab clicks and compare
@@ -239,7 +242,6 @@ export function openLightbox(_initialItems, startItemOrIndex, openEvent) {
   ]);
   if (savedMetaWidth) metaPanel.style.width = savedMetaWidth + "px";
 
-  // Resize drag logic
   let _resizing = false;
   metaResizeHandle.addEventListener("mousedown", (e) => {
     e.preventDefault();
@@ -271,9 +273,9 @@ export function openLightbox(_initialItems, startItemOrIndex, openEvent) {
   const overlay = h("div", { class: "sbg-lightbox" }, [mediaArea, metaPanel]);
   document.body.appendChild(overlay);
 
-  // Zoom/pan controller. The getters are only invoked from event handlers,
-  // after this closure has finished setting up (_compareElements and
-  // currentMediaEl are assigned later).
+  // The getters are only invoked from event handlers, after this closure has
+  // finished setting up (_compareElements and currentMediaEl are assigned
+  // later).
   const zoomCtl = createZoomPanController({
     overlay, mediaArea, mediaContainer,
     getCurrentMediaEl: () => currentMediaEl,
@@ -285,7 +287,6 @@ export function openLightbox(_initialItems, startItemOrIndex, openEvent) {
     initialCtrl: !!(openEvent && openEvent.ctrlKey),
   });
 
-  // Re-render metadata when layout changes (live preview of style changes)
   const _onLayoutChanged = () => { if (meta && !destroyed) renderMeta(meta); };
   document.addEventListener("sbg-layout-changed", _onLayoutChanged);
 
@@ -329,7 +330,6 @@ export function openLightbox(_initialItems, startItemOrIndex, openEvent) {
   // Inject file-level fields (filename/path/size/modified) into the summary so the
   // File Info section can resolve them via plain paths like any other field.
   function _mergeFileInfo(summary, file) {
-    // Respect the "Filename Display" setting (basename vs full relative path).
     const relStyle = getSetting(S.FILENAME_STYLE, "basename") === "relpath";
     return Object.assign({}, summary, {
       filename: file && (relStyle ? (file.relpath || file.filename) : file.filename),
@@ -339,14 +339,12 @@ export function openLightbox(_initialItems, startItemOrIndex, openEvent) {
     });
   }
 
-  /** Sort metaBody children by saved order, using layout config if available */
   /* Render metadata */
 
-  let _metaObservers = []; // Track MutationObservers for cleanup on re-render
+  let _metaObservers = [];
 
   function renderMeta(m) {
     meta = m;
-    // Disconnect previous MutationObservers before clearing the DOM
     for (const obs of _metaObservers) { try { obs.disconnect(); } catch { } }
     _metaObservers = [];
     metaBody.innerHTML = "";
@@ -354,7 +352,6 @@ export function openLightbox(_initialItems, startItemOrIndex, openEvent) {
     copyPromptBtn.disabled = true;
     copyWfBtn.disabled = true;
 
-    // Reset tab state, preserving the active tab if the user enabled tab persistence.
     // While compare is active the compare panel owns the tab state and the
     // tab-bar visibility (resetting here would yank the user off the Initial
     // tab on every left-side navigation).
@@ -362,11 +359,7 @@ export function openLightbox(_initialItems, startItemOrIndex, openEvent) {
     _initialImageContent = null;
     _pendingInitialArgs = null;
     const tabPersist = getSetting(S.META_TAB_PERSIST, false);
-    if (!tabPersist && !_compareActive) {
-      _activeMetaTab = "generated";
-      _tabGenerated.classList.add("sbg-lb__meta-tab--active");
-      _tabInitialImage.classList.remove("sbg-lb__meta-tab--active");
-    }
+    if (!tabPersist && !_compareActive) _setActiveMetaTab("generated");
     if (!_compareActive) _metaTabs.style.display = "none"; // hide until initial_image found
 
     if (!m) {
@@ -376,15 +369,13 @@ export function openLightbox(_initialItems, startItemOrIndex, openEvent) {
 
     const s = m.summary || {};
 
-    // Source App Badge (in METADATA header)
-    // Derived from the shared app registry, so a newly supported app gets its
-    // lightbox badge automatically.
+    // The source-app badge is derived from the shared app registry, so a newly
+    // supported app gets its lightbox badge automatically.
     const _appLabels = TL.APP_LABELS;
     const _appColorKeys = Object.fromEntries(APP_REGISTRY.map(a => [a.id, a.settingKey]));
     _metaHeaderBadge.innerHTML = "";
     if (s.source_app && _appLabels[s.source_app]) {
       const badge = h("span", { class: `sbg-badge sbg-badge--source sbg-badge--source-${s.source_app}`, text: _appLabels[s.source_app] });
-      // Apply user-customized badge color
       const userColor = getSetting(_appColorKeys[s.source_app], "");
       if (userColor) {
         badge.style.color = userColor;
@@ -394,17 +385,15 @@ export function openLightbox(_initialItems, startItemOrIndex, openEvent) {
       _metaHeaderBadge.appendChild(badge);
     }
 
-    // Action-button enablement depends only on the summary.
     if (s.positive_prompt) copyPromptBtn.disabled = false;
     if (s.has_workflow) {
       loadWfBtn.disabled = false;
       copyWfBtn.disabled = false;
     }
 
-    // Compare mode owns the panel
-    // Skip building the full normal panel (it would be wiped immediately and
-    // is rebuilt from scratch when compare closes); render the compare view
-    // for whichever tab is active instead.
+    // Compare mode owns the panel, so skip building the normal one (it would
+    // be wiped immediately and is rebuilt from scratch when compare closes)
+    // and render the compare view for whichever tab is active.
     if (_compareActive) {
       if (_compareSummary) _renderComparePanel(_compareSummary);
       return;
@@ -432,7 +421,6 @@ export function openLightbox(_initialItems, startItemOrIndex, openEvent) {
       metaBody.appendChild(makeSection(section, contentEl));
     }
 
-    // Search highlighting in metadata panel
     // Highlight each searched value wherever it appears in the panel. searchState.query
     // holds values only (field prefixes like "adetailer:" never reach here), so a
     // field-scoped search like "adetailer:denoising" highlights "denoising".
@@ -447,17 +435,16 @@ export function openLightbox(_initialItems, startItemOrIndex, openEvent) {
     while (metaBody.firstChild) _generatedMetaContent.appendChild(metaBody.firstChild);
     metaBody.appendChild(_generatedMetaContent);
 
-    // Initial Image tab
     if (initialImageList(s).length) {
-      _metaTabs.style.display = ""; // show tab bar when initial image(s) exist
+      _metaTabs.style.display = "";
       // LAZY: don't build the blocks (async metadata chains + /view probes per
       // source image) unless the tab is actually shown. _switchMetaTab builds
       // from these pending args on first activation; compare mode has its own
       // eager path since its blocks are immediately visible.
       _pendingInitialArgs = { s, rootId: meta?._sbgRootId ?? items[idx]?.root_id };
 
-      // If tab persistence is on and user was on the initial tab, switch back
-      // to it (this builds the content right away, since the user is looking at it).
+      // Switching back to a persisted Initial tab builds its content right
+      // away, since the user is looking at it.
       if (tabPersist && _activeMetaTab === "initial") {
         _switchMetaTab("initial");
       }
@@ -496,10 +483,8 @@ export function openLightbox(_initialItems, startItemOrIndex, openEvent) {
   // per image per session; "none" = all three 404ed (skip probing next time).
   const _initViewType = new Map();
 
-  // Build the "Initial Image" content block for ONE source image: preview,
-  // filename, and the source image's own metadata (resolved async, cached and
-  // single-flighted per image in _resolveInitMeta). Used by the normal Initial
-  // Image tab and by compare mode for both sides.
+  // One source image's block, used by the normal Initial Image tab and by
+  // compare mode for both sides.
   function _buildInitialContent(entry, rootId, label) {
     const initWrap = h("div", { class: "sbg-meta-group", style: "padding:8px" });
 
@@ -545,7 +530,7 @@ export function openLightbox(_initialItems, startItemOrIndex, openEvent) {
       }
     }
 
-    // File info (kvRow inserts word-break opportunities into long filenames)
+    // kvRow inserts word-break opportunities into long filenames.
     const infoGroup = h("div", { class: "sbg-meta-group" });
     const nameRow = kvRow("Filename", imgName);
     if (nameRow) infoGroup.appendChild(nameRow);
@@ -592,7 +577,7 @@ export function openLightbox(_initialItems, startItemOrIndex, openEvent) {
 
   let _navGen = 0; // generation counter: prevents stale metadata overwrites
   let _lastNavAt = 0; // for rapid-nav (held key) coalescing in goTo
-  const metaCache = _metaCache; // use module-level cache
+  const metaCache = _metaCache;
 
   // Validate a cached metadata entry against the file's real modification
   // time. it.mtime is the gallery sort key (creation time); comparing against
@@ -649,7 +634,6 @@ export function openLightbox(_initialItems, startItemOrIndex, openEvent) {
       }
     }
 
-    // Cross-fade media swap (images only)
     // Keep the previous frame visible until the new media can paint, so there's
     // no blank flash, but only for images. A <video> kept alive as a backdrop
     // holds its decoder, and Firefox-on-Windows has a tiny H.265/HEVC decoder
@@ -686,7 +670,7 @@ export function openLightbox(_initialItems, startItemOrIndex, openEvent) {
 
     let swapped = false;
     const _swapIn = (neu) => {
-      if (swapped || destroyed || _navGen !== gen) return; // stale or already done
+      if (swapped || destroyed || _navGen !== gen) return;
       swapped = true;
       if (neu.dataset) delete neu.dataset.sbgPending;
       neu.style.position = "";
@@ -765,7 +749,7 @@ export function openLightbox(_initialItems, startItemOrIndex, openEvent) {
       img.dataset.sbgPending = "1";
       img.style.position = "absolute";
       img.style.opacity = "0";
-      img.onerror = () => _swapIn(img); // still swap on error
+      img.onerror = () => _swapIn(img);
       currentMediaEl = img;
       _insertMedia(img);
       img.src = fileUrl(it);
@@ -785,7 +769,7 @@ export function openLightbox(_initialItems, startItemOrIndex, openEvent) {
         if (img.complete) _swapIn(img); // synchronously cached
       }
     }
-    }; // end buildMedia
+    };
 
     bottomName.textContent = `${it.filename}  (${idx + 1} / ${items.length})`;
     dlBtn.href = fileUrl(it);
@@ -795,11 +779,9 @@ export function openLightbox(_initialItems, startItemOrIndex, openEvent) {
     _updateCompareLabels(); // left filename + arrow visibility depend on idx
 
     const buildMeta = () => {
-    // Metadata: use cache or fetch summary from DB
     const cacheKey = itemKey(it);
     const cached = metaCache.get(cacheKey);
     const _itMtime = it.mtime_real ?? it.mtime;
-    // Save scroll position before any metadata content change
     const savedScroll = metaPanel.scrollTop;
     if (_freshMeta(cached, _itMtime)) {
       // Stamp the owning root: a re-render (layout change, compare close) can
@@ -834,7 +816,7 @@ export function openLightbox(_initialItems, startItemOrIndex, openEvent) {
         }
       });
     }
-    }; // end buildMeta
+    };
 
     if (rapid) {
       // Trailing debounce: a further keydown bumps _navGen, so only the frame
@@ -849,7 +831,6 @@ export function openLightbox(_initialItems, startItemOrIndex, openEvent) {
       buildMeta();
     }
 
-    // Debounced prefetch: only when user settles (300ms)
     clearTimeout(_prefetchTimer);
     _prefetchTimer = setTimeout(() => {
       if (destroyed || _navGen !== gen) return;
@@ -879,12 +860,10 @@ export function openLightbox(_initialItems, startItemOrIndex, openEvent) {
 
   /* Events */
 
-  // Listen for new items so the lightbox can navigate to newly generated images
   function _onItemsUpdated(e) {
     if (destroyed) return;
     const newItems = e.detail?.items;
     if (!newItems || !Array.isArray(newItems)) return;
-    // Find the current item by relpath to maintain position
     const currentItem = items[idx];
     const currentKey = currentItem ? itemKey(currentItem) : null;
     const cmpItem = _compareActive ? items[_compareIdx] : null;
@@ -913,12 +892,11 @@ export function openLightbox(_initialItems, startItemOrIndex, openEvent) {
     }
     // The viewed file itself is gone: reload the viewer at the clamped
     // position so the media, the metadata panel and the Download button move
-    // together. Relabeling alone left them all describing the deleted file
-    // while the bottom label named its neighbour. With nothing left to show,
+    // together. Relabeling alone would leave them all describing the deleted
+    // file while the bottom label names its neighbour. With nothing left to show,
     // close the viewer instead of keeping the deleted file on screen.
     if (vanished && !items.length) { destroy(); return; }
     if (vanished && items.length) { goTo(idx); return; }
-    // Update nav button visibility
     prevBtn.style.visibility = idx === 0 ? "hidden" : "visible";
     nextBtn.style.visibility = idx === items.length - 1 ? "hidden" : "visible";
     bottomName.textContent = `${items[idx]?.filename || ""}  (${idx + 1} / ${items.length})`;
@@ -967,7 +945,6 @@ export function openLightbox(_initialItems, startItemOrIndex, openEvent) {
     const isVid = currentMediaEl && currentMediaEl.tagName === "VIDEO";
     const isArrow = d.key === "ArrowLeft" || d.key === "ArrowRight";
     if (isFS && isVid && isArrow && isFinite(currentMediaEl.duration)) {
-      // In fullscreen over a video, ONLY arrows seek by 10% of duration
       const step = currentMediaEl.duration * 0.1;
       if (d.key === "ArrowLeft") currentMediaEl.currentTime = Math.max(0, currentMediaEl.currentTime - step);
       else currentMediaEl.currentTime = Math.min(currentMediaEl.duration, currentMediaEl.currentTime + step);
@@ -1000,7 +977,6 @@ export function openLightbox(_initialItems, startItemOrIndex, openEvent) {
   const keyCloseBare = _closeChunks.filter(k => k.toLowerCase() !== "escape").join(",");
   const _closeRun = () => {
     if (document.fullscreenElement) { document.exitFullscreen(); return true; }
-    // Close compare mode first, then lightbox
     if (_compareActive) { closeCompareMode(); return true; }
     destroy();
     return true;
@@ -1070,7 +1046,6 @@ export function openLightbox(_initialItems, startItemOrIndex, openEvent) {
   function _handleKey(e) {
     if (e.target.tagName === "INPUT" || e.target.tagName === "TEXTAREA") return;
 
-    // Spacebar: pause/play video
     if (e.key === " " || e.code === "Space") {
       e.preventDefault();
       if (currentMediaEl && currentMediaEl.tagName === "VIDEO") {
@@ -1148,12 +1123,11 @@ export function openLightbox(_initialItems, startItemOrIndex, openEvent) {
     }
   });
 
-  // Helper: lazy-fetch full metadata (with prompt+workflow) for current item
   async function _fetchFullMeta() {
-    if (meta?.workflow) return meta; // already have it
+    if (meta?.workflow) return meta;
     const it = items[idx];
     if (!it) return meta;
-    const gen = _navGen; // capture current generation
+    const gen = _navGen;
     const full = await api("/sidebar_gallery/metadata", { root_id: it.root_id, relpath: it.relpath });
     // Guard: if user navigated away during fetch, don't overwrite meta
     if (_navGen !== gen || destroyed) return meta;
@@ -1164,7 +1138,6 @@ export function openLightbox(_initialItems, startItemOrIndex, openEvent) {
     } else {
       meta = full;
     }
-    // Update L1+L2 caches
     const ck = itemKey(it);
     metaCache.set(ck, meta);
     _metaCacheAPI.put(ck, meta);
@@ -1260,7 +1233,6 @@ export function openLightbox(_initialItems, startItemOrIndex, openEvent) {
     const rightPrevBtn = h("button", { class: "sbg-lb__nav sbg-lb__nav--prev sbg-compare__nav", text: "‹", title: `Previous comparison image${keyPrev ? ` (${keyPrev})` : ""}` });
     const rightNextBtn = h("button", { class: "sbg-lb__nav sbg-lb__nav--next sbg-compare__nav", text: "›", title: `Next comparison image${keyNext ? ` (${keyNext})` : ""}` });
     const rightFilename = h("div", { class: "sbg-compare__filename", text: "" });
-    // "COMPARED" label, mirroring "CURRENT" at the top-left of its image.
     const rightLabel = h("div", { class: "sbg-compare__label", text: "COMPARED", style: `color:${CMP_RED};` });
     rightPrevBtn.addEventListener("click", (e) => { e.stopPropagation(); _navigateCompare(-1); });
     rightNextBtn.addEventListener("click", (e) => { e.stopPropagation(); _navigateCompare(1); });
@@ -1331,9 +1303,6 @@ export function openLightbox(_initialItems, startItemOrIndex, openEvent) {
     _loadCompareImage();
   }
 
-  // Refresh the overlays that depend on idx/_compareIdx: both filename chips
-  // and the left figure's arrow visibility. Called from _loadCompareImage,
-  // goTo (left nav) and _onItemsUpdated.
   function _updateCompareLabels() {
     if (!_compareActive || !_compareElements) return;
     _compareElements.leftFilename.textContent = items[idx]?.filename || "";
@@ -1366,7 +1335,7 @@ export function openLightbox(_initialItems, startItemOrIndex, openEvent) {
         ? h("video", { loop: "", autoplay: "", controls: "", playsinline: "" })
         : h("img", {});
       if (wantVideo) neu.muted = true; // required for autoplay
-      releaseVideo(mediaEl); // release the outgoing video's decoder before discarding it
+      releaseVideo(mediaEl);
       mediaEl.replaceWith(neu);
       _compareElements.rightMedia = neu;
       mediaEl = neu;
@@ -1418,7 +1387,6 @@ export function openLightbox(_initialItems, startItemOrIndex, openEvent) {
     }
   }
 
-  // Shared header for both compare views: which file, plus a colour legend.
   function _compareHeader(withDiffLegend) {
     const compItem = items[_compareIdx];
     const header = h("div", { class: "sbg-compare-header" });
@@ -1462,11 +1430,7 @@ export function openLightbox(_initialItems, startItemOrIndex, openEvent) {
     const curS = meta.summary || {};
     const showTabs = !!(initialImageList(curS).length || initialImageList(compareSummary).length);
     _metaTabs.style.display = showTabs ? "" : "none";
-    if (!showTabs && _activeMetaTab === "initial") {
-      _activeMetaTab = "generated";
-      _tabGenerated.classList.add("sbg-lb__meta-tab--active");
-      _tabInitialImage.classList.remove("sbg-lb__meta-tab--active");
-    }
+    if (!showTabs && _activeMetaTab === "initial") _setActiveMetaTab("generated");
     if (_activeMetaTab === "initial") _showCompInitial();
     else _showCompDiff(compareSummary);
   }
@@ -1480,7 +1444,6 @@ export function openLightbox(_initialItems, startItemOrIndex, openEvent) {
   }
   const _hairline = () => h("div", { style: "height:1px;background:rgba(255,255,255,0.08);margin:2px 8px;" });
 
-  // Initial Image tab while comparing: both sides' source images, stacked.
   function _showCompInitial() {
     if (!meta) return;
     const curS = meta.summary || {};
@@ -1497,8 +1460,8 @@ export function openLightbox(_initialItems, startItemOrIndex, openEvent) {
     };
     // When both sides resolve to the same source-image set, say "same"
     // explicitly instead of rendering the identical blocks twice, because that
-    // IS the answer the user is comparing for (blocks are built fresh per side
-    // now, so this is purely a UX choice with no DOM constraint behind it).
+    // IS the answer the user is comparing for (blocks are built fresh per side,
+    // so this is purely a UX choice with no DOM constraint behind it).
     const sameSource = initialImageList(curS).length && initialImageList(cmpS).length
       && _initialContentKey(curS, items[idx]?.root_id) === _initialContentKey(cmpS, items[_compareIdx]?.root_id);
     metaBody.appendChild(block("Current", CMP_GREEN, curS, items[idx]?.root_id));
@@ -1517,7 +1480,6 @@ export function openLightbox(_initialItems, startItemOrIndex, openEvent) {
     const currentSummary = meta.summary || {};
     const compItem = items[_compareIdx];
 
-    // Profile + merged summaries for the engine-based comparison.
     const _isVidCmp = items[idx] ? isVideo(items[idx]) : false;
     const _cmpApp = currentSummary.source_app || compareSummary.source_app || "comfyui";
     const _cmpProfile = TL.getActiveProfile(_cmpApp, _isVidCmp);
@@ -1544,7 +1506,6 @@ export function openLightbox(_initialItems, startItemOrIndex, openEvent) {
     metaBody.innerHTML = "";
     metaBody.appendChild(_compareHeader(true));
 
-    // Render each profile section, comparing current vs compared.
     for (const section of _cmpProfile) {
       if (!section || !section.title || section.style === "raw") continue;
       if (section.hidden) continue;  // hidden via the layout-editor eye toggle

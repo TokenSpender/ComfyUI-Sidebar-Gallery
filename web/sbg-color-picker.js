@@ -2,9 +2,9 @@
  * sbg-color-picker.js: Reusable HSL + opacity color picker component
  *
  * Provides createColorPicker() with an alpha channel, shared by Appearance
- * settings and the Layout Editor so colours behave identically. Depends only
- * on sbg-core.js. Colours round-trip through sbg-core's canonical model
- * (parseColor / formatColor, always rgba), so translucent values edit cleanly.
+ * settings and the Layout Editor so colours behave identically. Colours
+ * round-trip through sbg-core's canonical model (parseColor / formatColor,
+ * always rgba), so translucent values edit cleanly.
  */
 
 import {
@@ -13,19 +13,12 @@ import {
   getSavedColors, saveSavedColors,
 } from "./sbg-core.js";
 
-// Show a (possibly translucent) colour over a checkerboard so transparency reads.
 const withChecker = checkerBg;
 
 /**
- * Create an HSL + opacity color picker panel.
- *
  * @param {Object} options
  * @param {string} options.initialColor - Starting colour (hex or rgba)
  * @param {Function} options.onChange - Called with the canonical colour string on every change
- * @param {number} [options.slWidth=196] / [options.slHeight=150] / [options.hueHeight=14]
- * @param {boolean} [options.showPreview=true] / [options.showSaved=true]
- * @param {number} [options.savedChipSize=20]
- * @returns {{ panel: HTMLElement, destroy: Function, setColor: Function, init: Function }}
  */
 export function createColorPicker(options) {
   const {
@@ -39,18 +32,15 @@ export function createColorPicker(options) {
     savedChipSize = 20,
   } = options;
 
-  // Parse the initial colour into HSL + alpha (falls back to the accent purple).
   let cH, cS, cL, cA;
   { const pc = parseColor(initialColor) || parseColor("#7c6aef"); [cH, cS, cL] = rgbToHsl(pc.r, pc.g, pc.b); cA = pc.a; }
   const curStr = () => { const [r, g, b] = hslToRgb(cH, cS, cL); return formatColor(r, g, b, cA); };
-  // curStr builds the committed value and curRgbaStr feeds the text field.
-  // Both emit rgba(), since formatColor stores every colour as rgba, so the
-  // displayed string always matches what gets committed.
+  // curStr and curRgbaStr both emit rgba(), since formatColor stores every
+  // colour as rgba, so the displayed string always matches what gets committed.
   const curRgbaStr = () => { const [r, g, b] = hslToRgb(cH, cS, cL); return formatRgba(r, g, b, cA); };
   let currentColor = curStr();
 
-  // Two columns: controls on the left, saved colours stacked in the space to the
-  // right of the palette (they used to sit below it, leaving that space empty).
+  // Two columns: controls on the left, saved colours to the right of the palette.
   const panel = h("div", { class: "sbg-color-picker", style: "display:flex;gap:10px;align-items:flex-start;" });
   const col = h("div", { class: "sbg-cp-main", style: "display:flex;flex-direction:column;" });
   panel.appendChild(col);
@@ -134,12 +124,13 @@ export function createColorPicker(options) {
 
   // Preview + colour input
   let preview = null, hexInp = null;
-  // Commit the typed hex value. Declared at picker scope (not only inside the
-  // showPreview block) so the returned `commit` can flush a pending edit when the
-  // host tears the picker down: layout-editor popovers are *removed* on
-  // outside-click, which can pre-empt the input's own change/blur event.
-  let _hexDirty = false;       // user has typed since the last apply
-  let commitHex = () => {};    // real impl assigned below once the input exists
+  // Commit the typed hex value. Declared at picker scope rather than only
+  // inside the showPreview block so the returned `commit` can flush a pending
+  // edit when the host tears the picker down: layout-editor popovers are
+  // *removed* on outside-click, which can pre-empt the input's own
+  // change/blur event.
+  let _hexDirty = false;
+  let commitHex = () => {};
   if (showPreview) {
     const previewRow = h("div", { style: "display:flex;align-items:center;gap:8px;margin-bottom:8px;" });
     preview = h("div", { style: "width:32px;height:32px;border-radius:6px;border:1px solid rgba(255,255,255,0.15);flex-shrink:0;" });
@@ -150,7 +141,7 @@ export function createColorPicker(options) {
       _hexDirty = false;
       const pc = parseColor(hexInp.value.trim());
       if (pc) { [cH, cS, cL] = rgbToHsl(pc.r, pc.g, pc.b); cA = pc.a; drawSL(); drawHue(); _apply(); }
-      else { hexInp.value = currentColor; }  // revert invalid input to the last valid colour
+      else { hexInp.value = currentColor; }
     };
     hexInp.addEventListener("input", () => { _hexDirty = true; });
     // `change` fires on blur (clicking another control or outside) and on Enter.
@@ -160,7 +151,7 @@ export function createColorPicker(options) {
     col.appendChild(previewRow);
   }
 
-  // Saved colours (right column, fills the space beside the palette)
+  // Saved colours
   if (showSaved) {
     const savedCol = h("div", { class: "sbg-cp-saved", style: "display:flex;flex-direction:column;align-items:center;gap:5px;max-height:230px;overflow-y:auto;overflow-x:hidden;padding:2px;" });
     const savedLabel = h("div", { style: "font-size:10px;opacity:0.5;text-align:center;", text: "Saved" });
@@ -170,8 +161,8 @@ export function createColorPicker(options) {
       chipsWrap.innerHTML = "";
       for (const sc of getSavedColors()) {
         const chip = h("div", { style: `position:relative;width:${savedChipSize}px;height:${savedChipSize}px;border-radius:4px;background:${withChecker(sc)};cursor:pointer;border:1px solid rgba(255,255,255,0.1);flex-shrink:0;`, title: sc });
-        // Explicit × remove. Sits INSIDE the chip's top-right corner (not
-        // overhanging) so the saved-list scrollbar / overflow can't clip or hide it.
+        // The remove button sits inside the chip's top-right corner so the
+        // saved-list scrollbar and overflow can't clip or hide it.
         const x = h("span", { text: "×", title: "Remove", style: "position:absolute;top:0;right:0;width:14px;height:14px;line-height:13px;text-align:center;font-size:12px;border-radius:0 4px 0 4px;background:rgba(0,0,0,0.65);color:#fff;cursor:pointer;opacity:0;transition:opacity 0.1s;" });
         x.addEventListener("click", (e) => { e.stopPropagation(); saveSavedColors(getSavedColors().filter(v => v !== sc)); renderSaved(); });
         chip.addEventListener("mouseenter", () => { x.style.opacity = "1"; });
@@ -191,19 +182,17 @@ export function createColorPicker(options) {
     panel._renderSaved = renderSaved;
   }
 
-  // Apply colour everywhere
   function _apply() {
     currentColor = curStr();
     if (preview) preview.style.background = withChecker(currentColor);
-    // Programmatic value set rather than a user edit, so clear the dirty flag. Display
-    // is always rgba(...); the committed value (currentColor) stays canonical.
+    // Programmatic value set rather than a user edit, so clear the dirty flag.
     if (hexInp) { hexInp.value = curRgbaStr(); _hexDirty = false; }
     opRange.value = String(Math.round(cA * 100));
     opVal.textContent = Math.round(cA * 100) + "%";
     onChange(currentColor);
   }
 
-  /** Programmatically set the picker to a new colour (hex or rgba). */
+  /** Accepts hex or rgba. */
   function setColor(color) {
     const pc = parseColor(color);
     if (pc) { [cH, cS, cL] = rgbToHsl(pc.r, pc.g, pc.b); cA = pc.a; drawSL(); drawHue(); _apply(); }

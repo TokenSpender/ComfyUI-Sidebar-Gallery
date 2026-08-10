@@ -37,14 +37,14 @@ export const _dataCache = {
 /* Mutable shared state (used by gallery + lightbox) */
 
 export const searchState = {
-  query: "",       // current search term for metadata highlighting (_activeSearchQuery)
+  query: "",       // current search term for metadata highlighting
 };
 
 /* Module-level caches */
 
 // Bounded Map (FIFO eviction) so the metadata cache can't grow without limit
 // over a long browsing session. Entries are small, so the cap is generous; an
-// evicted item just re-fetches from the server (a fast DB read) when next viewed.
+// evicted item just re-fetches from the server when next viewed.
 class _LruMap extends Map {
   constructor(max) { super(); this._max = max; }
   set(k, v) {
@@ -205,6 +205,44 @@ export function showToast(msg, duration = 1800) {
   _toastTimer = setTimeout(() => _toastEl.classList.remove("sbg-toast--visible"), duration);
 }
 
+/**
+ * Two-step destructive click. The first click arms the button (relabels it,
+ * applies the arm styling) and starts a reset timer; a second click inside
+ * the window restores the button and runs onConfirm. opts: label (default
+ * "Sure?"), armMs (default 2000), background / color inline styles or an
+ * armClass, all restored on disarm.
+ */
+export function confirmClick(btn, onConfirm, opts = {}) {
+  const label = opts.label || "Sure?";
+  const armMs = opts.armMs || 2000;
+  let armed = false, timer = null;
+  const orig = { text: "", background: "", color: "" };
+  const disarm = () => {
+    armed = false;
+    clearTimeout(timer);
+    btn.textContent = orig.text;
+    btn.style.background = orig.background;
+    btn.style.color = orig.color;
+    if (opts.armClass) btn.classList.remove(opts.armClass);
+  };
+  btn.addEventListener("click", (e) => {
+    if (!armed) {
+      armed = true;
+      orig.text = btn.textContent;
+      orig.background = btn.style.background;
+      orig.color = btn.style.color;
+      btn.textContent = label;
+      if (opts.armClass) btn.classList.add(opts.armClass);
+      if (opts.background) btn.style.background = opts.background;
+      if (opts.color) btn.style.color = opts.color;
+      timer = setTimeout(disarm, armMs);
+      return;
+    }
+    disarm();
+    onConfirm(e);
+  });
+}
+
 export function copyText(text) {
   if (text == null || text === "") { showToast("Nothing to copy"); return; }
   const str = String(text);
@@ -275,15 +313,14 @@ const _idbPromise = () => {
 export function _resetIdb() {
   if (_idbCachedPromise) {
     // Close the existing connection first so deleteDatabase isn't blocked
-    _idbCachedPromise.then(db => { try { db.close(); } catch (e) { /* ignore */ } }).catch(() => {});
+    _idbCachedPromise.then(db => { try { db.close(); } catch (e) { } }).catch(() => {});
   }
   _idbCachedPromise = null;
 }
 // L1 synchronous memory cache mapping url to blobUrl (with LRU eviction)
-const MAX_MEM_CACHE = 500;  // Max blob URLs kept in memory
+const MAX_MEM_CACHE = 500;
 export const _thumbMemCache = new Map();
 
-/** Insert into L1 cache with LRU eviction */
 function _thumbMemSet(url, blobUrl) {
   // Move to end (most recently used). A replaced entry's object URL is
   // revoked unless a visible card still shows it, or every replacement
@@ -300,7 +337,6 @@ function _thumbMemSet(url, blobUrl) {
     }
   }
   _thumbMemCache.set(url, blobUrl);
-  // Evict oldest 25% when over limit
   if (_thumbMemCache.size > MAX_MEM_CACHE) {
     const evictCount = Math.floor(MAX_MEM_CACHE * 0.25);
     let evicted = 0;
@@ -319,55 +355,86 @@ function _thumbMemSet(url, blobUrl) {
   }
 }
 
+// Store-scoped transaction helpers shared by the thumb and meta caches, so
+// the promise-wrapped plumbing exists once. Every operation resolves (with
+// null / undefined / empty stats) instead of rejecting: cache trouble must
+// never break a caller.
+function _idbGet(store, key) {
+  return _idbPromise().then(db => new Promise(resolve => {
+    const req = db.transaction(store, 'readonly').objectStore(store).get(key);
+    req.onsuccess = () => resolve(req.result || null);
+    req.onerror = () => resolve(null);
+  })).catch(() => null);
+}
+
+function _idbPut(store, key, value) {
+  return _idbPromise().then(db => new Promise(resolve => {
+    const tx = db.transaction(store, 'readwrite');
+    tx.objectStore(store).put(value, key);
+    tx.oncomplete = () => resolve();
+    tx.onerror = () => resolve();
+  })).catch(() => { });
+}
+
+// Resolves true when the store was cleared and false when it was not (a
+// failed open, a missing store, an aborted transaction), so the settings
+// buttons can report a failed clear instead of a false success.
+function _idbClear(store) {
+  return _idbPromise().then(db => new Promise(resolve => {
+    const tx = db.transaction(store, 'readwrite');
+    tx.objectStore(store).clear();
+    tx.oncomplete = () => resolve(true);
+    tx.onerror = () => resolve(false);
+    tx.onabort = () => resolve(false);
+  })).catch(() => false);
+}
+
+function _idbStats(store, sizeOf) {
+  return _idbPromise().then(db => new Promise(resolve => {
+    const tx = db.transaction(store, 'readonly');
+    const st = tx.objectStore(store);
+    const countReq = st.count();
+    let totalSize = 0;
+    const cursorReq = st.openCursor();
+    cursorReq.onsuccess = (e) => {
+      const cursor = e.target.result;
+      if (cursor) {
+        try { totalSize += sizeOf(cursor.value) || 0; } catch { }
+        cursor.continue();
+      }
+    };
+    countReq.onsuccess = () => {
+      tx.oncomplete = () => resolve({ count: countReq.result, totalSizeBytes: totalSize });
+    };
+    countReq.onerror = () => resolve({ count: 0, totalSizeBytes: 0 });
+  })).catch(() => ({ count: 0, totalSizeBytes: 0 }));
+}
+
 export const _thumbCacheAPI = {
-  async _get(url) {
-    const db = await _idbPromise();
-    return new Promise(resolve => {
-      const tx = db.transaction('thumbs', 'readonly');
-      const req = tx.objectStore('thumbs').get(url);
-      req.onsuccess = () => resolve(req.result || null);
-      req.onerror = () => resolve(null);
-    });
-  },
-
-  async _put(url, blob) {
-    const db = await _idbPromise();
-    return new Promise(resolve => {
-      const tx = db.transaction('thumbs', 'readwrite');
-      tx.objectStore('thumbs').put(blob, url);
-      tx.oncomplete = () => resolve();
-      tx.onerror = () => resolve();
-    });
-  },
-
-  /** Synchronous check of L1 memory cache. Returns blobUrl or null. */
   tryGetSync(url) {
     return _thumbMemCache.get(url) || null;
   },
 
-  /** Load a thumbnail URL from memory/IndexedDB cache or network. Returns an object URL.
+  /** Load a thumbnail URL from memory/IndexedDB cache or network.
    *  Deduped: concurrent callers for one URL share one promise, so a pair of
    *  simultaneous misses cannot mint two blob URLs for the same thumb. */
   async getOrFetch(url) {
-    // L1: synchronous memory check
     const mem = _thumbMemCache.get(url);
     if (mem) return mem;
     return singleFlight("thumbFetch:" + url, async () => {
       const again = _thumbMemCache.get(url);
       if (again) return again;
       try {
-        // L2: IndexedDB
-        const cached = await this._get(url);
+        const cached = await _idbGet('thumbs', url);
         if (cached) {
           const blobUrl = URL.createObjectURL(cached);
           _thumbMemSet(url, blobUrl);
           return blobUrl;
         }
-        // L3: Network fetch
         const resp = await fetch(url);
         if (resp.ok) {
           const blob = await resp.blob();
-          await this._put(url, blob);
+          await _idbPut('thumbs', url, blob);
           const blobUrl = URL.createObjectURL(blob);
           _thumbMemSet(url, blobUrl);
           return blobUrl;
@@ -381,15 +448,13 @@ export const _thumbCacheAPI = {
    *  Deduped like getOrFetch, under its own key so a fetch never joins a
    *  cache-only check and inherits its null. */
   async tryGet(url) {
-    // L1: synchronous memory check
     const mem = _thumbMemCache.get(url);
     if (mem) return mem;
     return singleFlight("thumbTry:" + url, async () => {
       const again = _thumbMemCache.get(url);
       if (again) return again;
       try {
-        // L2: IndexedDB
-        const cached = await this._get(url);
+        const cached = await _idbGet('thumbs', url);
         if (cached) {
           const blobUrl = URL.createObjectURL(cached);
           _thumbMemSet(url, blobUrl);
@@ -400,42 +465,12 @@ export const _thumbCacheAPI = {
     });
   },
 
-  /** Get cache stats including total size. */
-  async getStats() {
-    try {
-      const db = await _idbPromise();
-      return new Promise(resolve => {
-        const tx = db.transaction('thumbs', 'readonly');
-        const store = tx.objectStore('thumbs');
-        const countReq = store.count();
-        let totalSize = 0;
-        const cursorReq = store.openCursor();
-        cursorReq.onsuccess = (e) => {
-          const cursor = e.target.result;
-          if (cursor) {
-            if (cursor.value && cursor.value.size) totalSize += cursor.value.size;
-            cursor.continue();
-          }
-        };
-        countReq.onsuccess = () => {
-          tx.oncomplete = () => resolve({ count: countReq.result, totalSizeBytes: totalSize });
-        };
-        countReq.onerror = () => resolve({ count: 0, totalSizeBytes: 0 });
-      });
-    } catch { return { count: 0, totalSizeBytes: 0 }; }
+  getStats() {
+    return _idbStats('thumbs', (v) => v && v.size);
   },
 
-  /** Clear all cached thumbnails. */
-  async clear() {
-    try {
-      const db = await _idbPromise();
-      return new Promise(resolve => {
-        const tx = db.transaction('thumbs', 'readwrite');
-        tx.objectStore('thumbs').clear();
-        tx.oncomplete = () => resolve();
-        tx.onerror = () => resolve();
-      });
-    } catch { }
+  clear() {
+    return _idbClear('thumbs');
   },
 
   /** Bound the store: entries are content-addressed (&v=mtime), so a changed
@@ -453,7 +488,7 @@ export const _thumbCacheAPI = {
         const store = tx.objectStore('thumbs');
         const countReq = store.count();
         countReq.onsuccess = () => {
-          if ((countReq.result || 0) <= maxCount) return;  // under cap, nothing to trim
+          if ((countReq.result || 0) <= maxCount) return;
           let toDelete = countReq.result - target;
           const curReq = store.openKeyCursor();
           curReq.onsuccess = (e) => {
@@ -473,33 +508,14 @@ export const _thumbCacheAPI = {
 };
 
 export const _metaCacheAPI = {
-  /** Get a metadata entry from IndexedDB. */
-  async get(key) {
-    try {
-      const db = await _idbPromise();
-      return new Promise(resolve => {
-        const tx = db.transaction('meta', 'readonly');
-        const req = tx.objectStore('meta').get(key);
-        req.onsuccess = () => resolve(req.result || null);
-        req.onerror = () => resolve(null);
-      });
-    } catch { return null; }
+  get(key) {
+    return _idbGet('meta', key);
   },
 
-  /** Store a single metadata entry. */
-  async put(key, value) {
-    try {
-      const db = await _idbPromise();
-      return new Promise(resolve => {
-        const tx = db.transaction('meta', 'readwrite');
-        tx.objectStore('meta').put(value, key);
-        tx.oncomplete = () => resolve();
-        tx.onerror = () => resolve();
-      });
-    } catch { }
+  put(key, value) {
+    return _idbPut('meta', key, value);
   },
 
-  /** Bulk store metadata entries: [{key, value}, ...] */
   async putBatch(entries) {
     if (!entries.length) return;
     try {
@@ -514,53 +530,23 @@ export const _metaCacheAPI = {
     } catch { }
   },
 
-  /** Get count and size of cached metadata entries. */
-  async getStats() {
-    try {
-      const db = await _idbPromise();
-      return new Promise(resolve => {
-        const tx = db.transaction('meta', 'readonly');
-        const store = tx.objectStore('meta');
-        const countReq = store.count();
-        let totalSize = 0;
-        const cursorReq = store.openCursor();
-        cursorReq.onsuccess = (e) => {
-          const cursor = e.target.result;
-          if (cursor) {
-            try { totalSize += JSON.stringify(cursor.value).length * 2; } catch { }
-            cursor.continue();
-          }
-        };
-        countReq.onsuccess = () => {
-          tx.oncomplete = () => resolve({ count: countReq.result, totalSizeBytes: totalSize });
-        };
-        countReq.onerror = () => resolve({ count: 0, totalSizeBytes: 0 });
-      });
-    } catch { return { count: 0, totalSizeBytes: 0 }; }
+  getStats() {
+    return _idbStats('meta', (v) => JSON.stringify(v).length * 2);
   },
 
-  /** Clear all cached metadata. */
-  async clear() {
-    try {
-      const db = await _idbPromise();
-      return new Promise(resolve => {
-        const tx = db.transaction('meta', 'readwrite');
-        tx.objectStore('meta').clear();
-        tx.oncomplete = () => resolve();
-        tx.onerror = () => resolve();
-      });
-    } catch { }
+  clear() {
+    return _idbClear('meta');
   },
 };
 
 /* Lazy thumbnail loading via IntersectionObserver */
 
 let _thumbObserver = null;
-const _thumbFailedUrls = new Set(); // Track URLs that have already failed
+const _thumbFailedUrls = new Set();
 // Backoff for transient thumbnail misses: the server is still generating the
 // thumb for a just-generated file, or is briefly unreachable right after a
-// ComfyUI reboot. getOrFetch resolves to the raw URL (not a blob:) on a miss, so
-// retry a few times before giving up.
+// ComfyUI reboot. getOrFetch resolves to the raw URL on a miss, so retry a few
+// times before giving up.
 const THUMB_RETRY_DELAYS = [1500, 3500, 7000];
 
 export function initThumbObserver() {
@@ -572,10 +558,10 @@ export function initThumbObserver() {
       _thumbObserver.unobserve(wrap);
       const item = wrap._sbgItem;
       if (!item || !item.thumb_url) continue;
-      if (_thumbFailedUrls.has(item.thumb_url)) continue; // Skip known-failed URLs
+      if (_thumbFailedUrls.has(item.thumb_url)) continue;
 
       const giveUp = () => {
-        _thumbFailedUrls.add(item.thumb_url); // stop hammering a genuinely-dead URL
+        _thumbFailedUrls.add(item.thumb_url);
         const spinner = wrap.querySelector(".sbg-card__spinner");
         if (spinner) spinner.remove();
       };
@@ -589,10 +575,9 @@ export function initThumbObserver() {
           // The wrap may have been removed (filter change) or rebound to another
           // item by the time the fetch resolves; don't inject a stale thumbnail.
           if (!wrap.isConnected || wrap._sbgItem !== item) return;
-          // getOrFetch resolves to the raw URL (not a blob:) on a miss, e.g. a
-          // just-generated file whose thumbnail isn't built yet, or the server not
-          // yet up right after a reboot. Retry with backoff so it self-heals in
-          // place instead of waiting for a manual rescan.
+          // A raw URL means the thumbnail is missing server-side, e.g. a
+          // just-generated file whose thumbnail is still being built. Retry with
+          // backoff so it self-heals in place without a manual rescan.
           if (blobUrl === item.thumb_url) { scheduleRetry(attempt); return; }
           const img = h("img", { class: "sbg-card__thumb", loading: "lazy" });
           img.src = blobUrl;
@@ -686,16 +671,13 @@ export const S = {
   PROMPT_VIEW: "SBG.PromptView",
   SEARCH_TAG_COLOR: "SBG.SearchTagColor",
   SEARCH_TAG_NEG_COLOR: "SBG.SearchTagNegColor",
-  // Per-app badge colors
   APP_BADGE_COMFYUI: "SBG.AppBadgeComfyUI",
   APP_BADGE_A1111: "SBG.AppBadgeA1111",
   APP_BADGE_FORGE: "SBG.AppBadgeForge",
   APP_BADGE_SDNEXT: "SBG.AppBadgeSDNext",
   APP_BADGE_FOOOCUS: "SBG.AppBadgeFooocus",
   APP_BADGE_CIVITAI: "SBG.AppBadgeCivitAI",
-  // Initial image tab
   INITIAL_IMAGE_TAB_COLOR: "SBG.InitialImageTabColor",
-  // Pill/badge colors
   PILL_BG_COLOR: "SBG.PillBgColor",
   PILL_TEXT_COLOR: "SBG.PillTextColor",
   PILL_BORDER_COLOR: "SBG.PillBorderColor",
@@ -704,7 +686,6 @@ export const S = {
   MODEL_NAME_STYLE: "SBG.ModelNameStyle",
   VSCROLL_BUFFER: "SBG.VScrollBuffer",
   META_TAB_PERSIST: "SBG.MetaTabPersist",
-  // Lightbox zoom
   LB_ZOOM_SCROLL_MODE: "SBG.LbZoomScrollMode",
   LB_ZOOM_ANCHOR: "SBG.LbZoomAnchor",
   LB_ZOOM_SENSITIVITY: "SBG.LbZoomSensitivity",
@@ -727,6 +708,28 @@ export const APP_REGISTRY = [
   { id: "fooocus", label: "Fooocus", settingKey: S.APP_BADGE_FOOOCUS, cssVar: "--sbg-app-fooocus", defaultColor: "#f472b6" },
   { id: "civitai", label: "CivitAI", settingKey: S.APP_BADGE_CIVITAI, cssVar: "--sbg-app-civitai", defaultColor: "#3b82f6" },
 ];
+
+/* Custom theme variables */
+// The variables the "custom" theme drives, with their setting keys and
+// defaults. Applied at gallery boot and again live from the Appearance tab;
+// one list so a new variable cannot reach one site and miss the other.
+const _CUSTOM_THEME_VARS = [
+  ["--sbg-bg", "CUSTOM_BG", "#1a1a1a"],
+  ["--sbg-surface", "CUSTOM_SURFACE", "#222222"],
+  ["--sbg-border", "CUSTOM_BORDER", "#444444"],
+  ["--sbg-text", "CUSTOM_TEXT", "#e0e0e0"],
+  ["--sbg-accent", "CUSTOM_ACCENT", "#7c6aef"],
+];
+
+/** Set the custom theme's variables on rootEl, or clear them for any other
+ *  theme so the stylesheet's theme rules take over. */
+export function applyCustomThemeVars(rootEl, theme) {
+  if (!rootEl) return;
+  for (const [cssVar, key, def] of _CUSTOM_THEME_VARS) {
+    if (theme === "custom") rootEl.style.setProperty(cssVar, getSetting(key, def));
+    else rootEl.style.removeProperty(cssVar);
+  }
+}
 
 /* Shared scan/reindex progress poller */
 // One timer and one fetch of /sidebar_gallery/reindex_progress, fanned out to
@@ -801,23 +804,20 @@ export function formatProgress(entry) {
    collapse into one write. Purely per-browser state (panel widths, collapse
    memory, saved picker colours, presets) stays in localStorage. */
 
-/** In-memory settings cache. Populated by loadSettings(). */
 let _diskSettings = {};
 let _diskSettingsLoaded = false;
-let _diskSettingsLoading = null; // Promise while loading
+let _diskSettingsLoading = null;
 
-/** Debounce timer for saving settings to disk */
 let _saveDebounceTimer = null;
 const _SAVE_DEBOUNCE_MS = 500;
 
-/** Pending changes to be saved (accumulated during debounce window) */
+// Browsers cap the combined body size of in-flight keepalive requests at
+// 64 KiB and reject anything larger before it is sent, so payloads near the
+// cap must go as plain requests to be deliverable at all.
+const _KEEPALIVE_MAX_BYTES = 60000;
+
 let _pendingChanges = {};
 
-/**
- * Load all settings from the server into memory.
- * Returns a promise that resolves when settings are loaded.
- * Subsequent calls return the cached promise if still loading.
- */
 export async function loadSettings() {
   if (_diskSettingsLoaded) return _diskSettings;
   if (_diskSettingsLoading) return _diskSettingsLoading;
@@ -830,6 +830,9 @@ export async function loadSettings() {
         if (data && typeof data === "object") {
           _diskSettings = data;
         }
+      } else {
+        console.warn("[SBG] Failed to load settings from server: HTTP " + resp.status);
+        showToast("Loading saved gallery settings failed. Defaults are in use for this session.", 5000);
       }
     } catch (e) {
       console.warn("[SBG] Failed to load settings from server:", e);
@@ -860,13 +863,17 @@ export function flushSettingsNow() {
   // browser wrote since load.
   for (const key of keys) {
     const payload = JSON.stringify({ key, value: pending[key] });
+    const blob = new Blob([payload], { type: "application/json" });
     let sent = false;
     try {
-      const blob = new Blob([payload], { type: "application/json" });
       sent = !!(navigator.sendBeacon && navigator.sendBeacon("/sidebar_gallery/settings", blob));
     } catch { }
     if (!sent) {
-      try { fetch("/sidebar_gallery/settings", { method: "POST", headers: { "Content-Type": "application/json" }, body: payload, keepalive: true }); } catch { }
+      // sendBeacon refuses oversized payloads, and a keepalive fetch would
+      // reject them for the same quota, so those go as plain requests. That
+      // still delivers when the page stays alive (a hidden tab) and is a
+      // best effort on a real close.
+      try { fetch("/sidebar_gallery/settings", { method: "POST", headers: { "Content-Type": "application/json" }, body: payload, keepalive: blob.size < _KEEPALIVE_MAX_BYTES }); } catch { }
     }
   }
 }
@@ -881,30 +888,42 @@ function _installFlushHooks() {
   document.addEventListener("visibilitychange", () => { if (document.visibilityState === "hidden") flushSettingsNow(); });
 }
 
-/**
- * Save a single setting by key. Updates in-memory cache immediately
- * and debounces the POST to the server.
- */
 export function saveSetting(key, value) {
   _diskSettings[key] = value;
   _pendingChanges[key] = value;
 
-  // Debounce the disk write
   if (_saveDebounceTimer) clearTimeout(_saveDebounceTimer);
   _saveDebounceTimer = setTimeout(_flushSettings, _SAVE_DEBOUNCE_MS);
+}
+
+let _lastSaveFailToast = 0;
+const _SAVE_FAIL_TOAST_GAP_MS = 30000;
+
+function _saveFailed(key, detail) {
+  console.warn("[SBG] Failed to save setting", key, detail);
+  const now = Date.now();
+  if (now - _lastSaveFailToast >= _SAVE_FAIL_TOAST_GAP_MS) {
+    _lastSaveFailToast = now;
+    showToast("Saving gallery settings failed. Recent changes may be lost when the page reloads.", 5000);
+  }
 }
 
 /**
  * Flush all pending setting changes to the server. One drain runs at a time so
  * two concurrent drains can't post a stale value over a newer one; keys are
  * claimed one at a time (so unposted keys stay visible to the unload beacon)
- * and each post carries keepalive so a nav-interrupted drain still delivers.
+ * and a post carries keepalive when its body fits the quota, so a
+ * nav-interrupted drain still delivers. A failed post warns the user and
+ * returns its key to the pending map for the next drain or the unload flush;
+ * the rest of this drain skips it so a persistent server error ends the loop
+ * instead of retrying without bound.
  */
 let _flushInFlight = false;
 async function _flushSettings() {
   _saveDebounceTimer = null;
   if (_flushInFlight) return;  // the running drain empties the pending map itself
   _flushInFlight = true;
+  const failed = {};
   try {
     // Persist each changed key with a per-key update. The server merges per
     // key, so the whole settings file is never replaced; replacing it would
@@ -912,23 +931,33 @@ async function _flushSettings() {
     // loss). A key re-saved while its older value is in flight simply lands
     // back in the pending map and is posted again afterwards, newest last.
     for (;;) {
-      const keys = Object.keys(_pendingChanges);
-      if (!keys.length) break;
-      const key = keys[0];
+      const key = Object.keys(_pendingChanges).find((k) => !(k in failed));
+      if (key === undefined) break;
       const value = _pendingChanges[key];
       delete _pendingChanges[key];
+      const body = JSON.stringify({ key, value });
+      let err = null;
       try {
-        await fetch("/sidebar_gallery/settings", {
+        const resp = await fetch("/sidebar_gallery/settings", {
           method: "POST",
           headers: { "Content-Type": "application/json" },
-          body: JSON.stringify({ key, value }),
-          keepalive: true,
+          body,
+          keepalive: new Blob([body]).size < _KEEPALIVE_MAX_BYTES,
         });
+        if (!resp.ok) err = "HTTP " + resp.status;
       } catch (e) {
-        console.warn("[SBG] Failed to save setting", key, e);
+        err = e;
+      }
+      if (err !== null) {
+        failed[key] = value;
+        _saveFailed(key, err);
       }
     }
   } finally {
+    // A newer value queued during the drain wins over the failed one.
+    for (const key of Object.keys(failed)) {
+      if (!(key in _pendingChanges)) _pendingChanges[key] = failed[key];
+    }
     _flushInFlight = false;
   }
 }
@@ -946,12 +975,6 @@ export function getSetting(id, fallback) {
 
 /* KV Row helper */
 
-/**
- * Build a key-value metadata row.
- * @param {string} label - The label to display
- * @param {*} value - The value to display
- * @returns {HTMLElement|null} The row element, or null if value is empty
- */
 /** For a long filename-ish value, return a DocumentFragment with <wbr> break
  *  opportunities inserted after underscore/dot/hyphen runs, so the browser can
  *  wrap at those boundaries. CSS only soft-wraps at spaces/existing hyphens, so
@@ -1031,9 +1054,7 @@ export function formatColor(r, g, b, a = 1) {
 }
 
 /** Always-rgba string "rgba(r, g, b, a)": channels clamped to 0..255, alpha
- *  clamped to 0..1 and rounded to 3 decimals. Unlike formatColor() this never
- *  collapses to hex; used where the UI must always read rgba (the colour picker
- *  and the settings colour inputs). */
+ *  clamped to 0..1 and rounded to 3 decimals. */
 export function formatRgba(r, g, b, a = 1) {
   const c = (n) => Math.max(0, Math.min(255, Math.round(n)));
   a = Math.max(0, Math.min(1, a));
@@ -1077,9 +1098,6 @@ export function saveSavedColors(arr) {
 
 /* Search highlight */
 
-/**
- * Walk all text nodes in container and wrap query matches in <mark>.
- */
 export function highlightSearchMatches(container, query) {
   if (!query) return;
   // Match case-insensitively and treat spaces / underscores / hyphens as
@@ -1097,7 +1115,6 @@ export function highlightSearchMatches(container, query) {
     const text = node.textContent;
     re.lastIndex = 0;
     if (!re.test(text)) continue;
-    // Skip nodes inside <pre> or buttons
     if (node.parentElement?.closest("pre, button, .sbg-section__head")) continue;
     const frag = document.createDocumentFragment();
     let lastIdx = 0, m;

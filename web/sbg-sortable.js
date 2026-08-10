@@ -1,19 +1,14 @@
 /**
  * sbg-sortable.js: Pointer-based real-time sortable
  *
- * Items physically reorder as you drag them, like a modern sortable list.
- * The layout editor drives it for sections, tabs, and fields.
- * No external dependencies.
+ * Items reorder in place as they are dragged. The layout editor drives it for
+ * sections, tabs, and fields.
  */
 
 let _sortState = null;
 
 /**
- * Make an item sortable within a container via a drag handle.
- *
- * @param {HTMLElement} container - Parent element containing sortable children
  * @param {HTMLElement} handle - The drag handle element (mousedown target)
- * @param {HTMLElement} item - The draggable item element
  * @param {Object} [opts]
  * @param {string} [opts.type] - "section" or "param"; determines the default sibling selector
  * @param {string} [opts.itemSelector] - explicit selector for sortable siblings (overrides type default)
@@ -42,13 +37,11 @@ export function initSortable(container, handle, item, opts = {}) {
     const offsetX = e.clientX - rect.left;
     const offsetY = e.clientY - rect.top;
 
-    // Create placeholder
     const placeholder = document.createElement("div");
     placeholder.className = "sbg-sortable-placeholder";
     placeholder.style.height = rect.height + "px";
     placeholder.style.margin = getComputedStyle(item).margin;
 
-    // Position the item as fixed overlay
     const origWidth = rect.width;
     item.style.position = "fixed";
     item.style.zIndex = "999999";
@@ -64,17 +57,15 @@ export function initSortable(container, handle, item, opts = {}) {
     // themselves only while a drag of that kind is in progress.
     document.body.classList.add("sbg-dragging-" + (opts.type || "item"));
 
-    // Insert placeholder where item was. homeNext is the item's original
-    // following sibling, so an abandoned drag can put it back exactly.
+    // homeNext is the item's original following sibling, so an abandoned drag
+    // can put it back exactly.
     const actualParent = item.parentNode;
     const homeNext = item.nextSibling;
     actualParent.insertBefore(placeholder, item);
 
-    // Get sortable siblings (exclude the dragged item)
     const selector = opts.itemSelector || (opts.type === "param" ? "[data-type='param']" : ".sbg-section");
     const getSiblings = () => [...container.querySelectorAll(selector)].filter(s => s !== item && !s.classList.contains("sbg-sortable-placeholder"));
 
-    // Find the scrollable ancestor for auto-scroll
     let scrollParent = container.parentElement;
     while (scrollParent && scrollParent !== document.body) {
       const ov = getComputedStyle(scrollParent).overflowY;
@@ -110,8 +101,6 @@ export function initSortable(container, handle, item, opts = {}) {
       }
     }
 
-    // Convert-target state: the element currently highlighted as a drop-INTO
-    // target, if any. Cleared whenever the cursor leaves it.
     let convertEl = null;
     const convertClass = (opts.convertTargets && opts.convertTargets.className) || "sbg-sortable-dropinto";
     function clearConvert() {
@@ -128,18 +117,15 @@ export function initSortable(container, handle, item, opts = {}) {
       // the drag (revert, no drop) rather than commit something unintended.
       if (ev.buttons === 0) { cancelDrag(); return; }
       _lastX = ev.clientX; _lastY = ev.clientY;
-      // Move the dragged item with cursor
       item.style.left = (ev.clientX - offsetX) + "px";
       item.style.top = (ev.clientY - offsetY) + "px";
-      // Auto-scroll when near container edges
       autoScroll(ev.clientY);
       evaluate(ev.clientX, ev.clientY);
     }
 
-    // Position the placeholder / pick a convert target for a cursor position.
-    // Called from onMove and, with the last cursor position, from the auto-scroll
-    // loop so a stationary cursor keeps tracking the scrolled content.
-    // Uses a 40% threshold (not the 50% midpoint) for a snappier reorder feel.
+    // Position the placeholder or pick a convert target for a cursor position.
+    // The vertical placement test uses a 40% threshold, which makes the reorder
+    // feel snappier than a midpoint test.
     function evaluate(clientX, clientY) {
       if (!_sortState) return;
       const elUnder = document.elementFromPoint(clientX, clientY);
@@ -231,12 +217,11 @@ export function initSortable(container, handle, item, opts = {}) {
         const last = siblings[siblings.length - 1];
         if (last.nextSibling !== placeholder) (last.parentNode || activeContainer).insertBefore(placeholder, last.nextSibling);
       } else if (placeholder.parentNode !== activeContainer) {
-        activeContainer.appendChild(placeholder); // empty target container
+        activeContainer.appendChild(placeholder);
       }
     }
 
-    // Shared teardown: restore the dragged item's inline styles and drop the
-    // document listeners. The caller has already cancelled the auto-scroll RAF.
+    // Shared teardown. The caller has already cancelled the auto-scroll RAF.
     function endDrag() {
       clearConvert();
       item.style.position = "";
@@ -268,9 +253,8 @@ export function initSortable(container, handle, item, opts = {}) {
       if (!_sortState) return;
       if (_scrollRAF) cancelAnimationFrame(_scrollRAF);
 
-      // Report what kind of zone took the drop. A highlighted convert target
-      // wins; otherwise a placeholder parked in the promote container reports
-      // its position among that container's items.
+      // A highlighted convert target wins; otherwise a placeholder parked in
+      // the promote container reports its position among that container's items.
       const info = {};
       if (convertEl) {
         info.convertEl = convertEl;
@@ -284,9 +268,9 @@ export function initSortable(container, handle, item, opts = {}) {
         info.promoteIndex = idx;
       }
 
-      // Place item back into flow where the placeholder is. An async re-render
-      // (e.g. a late sample-metadata fetch repainting the editor) can detach the
-      // placeholder mid-drag; guard so cleanup still runs instead of throwing.
+      // An async re-render (e.g. a late sample-metadata fetch repainting the
+      // editor) can detach the placeholder mid-drag; guard so cleanup still
+      // runs instead of throwing.
       if (placeholder.parentNode) placeholder.parentNode.insertBefore(item, placeholder);
       placeholder.remove();
       endDrag();

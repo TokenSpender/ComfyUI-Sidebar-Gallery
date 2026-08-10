@@ -1,10 +1,7 @@
 """Pure metadata search matching for Sidebar Gallery.
 
-Extracted from routes.py so the matcher is decoupled from the aiohttp route
-handler and can be unit-tested in isolation (routes.py pulls in aiohttp +
-folder_paths and cannot be imported in a bare environment).
-
-Pure stdlib so it imports anywhere, including environments without ComfyUI.
+Kept out of routes.py so the matcher stays importable in a bare environment:
+routes.py pulls in aiohttp and folder_paths. Pure stdlib here.
 """
 from __future__ import annotations
 
@@ -18,6 +15,31 @@ def _count_hits(haystack: str, needle: str) -> int:
     if needle and needle in haystack:
         return haystack.count(needle)
     return 1
+
+
+# Field names the two gates treat as handled: everything with a dedicated
+# matcher in match_summary, plus pos_prompt and neg_prompt, which are emitted
+# badge labels with no input matcher of their own (listed since the original
+# tuples, so typing them as a field scopes to nothing rather than falling
+# into the deep search). A new matcher only has to extend this set once for
+# both gates to honour it.
+_HANDLED_FIELDS = frozenset({
+    "app", "source_app", "model", "vae", "clip", "lora", "sampler",
+    "controlnet", "prompt", "keyword", "pos_prompt", "neg_prompt",
+    "mmaudio", "sampling", "adetailer", "upscaling", "interpolation",
+    "fileinfo", "extra", "workflow_nodes",
+})
+
+
+def _entry_hits(entry: dict, value: str) -> int:
+    """Total hits across one dict's keys and values; a key-name match with no
+    value hit counts once via _count_hits."""
+    count = 0
+    for k, v in entry.items():
+        sv = str(v).lower()
+        if value in k.lower() or value in sv:
+            count += _count_hits(sv, value)
+    return count
 
 
 def match_item(s: dict | None, relpath: str, tags: list[dict], mode: str) -> list[dict] | None:
@@ -54,13 +76,11 @@ def match_item(s: dict | None, relpath: str, tags: list[dict], mode: str) -> lis
         elif s:
             tag_matched_fields = match_summary(s, field, value, node_classes)
 
-        # Fallback string check against the path, so free-text searches also
-        # hit the filename.
+        # Free-text searches also hit the filename.
         if not tag_matched_fields and field == "any" and value and value in relpath.lower():
             tag_matched_fields = [{"field": "filename", "count": relpath.lower().count(value)}]
 
         if is_exclude:
-            # Exclude tag: file passes if term is NOT found
             tag_checks.append(len(tag_matched_fields) == 0)
         else:
             if tag_matched_fields:
@@ -78,7 +98,7 @@ def match_item(s: dict | None, relpath: str, tags: list[dict], mode: str) -> lis
 
 
 def match_summary(s: dict, field: str, value: str, node_classes: list | None = None) -> list[dict]:
-    """Check if a summary dict matches a search query. Returns list of {field, count} for ALL matching fields.
+    """Returns a list of {field, count} for ALL matching fields.
 
     ``node_classes`` scopes a ``workflow_nodes`` search to nodes whose
     class_type or title is in the list. The frontend sends it when the typed
@@ -176,11 +196,7 @@ def match_summary(s: dict, field: str, value: str, node_classes: list | None = N
     if field in ("mmaudio", "any"):
         mma = s.get("mmaudio")
         if isinstance(mma, dict):
-            count = 0
-            for k, v in mma.items():
-                sv = str(v).lower()
-                if value in k.lower() or value in sv:
-                    count += _count_hits(sv, value)
+            count = _entry_hits(mma, value)
             if count:
                 results.append({"field": "mmaudio", "count": count})
 
@@ -198,56 +214,25 @@ def match_summary(s: dict, field: str, value: str, node_classes: list | None = N
                     if value in k.lower() or value in sv:
                         results.append({"field": "sampling", "count": _count_hits(sv, value)})
                         break
-        # Also check top-level sampling-related keys
         for tk in ("clip_skip", "shift", "sampling_type"):
             tv = s.get(tk)
             if tv is not None and value in str(tv).lower():
                 results.append({"field": "sampling", "count": 1})
 
-    if field in ("adetailer", "any"):
-        ads = s.get("adetailer", [])
-        if isinstance(ads, list):
-            for ad in ads:
-                if not isinstance(ad, dict):
-                    continue
-                count = 0
-                for k, v in ad.items():
-                    sv = str(v).lower()
-                    if value in k.lower() or value in sv:
-                        count += _count_hits(sv, value)
-                if count:
-                    results.append({"field": "adetailer", "count": count})
-
-    if field in ("upscaling", "any"):
-        ups = s.get("upscaling", [])
-        if isinstance(ups, list):
-            for up in ups:
-                if not isinstance(up, dict):
-                    continue
-                count = 0
-                for k, v in up.items():
-                    sv = str(v).lower()
-                    if value in k.lower() or value in sv:
-                        count += _count_hits(sv, value)
-                if count:
-                    results.append({"field": "upscaling", "count": count})
-
-    if field in ("interpolation", "any"):
-        ips = s.get("interpolation", [])
-        if isinstance(ips, list):
-            for ip in ips:
-                if not isinstance(ip, dict):
-                    continue
-                count = 0
-                for k, v in ip.items():
-                    sv = str(v).lower()
-                    if value in k.lower() or value in sv:
-                        count += _count_hits(sv, value)
-                if count:
-                    results.append({"field": "interpolation", "count": count})
+    # List sections score one result per entry; the per-field merge below
+    # combines them into one badge.
+    for sec in ("adetailer", "upscaling", "interpolation"):
+        if field in (sec, "any"):
+            entries = s.get(sec, [])
+            if isinstance(entries, list):
+                for e in entries:
+                    if not isinstance(e, dict):
+                        continue
+                    count = _entry_hits(e, value)
+                    if count:
+                        results.append({"field": sec, "count": count})
 
     if field in ("fileinfo", "any"):
-        # File info is stored at top-level: resolution, codec, fps, duration, etc.
         for fk in ("resolution", "codec", "fps", "total_frames", "duration", "duration_seconds"):
             fv = s.get(fk)
             if fv is not None and value in str(fv).lower():
@@ -256,17 +241,11 @@ def match_summary(s: dict, field: str, value: str, node_classes: list | None = N
     if field in ("extra", "any"):
         extra = s.get("extra", {})
         if isinstance(extra, dict):
-            count = 0
-            for k, v in extra.items():
-                sv = str(v).lower()
-                if value in k.lower() or value in sv:
-                    count += _count_hits(sv, value)
+            count = _entry_hits(extra, value)
             if count:
                 results.append({"field": "extra", "count": count})
 
     if field in ("workflow_nodes", "any"):
-        # Search ALL workflow nodes for a name or param key/value match, or
-        # only the node_classes subset when the tag carries one.
         wanted = {str(c).lower() for c in node_classes} if node_classes else None
         nodes = s.get("workflow_nodes", [])
         if isinstance(nodes, list):
@@ -281,10 +260,8 @@ def match_summary(s: dict, field: str, value: str, node_classes: list | None = N
                 node_display = node.get("title") or node.get("class_type") or "Node"
                 node_name_lower = node_display.lower()
                 count = 0
-                # Match against the node name itself (title / class_type)
                 if value and value in node_name_lower:
                     count += 1
-                # Also match against param keys and values
                 params = node.get("params", {})
                 if isinstance(params, dict):
                     for k, v in params.items():
@@ -294,11 +271,10 @@ def match_summary(s: dict, field: str, value: str, node_classes: list | None = N
                 if count:
                     results.append({"field": node_display, "count": count})
 
-    if field not in ("any", "app", "source_app", "model", "vae", "clip", "lora", "sampler", "controlnet", "prompt", "keyword", "pos_prompt", "neg_prompt",
-                     "mmaudio", "sampling", "adetailer", "upscaling", "interpolation", "fileinfo", "extra", "workflow_nodes"):
-        # Check if field matches a workflow node name. Match against BOTH class_type
+    if field != "any" and field not in _HANDLED_FIELDS:
+        # An unrecognized field may name a workflow node. Match BOTH class_type
         # and title (case-insensitively): the layout editor keys node paths by
-        # class_type, but a node may carry a custom title, and either should match.
+        # class_type, while a node may carry a custom title, and either counts.
         nodes = s.get("workflow_nodes", [])
         if isinstance(nodes, list):
             clean_field = field.replace("workflow nodes::", "").strip().lower()
@@ -340,15 +316,13 @@ def match_summary(s: dict, field: str, value: str, node_classes: list | None = N
     # Deep recursive search (only for 'any' or unrecognized fields).
     # Skip when an unrecognized field was already matched as a workflow-node
     # name above, since running both could count the same hit twice.
-    if field == "any" or (not results and field not in ("model", "vae", "clip", "lora", "sampler", "controlnet", "prompt", "keyword", "pos_prompt", "neg_prompt",
-                                                        "app", "source_app", "mmaudio", "sampling", "adetailer", "upscaling", "interpolation",
-                                                        "fileinfo", "extra", "workflow_nodes")):
+    if field == "any" or (not results and field not in _HANDLED_FIELDS):
         def _deep_search(obj: Any, is_root: bool = False) -> int:
             matches = 0
             if isinstance(obj, dict):
                 for k, v in obj.items():
                     if is_root and field == "any" and k in checked_keys:
-                        continue  # a specific matcher above already handled this key
+                        continue
                     # The scalar mirrors initial_images[0] only in summaries
                     # that carry the list; skip it just then so a source
                     # filename is not counted twice. A pre-list summary has the

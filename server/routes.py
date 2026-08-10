@@ -6,8 +6,6 @@ import hashlib
 import json
 import logging
 import os
-import shutil
-import subprocess
 import threading
 import time
 from concurrent.futures import ThreadPoolExecutor
@@ -29,20 +27,21 @@ from .search import match_item
 from .security import AllowedRoot, make_root_id, safe_join
 
 # Two dedicated worker pools, split by latency class, isolate gallery work from
-# ComfyUI's shared default executor and from each other (so a long scan or ffmpeg
-# job can't head-of-line-block interactive work).
+# ComfyUI's shared default executor and from each other (so a long scan or video
+# decode can't head-of-line-block interactive work).
 #
 # _SCAN_EXECUTOR: minutes-long whole-library work (incremental scans, meta-key
 #   aggregation, removed-root purges). 2 workers keeps disk/SQLite contention bounded.
 # _IO_EXECUTOR: interactive per-item work (image/video thumbnails, search,
-#   new-file processing). 4 workers; ffmpeg is still capped at 2 by _FFMPEG_SEM,
-#   so video jobs can never occupy the whole pool.
+#   new-file processing). 4 workers; video jobs are capped at 2 by
+#   _VIDEO_THUMB_GATE before they are ever submitted, so they can never occupy
+#   the whole pool.
 # The list_all payload build stays on the DEFAULT executor so gallery opens
 # never queue behind either pool.
 _SCAN_EXECUTOR = ThreadPoolExecutor(max_workers=2, thread_name_prefix="sbg-scan")
 _IO_EXECUTOR = ThreadPoolExecutor(max_workers=4, thread_name_prefix="sbg-io")
 # Response deflate gets its own tiny pool: on _IO_EXECUTOR a finished response's
-# compression could queue behind a running ffmpeg job, delaying first byte by
+# compression could queue behind a running video decode, delaying first byte by
 # seconds for millisecond-scale work.
 _ZLIB_EXECUTOR = ThreadPoolExecutor(max_workers=2, thread_name_prefix="sbg-zlib")
 
@@ -111,7 +110,6 @@ threading.Thread(target=_gc_thumbs, daemon=True).start()
 
 
 def _thumb_hash(full_path: str, size: int) -> str:
-    """Stable hash key for a thumbnail: based on path + mtime + size."""
     try:
         mtime = os.path.getmtime(full_path)
     except OSError:
@@ -120,12 +118,10 @@ def _thumb_hash(full_path: str, size: int) -> str:
 
 
 def _video_thumb_path(full_path: str, size: int = 512) -> Path:
-    """Get the cache path for a video thumbnail."""
     return _THUMB_DIR / f"v_{_thumb_hash(full_path, size)}.jpg"
 
 
 def _image_thumb_path(full_path: str, size: int = 512) -> Path:
-    """Get the cache path for an image thumbnail."""
     return _THUMB_DIR / f"i_{_thumb_hash(full_path, size)}.jpg"
 
 
@@ -143,97 +139,111 @@ def _thumb_url(rid_q: str, rp_q: str, size: int, kind: str, mtime) -> str | None
     return None
 
 
-# Cap concurrent ffmpeg thumbnail jobs. During a full reindex the CPU is
-# saturated; unbounded parallel ffmpeg spawns then time out en masse, producing
-# waves of broken video thumbnails.
-_FFMPEG_SEM = threading.Semaphore(2)
+def _client_item(root_id, relpath, ext, kind, size, mtime, ctime, thumb_size,
+                 rid_q, *, filename=None, subfolder=None, w=None, h=None,
+                 has_thumb=None):
+    """The wire shape the list endpoints return for one file. Callers differ
+    only in `has_thumb`: list_all omits it, the delta forms send it.
 
-# Async-level gate matching _FFMPEG_SEM: acquired BEFORE submitting a video job
-# to _IO_EXECUTOR, so excess video requests wait on the event loop (free) instead
-# of occupying pool workers while blocked on the threading semaphore. A burst of
-# video thumbnails must never starve image thumbs and search of executor slots.
-_FFMPEG_GATE = asyncio.Semaphore(2)
+    Back-compat: `mtime` doubles as the default sort field and carries the
+    CREATION time (some file managers update the real mtime on viewing);
+    `mtime_real` carries the true modification time and drives the
+    content-addressed thumb/file URLs. filename/subfolder are derived from
+    relpath when absent; DB-backed callers pass the stored columns so the
+    whole-library build skips the per-row derivation."""
+    sort_time = ctime or mtime
+    real = mtime or ctime
+    item = {
+        "root_id": root_id,
+        "relpath": relpath,
+        "filename": os.path.basename(relpath) if filename is None else filename,
+        "subfolder": (os.path.dirname(relpath).replace("\\", "/")
+                      if subfolder is None else subfolder),
+        "ext": ext,
+        "kind": kind,
+        "size": size,
+        "mtime": sort_time,
+        "ctime": sort_time,
+        "mtime_real": real,
+        "thumb_url": _thumb_url(rid_q, quote(relpath), thumb_size, kind, real),
+    }
+    if has_thumb is not None:
+        item["has_thumb"] = has_thumb
+    # Dimensions drive the aspect-ratio thumbnail layout.
+    if w and h:
+        item["w"] = w
+        item["h"] = h
+    return item
+
+
+# Acquired BEFORE submitting to _IO_EXECUTOR so queued video jobs wait on the
+# event loop instead of holding pool workers.
+_VIDEO_THUMB_GATE = asyncio.Semaphore(2)
 
 
 async def _video_thumb_off_loop(full, tp, size):
-    async with _FFMPEG_GATE:
+    async with _VIDEO_THUMB_GATE:
         loop = asyncio.get_running_loop()
         return await loop.run_in_executor(
             _IO_EXECUTOR, lambda: _generate_video_thumbnail(full, tp, size))
 
-# Resolved ffmpeg path, cached after the first lookup.
-_FFMPEG_CACHE: list[str | None] = []
-
-
-def _find_ffmpeg() -> str | None:
-    """Locate an ffmpeg binary for video-thumbnail generation.
-
-    Tries PATH and the FFMPEG env var first, then the binary bundled by the
-    imageio-ffmpeg dependency (so thumbnails work with no separate install),
-    then common system locations. Returns None if nothing is found, in which
-    case the caller skips thumbnail generation. Cached after the first lookup.
-    """
-    if _FFMPEG_CACHE:
-        return _FFMPEG_CACHE[0]
-    found = shutil.which("ffmpeg") or os.environ.get("FFMPEG")
-    if not found:
-        try:
-            import imageio_ffmpeg
-            exe = imageio_ffmpeg.get_ffmpeg_exe()
-            if exe and os.path.isfile(exe):
-                found = exe
-        except Exception:
-            pass
-    if not found:
-        name = "ffmpeg.exe" if os.name == "nt" else "ffmpeg"
-        home = os.path.expanduser("~")
-        if os.name == "nt":
-            candidates = [
-                os.path.join(home, "AppData", "Local", "Microsoft", "WinGet", "Links", name),
-                r"C:\ffmpeg\bin\ffmpeg.exe",
-                r"C:\Program Files\ffmpeg\bin\ffmpeg.exe",
-            ]
-        else:
-            candidates = ["/usr/bin/ffmpeg", "/usr/local/bin/ffmpeg", "/opt/homebrew/bin/ffmpeg"]
-        for c in candidates:
-            if c and os.path.isfile(c):
-                found = c
-                break
-    _FFMPEG_CACHE.append(found)
-    return found
-
 
 def _generate_video_thumbnail(full_path: str, out_path: Path, size: int = 512) -> bool:
-    """Generate a thumbnail for a video file using ffmpeg.
-
-    Writes to a temp file and renames on success, so a timed-out/killed
-    ffmpeg can never leave a partial .jpg that would be served forever.
-    """
+    """Atomic temp-file + rename, same rationale as the image path. Returns
+    False on any failure; the caller then shows the video-file icon."""
     if out_path.exists():
         return True
-    ffmpeg = _find_ffmpeg()
-    if ffmpeg is None:
+    try:
+        import av
+        from PIL import Image
+    except Exception:
         return False
-    tmp_path = out_path.with_name("tmp_" + out_path.name)
+    # Concurrent generations of one file must not share a temp path.
+    tmp_path = out_path.with_name(f"tmp_{threading.get_ident()}_{out_path.name}")
     try:
         out_path.parent.mkdir(parents=True, exist_ok=True)
-        with _FFMPEG_SEM:
-            result = subprocess.run(
-                [
-                    # -ss BEFORE -i = fast input seeking (jump straight to the
-                    # keyframe) instead of decoding 0.5s of video first.
-                    ffmpeg, "-y", "-ss", "0.5", "-i", str(full_path),
-                    "-vframes", "1",
-                    "-vf", f"scale={size}:{size}:force_original_aspect_ratio=decrease:flags=lanczos",
-                    "-q:v", "2",
-                    str(tmp_path),
-                ],
-                capture_output=True, timeout=20,
-            )
-        ok = result.returncode == 0 and tmp_path.exists() and tmp_path.stat().st_size > 0
-        if ok:
+        with av.open(full_path) as container:
+            vstreams = container.streams.video
+            if not vstreams:
+                return False
+            stream = vstreams[0]
+            # The slice-threading default gains nothing on one-slice-per-frame
+            # streams.
+            stream.thread_type = "AUTO"
+            # av.time_base is ticks per second; the backward seek lands on the
+            # keyframe at or before 0.5s.
+            try:
+                container.seek(int(0.5 * av.time_base), backward=True)
+            except Exception:
+                pass
+            frame = None
+            for walked, cand in enumerate(container.decode(stream)):
+                frame = cand
+                if cand.time is not None and cand.time >= 0.5:
+                    break
+                # Bounds the walk when frames carry no timestamps.
+                if walked >= 240:
+                    break
+            if frame is None:
+                return False
+            # Scale in swscale so a full-resolution frame never reaches Python.
+            scale = min(size / frame.width, size / frame.height)
+            nw = max(1, round(frame.width * scale))
+            nh = max(1, round(frame.height * scale))
+            try:
+                small = frame.reformat(width=nw, height=nh, format="rgb24",
+                                       interpolation="LANCZOS")
+            except Exception:
+                small = frame.reformat(width=nw, height=nh, format="rgb24")
+            img = small.to_image()
+            # Rotate after scaling; the square target box keeps the fit valid.
+            rot = round((getattr(frame, "rotation", 0) or 0) / 90) * 90 % 360
+            if rot:
+                img = img.transpose(getattr(Image, f"ROTATE_{rot}"))
+        img.save(str(tmp_path), format="JPEG", quality=85)
+        if tmp_path.exists() and tmp_path.stat().st_size > 0:
             os.replace(tmp_path, out_path)
-        return ok and out_path.exists()
+        return out_path.exists()
     except Exception:
         return False
     finally:
@@ -251,7 +261,8 @@ def _generate_image_thumbnail(full_path: str, out_path: Path, size: int = 512) -
     """
     if out_path.exists():
         return True
-    tmp_path = out_path.with_name("tmp_" + out_path.name)
+    # Concurrent generations of one file must not share a temp path.
+    tmp_path = out_path.with_name(f"tmp_{threading.get_ident()}_{out_path.name}")
     try:
         from PIL import Image, ImageOps
         out_path.parent.mkdir(parents=True, exist_ok=True)
@@ -286,9 +297,7 @@ def _output_root() -> AllowedRoot:
 
 
 def _extra_root_id(raw: str) -> tuple[str, str]:
-    """Normalize a configured extra-root path and derive its root_id.
-
-    The single derivation for extra-root ids: rows are indexed under these ids
+    """The single derivation for extra-root ids: rows are indexed under these ids
     and the removed-root purge deletes by them, so this normalization must not
     be duplicated (a divergent copy would make the purge silently stop matching)."""
     p = os.path.normpath(os.path.expandvars(os.path.expanduser(raw.strip())))
@@ -366,10 +375,8 @@ def _find_root(root_id: str) -> AllowedRoot | None:
 # DB-backed metadata reader helper
 
 def _read_metadata_for_db(full_path: str) -> dict | None:
-    """Read metadata from a file and return only the compact summary dict.
-
-    Stores only the parsed summary (~1-5 KB) and leaves out the full prompt,
-    workflow, parsed, and raw_text blobs, which can be 50-200 KB each.
+    """Return only the compact summary dict, leaving out the much larger
+    prompt, workflow, parsed, and raw_text blobs so the index stays small.
     Returns None if parsing fails entirely."""
     cfg = load_config()
     try:
@@ -395,12 +402,11 @@ _SETTINGS_FILENAME = "sidebar_gallery_settings.json"
 
 
 def _settings_path() -> Path:
-    """Return the path to the user settings JSON file."""
     return Path(__file__).resolve().parents[1] / _SETTINGS_FILENAME
 
 
 def _read_settings() -> dict:
-    """Read settings from disk. Returns {} if file doesn't exist."""
+    """Returns {} when the file is missing, unreadable, or not a JSON object."""
     p = _settings_path()
     if not p.exists():
         return {}
@@ -421,7 +427,7 @@ def _write_settings(data: dict) -> None:
     tmp.replace(p)
 
 
-# In-memory settings state. The file is a quarter megabyte dominated by
+# In-memory settings state. The file is large and dominated by stored
 # layouts; reads answer from memory and writes serialize in the executor. The
 # lock makes concurrent per-key posts (the page-hide beacons fire in parallel)
 # a safe read-modify-write. An out-of-band edit to the file is picked up
@@ -480,7 +486,6 @@ async def _json_dict_body(request: web.Request):
 
 @routes.get("/sidebar_gallery/settings")
 async def get_settings(request: web.Request):
-    """Return the full user settings JSON."""
     key = request.query.get("key")
     async with _settings_lock:
         settings = await _settings_load_locked()
@@ -511,15 +516,14 @@ async def post_settings(request: web.Request):
         return err
 
     if "key" in body and "value" in body:
-        # Per-key update. Store the key literally (flat) without splitting on
-        # dots, so "SBG.Layouts" is a top-level key the client reads back verbatim.
+        # Store the key literally (flat) without splitting on dots, so
+        # "SBG.Layouts" is a top-level key the client reads back verbatim.
         async with _settings_lock:
             settings = await _settings_load_locked()
             settings[body["key"]] = body["value"]
             await _settings_write_locked()
         return web.json_response({"ok": True, "key": body["key"]})
     elif "settings" in body and isinstance(body["settings"], dict):
-        # Full replacement with explicit "settings" key
         async with _settings_lock:
             await _settings_replace_locked(body["settings"])
         return web.json_response({"ok": True, "replaced": True})
@@ -565,9 +569,7 @@ def _maybe_stamp_global_parser_version():
 
 
 def _start_full_reindex(roots: list[AllowedRoot]) -> bool:
-    """Start a background full reindex over the given roots.
-
-    Returns False if one is already running. Each root's parser stamp is
+    """Returns False if one is already running. Each root's parser stamp is
     written as that root completes; the global stamp is written only once
     every configured root (offline ones included) carries the current stamp,
     so an interrupted run resumes where it left off on the next startup and
@@ -609,10 +611,7 @@ def _start_full_reindex(roots: list[AllowedRoot]) -> bool:
 
 @routes.post("/sidebar_gallery/rebuild_index")
 async def rebuild_index(request: web.Request):
-    """Start a full background reindex of all roots.
-
-    Returns immediately. Frontend polls /reindex_progress for status.
-    """
+    """Returns immediately. The frontend polls /reindex_progress for status."""
     roots = _all_roots()
     if not _start_full_reindex(roots):
         return web.json_response({"status": "already_running",
@@ -628,22 +627,25 @@ async def reindex_progress(request: web.Request):
     return web.json_response(media_db.get_progress())
 
 
+def _config_payload(cfg) -> dict:
+    """The /config response body, shared by GET and POST so a new field can
+    never appear in one handler's response and silently miss the other's."""
+    return {
+        "extra_roots": cfg.extra_roots,
+        "excluded_dirs": cfg.excluded_dirs,
+        "index_hidden_dirs": cfg.index_hidden_dirs,
+        "auto_refresh_interval_s": cfg.auto_refresh_interval_s,
+        "roots": [{"id": r.root_id, "label": r.label, "path": r.path if r.root_id != "output" else None}
+                  for r in _all_roots()],
+        # Catalog default titles keyed by section_id: lets the frontend
+        # recognize layout-editor retitles for search-name resolution.
+        "section_titles": schema.section_titles(),
+    }
+
+
 @routes.get("/sidebar_gallery/config")
 async def get_config(request: web.Request):
-    cfg = load_config()
-    roots = _all_roots()
-    return _json_gz(
-        {
-            "extra_roots": cfg.extra_roots,
-            "excluded_dirs": cfg.excluded_dirs,
-            "index_hidden_dirs": cfg.index_hidden_dirs,
-            "auto_refresh_interval_s": cfg.auto_refresh_interval_s,
-            "roots": [{"id": r.root_id, "label": r.label, "path": r.path if r.root_id != "output" else None} for r in roots],
-            # Catalog default titles keyed by section_id: lets the frontend
-            # recognize layout-editor retitles for search-name resolution.
-            "section_titles": schema.section_titles(),
-        }
-    )
+    return _json_gz(_config_payload(load_config()))
 
 
 # Strong references to fire-and-forget background tasks (asyncio keeps tasks
@@ -662,7 +664,7 @@ async def _purge_removed_roots(root_ids: set[str]) -> None:
     # root). Purging after it ends is always clean: the rebuild worker also
     # skips roots that left the config, and even a root it already rewrote is
     # simply deleted here afterwards. The cap is a safety valve for a stuck
-    # progress flag; an hour exceeds any observed rebuild by far.
+    # progress flag.
     waited = 0.0
     while media_db.is_full_reindex_running() and waited < 3600.0:
         await asyncio.sleep(1.0)
@@ -713,8 +715,8 @@ async def post_config(request: web.Request):
 
     # Purge index rows for extra roots removed from config, so a removed folder
     # does not linger in the index (or re-appear instantly when re-added).
-    # Diffing old vs new config (not _all_roots) keeps a temporarily-offline
-    # network root's rows intact; only genuinely removed roots are purged.
+    # Diffing old config against new, rather than _all_roots, keeps a
+    # temporarily-offline network root's rows intact.
     # The purge runs as a background task: it first cancels + drains any in-flight
     # scan of the removed root (whose later batches would otherwise re-insert rows
     # after the purge, orphaning them forever), then deletes on a worker thread
@@ -722,23 +724,11 @@ async def post_config(request: web.Request):
     removed_ids = ({_extra_root_id(p)[0] for p in old_cfg.extra_roots}
                    - {_extra_root_id(p)[0] for p in cfg.extra_roots})
     if removed_ids:
-        # Keep a strong reference: the event loop holds tasks only weakly, so
-        # a bare create_task could be garbage-collected mid-purge.
         task = asyncio.create_task(_purge_removed_roots(removed_ids))
         _BG_TASKS.add(task)
         task.add_done_callback(_BG_TASKS.discard)
 
-    roots = _all_roots()
-    return web.json_response(
-        {
-            "extra_roots": cfg.extra_roots,
-            "excluded_dirs": cfg.excluded_dirs,
-            "index_hidden_dirs": cfg.index_hidden_dirs,
-            "auto_refresh_interval_s": cfg.auto_refresh_interval_s,
-            "roots": [{"id": r.root_id, "label": r.label, "path": r.path if r.root_id != "output" else None} for r in roots],
-            "section_titles": schema.section_titles(),
-        }
-    )
+    return web.json_response(_config_payload(cfg))
 
 
 # Subfolder listing
@@ -752,7 +742,6 @@ async def get_subfolders(request: web.Request):
         return web.Response(status=404)
 
     raw_folders = media_db.get_subfolders(root_id)
-    # Also add parent folders for full tree
     folders = set(raw_folders)
     for sf in raw_folders:
         parts = sf.split("/")
@@ -796,8 +785,8 @@ _inflight_scans: dict[str, _ScanHandle] = {}
 
 
 def _clear_inflight_scan(fut: asyncio.Future, root_id: str) -> None:
-    """Done-callback: drop the tracked handle once its scan finishes, but only if
-    it's still the current one for this root, so a newer scan isn't cleared by mistake."""
+    """Clears the tracked handle only while it is still the current one for this
+    root, so a newer scan is not dropped by mistake."""
     handle = _inflight_scans.get(root_id)
     if handle is not None and handle.future is fut:
         _inflight_scans.pop(root_id, None)
@@ -843,7 +832,7 @@ def _maybe_scan(root, force: bool, interval_s: float | None = None):
         return None
     inflight = _inflight_scans.get(root_id)
     if inflight is not None and not inflight.future.done():
-        return inflight.future  # a scan is already running for this root; reuse it
+        return inflight.future
     now = time.time()
     cooldown = _SCAN_COOLDOWN_S if interval_s is None else interval_s
     recently_scanned = (now - _last_scan_times.get(root_id, 0)) < cooldown
@@ -894,41 +883,21 @@ def _maybe_scan(root, force: bool, interval_s: float | None = None):
 
 
 def _build_list_all(root, thumb_size):
-    """Read rows for a root and build the list_all payload. Runs in a worker
-    thread so the DB read + whole-library item build never block the event loop."""
+    """Runs in a worker thread so the DB read and whole-library item build
+    never block the event loop."""
     root_id = root.root_id
     # Version + rows from one SQLite snapshot: the stamp matches the row set even
     # while a background scan is committing (see get_all_with_version).
     db_version, db_items = media_db.get_all_with_version(root_id)
     rid_q = quote(root_id)
-    out_items = []
-    for row in db_items:
-        relpath = row["relpath"]
-        kind = row["kind"]
-        rp_q = quote(relpath)
-
-        thumb_url = _thumb_url(rid_q, rp_q, thumb_size, kind, row["mtime"] or row["ctime"])
-
-        item = {
-            "root_id": row["root_id"],
-            "relpath": relpath,
-            "filename": row["filename"],
-            "subfolder": row["subfolder"],
-            "ext": row["ext"],
-            "kind": kind,
-            "size": row["size"],
-            "mtime": row["ctime"] or row["mtime"],  # Back-compat: default sort field (creation time)
-            "ctime": row["ctime"] or row["mtime"],  # File creation time
-            "mtime_real": row["mtime"] or row["ctime"],  # File modification time
-            "thumb_url": thumb_url,
-        }
-        # Include dimensions for AR thumbnail layout (only when available)
-        w, h = row.get("w"), row.get("h")
-        if w and h:
-            item["w"] = w
-            item["h"] = h
-        out_items.append(item)
-    first_time = media_db.is_empty()
+    out_items = [
+        _client_item(row["root_id"], row["relpath"], row["ext"], row["kind"],
+                     row["size"], row["mtime"], row["ctime"], thumb_size, rid_q,
+                     filename=row["filename"], subfolder=row["subfolder"],
+                     w=row.get("w"), h=row.get("h"))
+        for row in db_items
+    ]
+    first_time = not media_db.has_any_files()
     return {
         "root": {"id": root.root_id, "label": root.label},
         "total": len(out_items),
@@ -968,7 +937,7 @@ def _json_gz(payload):
 
 def _encode_json(payload, accept_gzip: bool) -> tuple[bytes, bool]:
     """json.dumps + gzip, meant to run off the event loop (in a worker).
-    For a large library's list_all payload (many megabytes), serializing and
+    For a large library's list_all payload, serializing and
     deflating on the loop stalls every websocket update and HTTP request
     ComfyUI serves."""
     body = json.dumps(payload).encode("utf-8")
@@ -998,11 +967,8 @@ def _build_list_all_encoded(root, thumb_size, accept_gzip):
 
 @routes.get("/sidebar_gallery/list_all")
 async def list_all_media(request: web.Request):
-    """Return ALL items for a root_id from SQLite DB.
-
-    Metadata is fetched on-demand via /metadata endpoint (cached in IndexedDB).
-    On first call (empty DB), triggers incremental scan.
-    """
+    """The payload carries no metadata: the client fetches that per item from
+    /metadata and caches it in IndexedDB."""
     root_id = request.rel_url.query.get("root_id", "output")
     root = _find_root(root_id)
     if root is None:
@@ -1019,7 +985,7 @@ async def list_all_media(request: web.Request):
     reindexing = media_db.is_full_reindex_running()
     scan_future = _maybe_scan(root, force)
     if force:
-        await _await_scan(scan_future)  # wait so the response reflects the rescan
+        await _await_scan(scan_future)
 
     loop = asyncio.get_running_loop()
     accept_gzip = _accepts_gzip(request)
@@ -1058,7 +1024,7 @@ async def poll_changes(request: web.Request) -> web.Response:
         # stray polls), floored at the snappy cooldown.
         refresh_s = float(load_config().auto_refresh_interval_s) or _POLL_SCAN_FALLBACK_S
         _maybe_scan(root, force=False,
-                    interval_s=max(_SCAN_COOLDOWN_S, refresh_s))  # fire and forget
+                    interval_s=max(_SCAN_COOLDOWN_S, refresh_s))
     loop = asyncio.get_running_loop()
     # Version/count/epoch each open a short-lived sqlite connection; keep those
     # PRAGMA+SELECT round-trips off the event loop.
@@ -1083,9 +1049,8 @@ async def poll_changes(request: web.Request) -> web.Response:
 
 
 def _process_new_files(root, root_id: str, files: list, thumb_size: int) -> list[dict]:
-    """files[]-form worker: stat each reported file, parse its metadata,
-    upsert it, and build its response item. Runs on _IO_EXECUTOR because the
-    metadata parse alone can take tens of ms per file."""
+    """The files[] form's worker. Runs on _IO_EXECUTOR because the per-file
+    stat, metadata parse and upsert are blocking disk and CPU work."""
     out_items: list[dict] = []
     conn = media_db._get_conn()
     try:
@@ -1120,16 +1085,11 @@ def _process_new_files(root, root_id: str, files: list, thumb_size: int) -> list
             mtime = float(st.st_mtime)
             ctime = float(st.st_ctime)
 
-            # Read metadata and insert into DB
             meta_dict = _read_metadata_for_db(full)
             meta_json = json.dumps(meta_dict) if meta_dict else None
             media_db.upsert_file(conn, root_id, relpath, ext, kind, size, mtime, meta_json, ctime=ctime)
 
-            rid_q = quote(root.root_id)
-            rp_q = quote(relpath)
-            thumb_url = _thumb_url(rid_q, rp_q, thumb_size, kind, mtime)
             has_thumb = False
-
             try:
                 tp = (_image_thumb_path(full, thumb_size) if kind == "image"
                       else _video_thumb_path(full, thumb_size))
@@ -1137,31 +1097,11 @@ def _process_new_files(root, root_id: str, files: list, thumb_size: int) -> list
             except Exception:
                 pass
 
-            item = {
-                "root_id": root_id,
-                "relpath": relpath,
-                "filename": os.path.basename(relpath),
-                "subfolder": os.path.dirname(relpath).replace("\\", "/"),
-                "ext": ext,
-                "kind": kind,
-                "size": size,
-                "mtime": ctime,  # Back-compat: default sort field (creation time)
-                "ctime": ctime,
-                "mtime_real": mtime,
-                "thumb_url": thumb_url,
-                "has_thumb": has_thumb,
-            }
-            # Include dimensions for aspect-ratio thumbnail layout so newly
-            # generated items don't render as zoomed squares.
-            try:
-                _w = meta_dict.get("width") if isinstance(meta_dict, dict) else None
-                _h = meta_dict.get("height") if isinstance(meta_dict, dict) else None
-                if _w and _h:
-                    item["w"] = _w
-                    item["h"] = _h
-            except Exception:
-                pass
-            out_items.append(item)
+            _w = meta_dict.get("width") if isinstance(meta_dict, dict) else None
+            _h = meta_dict.get("height") if isinstance(meta_dict, dict) else None
+            out_items.append(_client_item(
+                root_id, relpath, ext, kind, size, mtime, ctime, thumb_size,
+                quote(root.root_id), w=_w, h=_h, has_thumb=has_thumb))
 
         conn.commit()
     finally:
@@ -1170,37 +1110,18 @@ def _process_new_files(root, root_id: str, files: list, thumb_size: int) -> list
 
 
 def _build_since_items(root, thumb_size: int, since: float) -> list[dict]:
-    """since-form worker: build response items for every DB row newer than
-    `since`. Runs on _IO_EXECUTOR because after a long absence this can be
-    thousands of items. The mtime filter runs in SQL (idx_root_mtime), so the
+    """The since form's worker. Runs on _IO_EXECUTOR because a long absence
+    makes this a large build. The mtime filter runs in SQL (idx_root_mtime), so the
     routine few-item delta reads a few rows instead of dragging the whole
     table (and its metadata json_extract) through Python first."""
-    out_items: list[dict] = []
     rid_q = quote(root.root_id)
-    for row in media_db.get_rows_since(root.root_id, since):
-        relpath = row["relpath"]
-        kind = row["kind"]
-        rp_q = quote(relpath)
-        item = {
-            "root_id": row["root_id"],
-            "relpath": relpath,
-            "filename": row["filename"],
-            "subfolder": row["subfolder"],
-            "ext": row["ext"],
-            "kind": kind,
-            "size": row["size"],
-            "mtime": row["ctime"] or row["mtime"],  # Back-compat: default sort field (creation time)
-            "ctime": row["ctime"] or row["mtime"],
-            "mtime_real": row["mtime"] or row["ctime"],
-            "thumb_url": _thumb_url(rid_q, rp_q, thumb_size, kind, row["mtime"] or row["ctime"]),
-            "has_thumb": False,
-        }
-        _w, _h = row.get("w"), row.get("h")
-        if _w and _h:
-            item["w"] = _w
-            item["h"] = _h
-        out_items.append(item)
-    return out_items
+    return [
+        _client_item(row["root_id"], row["relpath"], row["ext"], row["kind"],
+                     row["size"], row["mtime"], row["ctime"], thumb_size, rid_q,
+                     filename=row["filename"], subfolder=row["subfolder"],
+                     w=row.get("w"), h=row.get("h"), has_thumb=False)
+        for row in media_db.get_rows_since(root.root_id, since)
+    ]
 
 
 @routes.post("/sidebar_gallery/list_new")
@@ -1232,7 +1153,7 @@ async def list_new_media(request: web.Request):
         # fresh as the version bump that triggered the caller.
         since = float(body.get("since", 0))
         known_version = body.get("known_version")
-        _maybe_scan(root, force=False)  # background freshen; nothing awaits it
+        _maybe_scan(root, force=False)
         # The version this response stamps is read BEFORE the removals, so it
         # can never run ahead of the removals snapshot. A bump landing between
         # the two reads is then re-delivered on the next poll; the reverse
@@ -1250,7 +1171,6 @@ async def list_new_media(request: web.Request):
                 stale = True
             else:
                 removed_relpaths = removals
-        # Return all items newer than `since` from DB (frontend will diff)
         out_items = await loop.run_in_executor(
             _IO_EXECUTOR, _build_since_items, root, thumb_size, since)
 
@@ -1295,7 +1215,7 @@ async def get_metadata(request: web.Request):
 
     relpath_clean = relpath.replace("\\", "/")
 
-    # Fast path: summary_only (DB only, zero disk I/O)
+    # Fast path: answered from the DB with no disk read.
     if summary_only:
         db_row = media_db.get_file(root_id, relpath_clean)
         if db_row and db_row.get("metadata_json"):
@@ -1375,7 +1295,9 @@ async def get_metadata(request: web.Request):
     # websocket) for up to the busy-wait while this handler blocks on it.
     def _backfill():
         try:
-            if not db_row:
+            if db_row and db_row.get("metadata_json"):
+                return
+            if not db_row or summary:
                 _ext = os.path.splitext(relpath_clean)[1].lower()
                 _kind = "video" if _ext in VIDEO_EXTS else "image"
                 with media_db._get_conn() as _conn:
@@ -1383,17 +1305,8 @@ async def get_metadata(request: web.Request):
                                          int(st.st_size), float(st.st_mtime),
                                          json.dumps(summary) if summary else None,
                                          ctime=float(st.st_ctime))
-            elif not db_row.get("metadata_json"):
-                if summary:
-                    _ext = os.path.splitext(relpath_clean)[1].lower()
-                    _kind = "video" if _ext in VIDEO_EXTS else "image"
-                    with media_db._get_conn() as _conn:
-                        media_db.upsert_file(_conn, root_id, relpath_clean, _ext, _kind,
-                                             int(st.st_size), float(st.st_mtime),
-                                             json.dumps(summary),
-                                             ctime=float(st.st_ctime))
-                elif not db_row.get("meta_mtime"):
-                    media_db.mark_meta_attempted(root_id, relpath_clean)
+            elif not db_row.get("meta_mtime"):
+                media_db.mark_meta_attempted(root_id, relpath_clean)
         except Exception:
             pass
 
@@ -1404,10 +1317,9 @@ async def get_metadata(request: web.Request):
 
 @routes.get("/sidebar_gallery/metadata_ondemand")
 async def get_metadata_ondemand(request: web.Request):
-    """Read metadata on-demand from a file path (e.g. ComfyUI input directory).
-
-    Unlike /metadata, this does NOT require the file to be in an indexed root.
-    Used for initial image metadata display.
+    """Unlike /metadata, this does NOT require the file to be in an indexed
+    root: it resolves ComfyUI's own input, output, or temp directory by `type`,
+    which is what lets the Initial Image panel read an input file.
     """
     cfg = load_config()
     filename = request.rel_url.query.get("filename", "")
@@ -1417,7 +1329,6 @@ async def get_metadata_ondemand(request: web.Request):
     if not filename:
         return web.Response(status=400, text="Missing filename")
 
-    # Resolve the file path based on type
     try:
         if ftype == "input":
             base_dir = folder_paths.get_input_directory()
@@ -1551,11 +1462,10 @@ async def get_preview(request: web.Request):
 
     target = _clamped_int(size, 256)
 
-    # Check disk cache first
     cached = _image_thumb_path(full, target)
     if not cached.exists():
         # Generate on a worker thread so PIL decode/encode never blocks the
-        # ComfyUI event loop (matches the list_all_media scan pattern).
+        # ComfyUI event loop.
         loop = asyncio.get_running_loop()
         await loop.run_in_executor(_IO_EXECUTOR, lambda: _generate_image_thumbnail(full, cached, target))
 
@@ -1568,7 +1478,6 @@ async def get_preview(request: web.Request):
             },
         )
 
-    # Fallback: serve original file
     try:
         return web.FileResponse(full)
     except Exception:
@@ -1597,9 +1506,6 @@ async def get_video_thumb(request: web.Request):
 
     tp = _video_thumb_path(full, size)
     if not tp.exists():
-        # ffmpeg can run for up to 20s (see _generate_video_thumbnail's
-        # timeout); the async gate queues excess requests on the event loop and
-        # the worker thread keeps the loop responsive while ffmpeg runs.
         ok = await _video_thumb_off_loop(full, tp, size)
         if not ok:
             return web.Response(status=404)
@@ -1618,7 +1524,6 @@ async def get_video_thumb(request: web.Request):
 
 @routes.post("/sidebar_gallery/generate_thumb")
 async def generate_thumb(request: web.Request) -> web.Response:
-    """Generate a thumbnail on demand and return it."""
     body, err = await _json_dict_body(request)
     if err is not None:
         return err
@@ -1638,8 +1543,8 @@ async def generate_thumb(request: web.Request) -> web.Response:
     if not os.path.isfile(full):
         return web.Response(status=404)
 
-    # Generate off the event loop: ffmpeg/PIL are blocking and the video
-    # path can take seconds (see the GET handlers above).
+    # Generate off the event loop: decoding and PIL are blocking and the
+    # video path can take seconds (see the GET handlers above).
     loop = asyncio.get_running_loop()
     if kind == "video":
         tp = _video_thumb_path(full, size)
@@ -1665,8 +1570,8 @@ async def generate_thumb(request: web.Request) -> web.Response:
 
 
 
-# Search matching lives in server/search.py (match_item / match_summary), a
-# pure, unit-tested module decoupled from this ComfyUI-coupled route handler.
+# Search matching lives in server/search.py (match_item / match_summary), kept
+# pure and decoupled from this ComfyUI-coupled route handler.
 
 
 
@@ -1682,14 +1587,12 @@ async def get_db_version(request: web.Request) -> web.Response:
 
 @routes.get("/sidebar_gallery/status")
 async def get_status(request: web.Request) -> web.Response:
-    """Return index counts and thumbnail info."""
     roots = _all_roots()
     index_counts: dict[str, int] = {}
 
     for root in roots:
         index_counts[root.root_id] = media_db.get_count(root.root_id)
 
-    # Thumbnail stats
     thumb_count = 0
     thumb_bytes = 0
     try:
@@ -1703,7 +1606,6 @@ async def get_status(request: web.Request) -> web.Response:
     except Exception:
         pass
 
-    # DB file stats
     db_path = str(media_db._DB_PATH)
     db_size_mb = 0.0
     try:
@@ -1722,28 +1624,20 @@ async def get_status(request: web.Request) -> web.Response:
             "size_mb": round(float(thumb_bytes) / (1024 * 1024), 1),
             "path": str(_THUMB_DIR),
         },
-        # Surfaces missing ffmpeg (no video thumbnails without it) so the UI can warn
-        # instead of serving broken video thumbnails.
-        "ffmpeg_available": _find_ffmpeg() is not None,
     })
 
 
 def _run_search(root_id, tags, mode, relpaths_filter):
     """CPU-bound metadata scan. Runs in a worker thread (run_in_executor)
     so a full-library search never blocks the ComfyUI event loop."""
-    # Read from the DB: all metadata is already stored as JSON
     if relpaths_filter and isinstance(relpaths_filter, list):
-        # Delta search: only check specific items (near-instant)
         db_rows = media_db.get_items_with_metadata(root_id, relpaths_filter)
     else:
         db_rows = media_db.get_all_with_metadata(root_id)
     total = len(db_rows)
 
     matches = []
-    scanned = 0
-
     for row in db_rows:
-        scanned += 1
         meta_json = row.get("metadata_json")
         relpath = row.get("relpath", "")
 
@@ -1757,16 +1651,14 @@ def _run_search(root_id, tags, mode, relpaths_filter):
         matched_fields = match_item(s, relpath, tags, mode)
         if matched_fields is not None:
             matches.append({"relpath": relpath, "matched_fields": matched_fields})
-    return {"matches": matches, "scanned": scanned, "total": total}
+    # scanned stays in the wire shape for the frontend's status line.
+    return {"matches": matches, "scanned": total, "total": total}
 
 
 @routes.post("/sidebar_gallery/search")
 async def search_metadata(request: web.Request) -> web.Response:
-    """Search through metadata stored in SQLite DB using multi-tag AND/OR logic.
-
-    Reads metadata_json from DB rows (zero disk I/O). The scan runs on a worker
-    thread so a full-library search never blocks the ComfyUI event loop.
-    """
+    """Multi-tag AND/OR matching over the metadata_json already stored in the
+    DB rows, so a search costs no disk read."""
     body, err = await _json_dict_body(request)
     if err is not None:
         return err
@@ -1774,7 +1666,7 @@ async def search_metadata(request: web.Request) -> web.Response:
     tags = body.get("tags", [])
     mode = body.get("mode", "AND").upper()
 
-    # Backwards compatibility check
+    # Legacy single-tag body shape.
     if not tags and "value" in body:
         tags = [{"field": body.get("field", "any").lower(), "value": body.get("value", "").lower()}]
 
@@ -1785,7 +1677,6 @@ async def search_metadata(request: web.Request) -> web.Response:
     if root is None:
         return web.Response(status=404)
 
-    # Optional: filter to specific relpaths (for delta search during active search)
     relpaths_filter = body.get("relpaths")  # list of relpaths to check, or None for full search
     loop = asyncio.get_running_loop()
     result = await loop.run_in_executor(_IO_EXECUTOR, _run_search, root_id, tags, mode, relpaths_filter)
@@ -1800,7 +1691,6 @@ _THEMES_DIR.mkdir(exist_ok=True)
 
 @routes.get("/sidebar_gallery/presets")
 async def _list_presets(request: web.Request) -> web.Response:
-    """List all preset JSON files in the themes directory."""
     presets = []
     for f in sorted(_THEMES_DIR.glob("*.json")):
         try:
@@ -1817,7 +1707,6 @@ async def _list_presets(request: web.Request) -> web.Response:
 
 @routes.get("/sidebar_gallery/preset")
 async def _get_preset(request: web.Request) -> web.Response:
-    """Return the full JSON content of a specific preset file."""
     filename = request.rel_url.query.get("filename", "")
     if not filename:
         return web.json_response({"error": "Missing filename"}, status=400)
@@ -1846,7 +1735,6 @@ async def _save_preset(request: web.Request) -> web.Response:
     if not name:
         return web.json_response({"error": "Missing preset name"}, status=400)
 
-    # Sanitize filename
     safe_name = "".join(c for c in name if c.isalnum() or c in " -_").strip()
     if not safe_name:
         return web.json_response({"error": "Invalid preset name"}, status=400)
@@ -1858,7 +1746,6 @@ async def _save_preset(request: web.Request) -> web.Response:
             filepath.unlink()
         return web.json_response({"ok": True})
 
-    # Save
     data = body.get("data", {})
     data["name"] = name
     if "created" not in data:
