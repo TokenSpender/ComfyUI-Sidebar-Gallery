@@ -250,8 +250,8 @@ function _colorInput(id, fallback, label, tooltip, callback, replaceChannel) {
   swatch.addEventListener("mouseenter", () => { swatch.style.boxShadow = "0 0 0 2px var(--sbg-accent)"; });
   swatch.addEventListener("mouseleave", () => { swatch.style.boxShadow = ""; });
 
-  // Accepts hex or rgba.
-  const text = h("input", { type: "text", class: "sbg-gs-input sbg-gs-input--sm", value: _toRgba(displayColor) });
+  // Accepts hex or rgba. Wide enough for a full rgba(r, g, b, a) value.
+  const text = h("input", { type: "text", class: "sbg-gs-input sbg-gs-input--sm", style: "min-width:26ch", value: _toRgba(displayColor) });
   text.addEventListener("change", () => {
     const v = text.value.trim();
     const pc = parseColor(v);
@@ -341,6 +341,10 @@ function _numberInput(id, fallback, label, tooltip) {
 
 
 function renderAppearance() {
+  // The colour rows attach their panels and document listeners to the body,
+  // and a re-visit rebuilds every row, so the previous visit's set is flushed
+  // here (closeGS still covers the final set).
+  for (const fn of _gsCleanups.splice(0)) { try { fn(); } catch { } }
   content.innerHTML = "";
   const wrap = h("div", { class: "sbg-gs-form" });
   function _badgePreview(text, color) {
@@ -367,7 +371,7 @@ function renderAppearance() {
   for (const [key, def, text, caption, tip] of [
     [S.BADGE_HIGH_COLOR, "#f87171", "HIGH", " Badge", "Color for HIGH/base KSampler and model badges"],
     [S.BADGE_LOW_COLOR, "#60a5fa", "LOW", " Badge", "Color for LOW/refine KSampler and model badges"],
-    [S.VIDEO_BADGE_COLOR, "#facc15", "MP4", " Badge", "Color for the format badge on video thumbnails"],
+    [S.VIDEO_BADGE_COLOR, "#facc15", "MP4", " Badge", "Color for the format badge on video and audio thumbnails"],
     [S.SEARCH_TAG_COLOR, "#6495ed", "search", " Search Badge", "Color for search tag badges in the search bar"],
     [S.SEARCH_TAG_NEG_COLOR, "#ef4444", "\u2212exclude", " Exclude Badge", "Color for negative/exclude search tag badges"],
   ]) {
@@ -385,7 +389,7 @@ function renderAppearance() {
     onColor: (c) => {
       localStorage.setItem("SBG.GS.HighlightBg", c);
       document.documentElement.style.setProperty("--sbg-highlight-bg", c);
-      hlSample.style.background = c;
+      hlSample.style.background = c || "rgba(250, 204, 21, 0.35)";
     },
   });
 
@@ -425,6 +429,7 @@ function renderAppearance() {
     [S.LB_COLOR_COPY_PROMPT, "Copy Prompt", "Background color for copy prompt button"],
     [S.LB_COLOR_COPY_WF, "Copy WF", "Background color for copy workflow button"],
     [S.LB_COLOR_LOAD_WF, "Load Workflow", "Background color for load workflow button"],
+    [S.LB_COLOR_COMPARE, "Compare", "Background color for compare button"],
   ]) {
     const chip = _btnPreview(text, getSetting(key, ""));
     _chipRow(key, "", chip, { tooltip: tip, onColor: (c) => { chip.style.background = c || _ACCENT; } });
@@ -599,6 +604,7 @@ function renderSettings() {
   wrap.appendChild(_toggle(S.LB_SHOW_COPY_PROMPT, true, "Copy Prompt Button", "Show copy prompt button in lightbox"));
   wrap.appendChild(_toggle(S.LB_SHOW_COPY_WF, true, "Copy WF Button", "Show copy workflow button in lightbox"));
   wrap.appendChild(_toggle(S.LB_SHOW_LOAD_WF, true, "Load Workflow Button", "Show load workflow button in lightbox"));
+  wrap.appendChild(_toggle(S.LB_SHOW_COMPARE, true, "Compare Button", "Show compare button in lightbox"));
 
   wrap.appendChild(h("div", { class: "sbg-gs-section-title", text: "Lightbox Zoom", style: "margin-top:16px" }));
   wrap.appendChild(h("div", { class: "sbg-gs-desc", text: "Zoom and pan on the image or video in the lightbox. Pinch always zooms; drag pans when zoomed in." }));
@@ -614,7 +620,7 @@ function renderSettings() {
     "Keep the current zoom level and position when moving to the next or previous image or video. Off: every navigation resets to fit-to-screen."));
 
   wrap.appendChild(h("div", { class: "sbg-gs-section-title", text: "Metadata", style: "margin-top:16px" }));
-  wrap.appendChild(_comboInput(S.PROMPT_VIEW, "remember", ["enhanced", "initial", "remember"], "Default Tab View", "Which tab opens first in tabbed sections. For prompt sections this picks Enhanced or Original; 'Remember' keeps your last-opened tab on every tabbed section."));
+  wrap.appendChild(_comboInput(S.PROMPT_VIEW, "remember", ["enhanced", "initial", "remember"], "Default Tab View", "Which tab opens first in tabbed sections. For prompt sections this picks Enhanced or Initial, while 'Remember' keeps your last-opened tab on every tabbed section."));
   wrap.appendChild(_comboInput(S.PROMPT_PADDING, "6", ["0", "1", "2", "3", "4", "5", "6", "8", "10", "12"], "Prompt Padding", "Horizontal padding inside prompt text boxes (in px); top/bottom run 2px tighter.", (v) => {
     document.documentElement.style.setProperty("--sbg-prompt-padding", v + "px");
   }));
@@ -795,6 +801,18 @@ function renderPresets() {
   saveChecks.appendChild(h("label", {}, [incKeys, document.createTextNode(" Keybindings")]));
   wrap.appendChild(saveChecks);
 
+  // Every colour the Appearance tab manages, as setting ids: the S entries
+  // whose names carry COLOR, the custom theme variables, the per-app badge
+  // keys, and the highlight background's settings copy.
+  function _appearanceColorIds() {
+    const ids = [];
+    for (const [k, id] of Object.entries(S)) if (k.includes("COLOR")) ids.push(id);
+    ids.push("CUSTOM_BG", "CUSTOM_SURFACE", "CUSTOM_BORDER", "CUSTOM_TEXT", "CUSTOM_ACCENT");
+    for (const a of APP_REGISTRY) ids.push(a.settingKey);
+    ids.push("HighlightBg");
+    return ids;
+  }
+
   // The one capture and the one apply, shared by the local preset buttons and
   // the server theme buttons, so the call sites cannot drift on what a
   // preset contains or how it lands.
@@ -805,12 +823,20 @@ function renderPresets() {
       preset.layouts = getSetting("SBG.Layouts", null);
     }
     if (incColors.checked) {
+      // The legacy four keys stay, so exports keep loading in older builds.
       preset.colors = {
         high: getSetting(S.BADGE_HIGH_COLOR, "#f87171"),
         low: getSetting(S.BADGE_LOW_COLOR, "#60a5fa"),
         video: getSetting(S.VIDEO_BADGE_COLOR, "#facc15"),
         highlight: localStorage.getItem("SBG.GS.HighlightBg") || "",
+        all: {},
       };
+      for (const id of _appearanceColorIds()) {
+        const v = getSetting(id, null);
+        // null means never set, while an empty string is a deliberate clear
+        // and must load as one.
+        if (v !== null) preset.colors.all[id] = v;
+      }
     }
     if (incSettings.checked) {
       preset.settings = {};
@@ -832,7 +858,16 @@ function renderPresets() {
       saveSetting(S.BADGE_HIGH_COLOR, p.colors.high);
       saveSetting(S.BADGE_LOW_COLOR, p.colors.low);
       saveSetting(S.VIDEO_BADGE_COLOR, p.colors.video);
-      if (p.colors.highlight) localStorage.setItem("SBG.GS.HighlightBg", p.colors.highlight);
+      if (p.colors.highlight) {
+        localStorage.setItem("SBG.GS.HighlightBg", p.colors.highlight);
+        saveSetting("HighlightBg", p.colors.highlight);
+      }
+      for (const [id, v] of Object.entries(p.colors.all || {})) {
+        saveSetting(id, v);
+        // HighlightBg is dual-copy and the render path reads the localStorage
+        // side, so a carried clear must land there too.
+        if (id === "HighlightBg") localStorage.setItem("SBG.GS.HighlightBg", v);
+      }
     }
     if (p.settings) {
       for (const [id, val] of Object.entries(p.settings)) {
@@ -936,11 +971,14 @@ function renderPresets() {
       }, { background: "var(--sbg-danger)" });
       const delBtn = h("button", { class: "sbg-btn sbg-btn--danger sbg-btn--sm", text: "\u2715" });
       confirmClick(delBtn, async () => {
-        await fetch("/sidebar_gallery/presets", {
-          method: "POST",
-          headers: { "Content-Type": "application/json" },
-          body: JSON.stringify({ action: "delete", name: sp.name }),
-        });
+        try {
+          const r = await fetch("/sidebar_gallery/presets", {
+            method: "POST",
+            headers: { "Content-Type": "application/json" },
+            body: JSON.stringify({ action: "delete", name: sp.name }),
+          });
+          if (!r.ok) throw new Error(`HTTP ${r.status}`);
+        } catch (e) { showToast("Error deleting theme: " + e.message); }
         renderPresets();
       });
       row.appendChild(loadBtn);
@@ -955,11 +993,12 @@ function renderPresets() {
     if (!name) { showToast("Enter a preset name first"); return; }
     const preset = capturePreset(name);
     try {
-      await fetch("/sidebar_gallery/presets", {
+      const r = await fetch("/sidebar_gallery/presets", {
         method: "POST",
         headers: { "Content-Type": "application/json" },
         body: JSON.stringify({ action: "save", name, data: preset }),
       });
+      if (!r.ok) throw new Error(`HTTP ${r.status}`);
       showToast(`Theme "${name}" saved to server`);
       renderPresets();
     } catch (e) { showToast("Error saving to server: " + e.message); }
@@ -1076,6 +1115,7 @@ function renderDiagnosticsTab() {
     try {
       const items = galleryCtx.allItems || [];
       let cached = 0;
+      let skipped = 0;
       for (const it of items) {
         if (!it.thumb_url) continue;
         // Already cached: count it and move on. The returned object URL is the
@@ -1085,16 +1125,21 @@ function renderDiagnosticsTab() {
         const existing = await _thumbCacheAPI.tryGet(it.thumb_url);
         if (existing) { cached++; continue; }
         try {
-          await _thumbCacheAPI.getOrFetch(it.thumb_url);
-          cached++;
-          if (cached % 20 === 0) {
+          // A raw-URL result is the server's 404 (no thumbnail exists), and
+          // rejections are transient failures. Neither counts as cached.
+          const got = await _thumbCacheAPI.getOrFetch(it.thumb_url);
+          if (got !== it.thumb_url) cached++;
+          else skipped++;
+          if ((cached + skipped) % 20 === 0) {
             diagCacheThumbBtn.textContent = `Caching… ${cached}/${items.length}`;
           }
-        } catch { cached++; }
+        } catch { skipped++; }
       }
       diagCacheThumbBtn.textContent = "🖼️ Cache Thumbnails";
       diagCacheThumbBtn.disabled = false;
-      showToast(`Thumbnails cached: ${cached} items`);
+      showToast(skipped
+        ? `Thumbnails cached: ${cached} items (${skipped} unavailable)`
+        : `Thumbnails cached: ${cached} items`);
       await refreshDiagStats(diagStatsContainer);
     } catch (e) {
       diagCacheThumbBtn.textContent = "🖼️ Cache Thumbnails";
@@ -1142,16 +1187,13 @@ function renderDiagnosticsTab() {
 
     localStorage.removeItem("SBG._dbVersion");
     localStorage.removeItem("SBG._cacheEpoch");
-    // SBGGS.* is the settings key prefix used by an older version.
-    const keysToRemove = [];
-    for (let i = 0; i < localStorage.length; i++) {
-      const k = localStorage.key(i);
-      if (k && k.startsWith("SBGGS.")) keysToRemove.push(k);
+    // Retired keys that aren't read anymore.
+    for (const k of ["SBG.Layout", "SBG.LayoutRenames", "SBG.MetaSectionOrder", "SBG.GS.HiddenSections"]) {
+      localStorage.removeItem(k);
     }
-    for (const k of keysToRemove) localStorage.removeItem(k);
 
     _metaCache.clear();
-    showToast(`All caches cleared (${keysToRemove.length} legacy keys removed). Reloading…`);
+    showToast("All caches cleared. Reloading…");
     setTimeout(() => location.reload(true), 500);
   }, { label: "⚠️ Sure? This will reload the page", armMs: 3000, background: "#ef4444", color: "#fff" });
 

@@ -96,6 +96,9 @@ export function createZoomPanController({
     else if (key === "left") { media = getCurrentMediaEl(); host = cmp.leftHalf; }
     else { media = cmp.rightMedia; host = cmp.rightHalf; }
     if (!media || !media.parentNode || (media.dataset && media.dataset.sbgPending === "1")) return null;
+    // Zoom has no meaning for the audio stage or the compare kind-icon pane,
+    // because transforming those elements would scale player controls or an icon.
+    if (media.tagName === "AUDIO" || media.tagName === "DIV") return null;
     if (!media.offsetWidth || !media.offsetHeight) return null;
     return { key, media, host };
   }
@@ -175,6 +178,27 @@ export function createZoomPanController({
     shield.style.height = (bottom - top) + "px";
   }
 
+  // The shield only has to be right when a gesture starts (a pointerdown over
+  // the video body). During a drag the pointer is already captured to the
+  // media area, so a frame-late shield changes nothing. A getBoundingClientRect
+  // read inside applyState, right after the transform write, forces a layout
+  // flush on every pan and zoom event. Coalescing the sync onto one animation
+  // frame moves that read past the paint, where it runs clean, and collapses a
+  // burst of events into a single sync. _syncVideoShield reads the live state,
+  // so a sync that lands after a reset simply sheds the shield.
+  let _shieldRaf = 0;
+  const _shieldPending = new Map(); // pane key, latest pane object
+  function _scheduleShieldSync(pane) {
+    _shieldPending.set(pane.key, pane);
+    if (_shieldRaf) return;
+    _shieldRaf = requestAnimationFrame(() => {
+      _shieldRaf = 0;
+      const panes = [..._shieldPending.values()];
+      _shieldPending.clear();
+      for (const p of panes) _syncVideoShield(p);
+    });
+  }
+
   /* State application */
 
   function applyState(pane, st) {
@@ -182,7 +206,7 @@ export function createZoomPanController({
     pane.media.style.transform = st.scale === 1
       ? "" : `translate(${st.tx}px, ${st.ty}px) scale(${st.scale})`;
     pane.host.classList.toggle("sbg-zoom--pannable", st.scale > 1);
-    _syncVideoShield(pane);
+    _scheduleShieldSync(pane);
   }
 
   function mirrorIfSynced(pane, st) {
@@ -286,6 +310,13 @@ export function createZoomPanController({
     const pane = resolvePane(e);
     if (!pane || states[pane.key].scale <= 1) return;
     if (overVideoControls(e, pane)) return;
+    // The pan-clamp inputs (media size and host viewport) do not change during
+    // a drag, since a window resize or fullscreen toggle aborts the drag through
+    // resetAll. Read them once here so onPointerMove never touches layout, and
+    // a fast pan cannot force a per-move flush by reading geometry between
+    // transform writes.
+    const _hr = pane.host.getBoundingClientRect();
+    const _geo = { mw: pane.media.offsetWidth, mh: pane.media.offsetHeight, hostW: _hr.width, hostH: _hr.height };
     if (pane.media.tagName === "VIDEO" && overMediaBody(e, pane)) {
       // Firefox's built-in controls swallow the pointer stream over the video
       // body inside the video's shadow tree (the keybind code documents the
@@ -301,12 +332,12 @@ export function createZoomPanController({
       e.preventDefault();
       e.stopPropagation();
       try { mediaArea.setPointerCapture(e.pointerId); } catch { }
-      _drag = { pane, id: e.pointerId, startX: e.clientX, startY: e.clientY, lastX: e.clientX, lastY: e.clientY, moved: false, video: true };
+      _drag = { pane, geo: _geo, id: e.pointerId, startX: e.clientX, startY: e.clientY, lastX: e.clientX, lastY: e.clientY, moved: false, video: true };
       return;
     }
-    // No preventDefault and no capture yet for images and background presses:
-    // a plain click must stay untouched until the drag threshold is crossed.
-    _drag = { pane, id: e.pointerId, startX: e.clientX, startY: e.clientY, lastX: e.clientX, lastY: e.clientY, moved: false };
+    // No preventDefault and no capture yet for images and background presses.
+    // A plain click must stay untouched until the drag threshold is crossed.
+    _drag = { pane, geo: _geo, id: e.pointerId, startX: e.clientX, startY: e.clientY, lastX: e.clientX, lastY: e.clientY, moved: false };
   }
 
   function onPointerMove(e) {
@@ -318,9 +349,9 @@ export function createZoomPanController({
       mediaArea.classList.add("sbg-zoom--panning");
     }
     const pane = _drag.pane;
-    const hr = pane.host.getBoundingClientRect();
+    const g = _drag.geo;
     const st2 = panBy(states[pane.key], e.clientX - _drag.lastX, e.clientY - _drag.lastY,
-      pane.media.offsetWidth, pane.media.offsetHeight, hr.width, hr.height);
+      g.mw, g.mh, g.hostW, g.hostH);
     _drag.lastX = e.clientX;
     _drag.lastY = e.clientY;
     applyState(pane, st2);
@@ -443,7 +474,17 @@ export function createZoomPanController({
     const host = key === "single" ? mediaContainer
       : key === "left" ? (cmp && cmp.leftHalf)
         : (cmp && cmp.rightHalf);
-    if (!media || !host || !media.offsetWidth || !media.offsetHeight) return;
+    // A pane that can no longer be zoomed (audio is display-none, compare
+    // shows the kind-icon pane) must still shed a shield and the pannable
+    // cursor left by a zoomed video, or the leftover overlay and grab hand
+    // survive onto the new stage.
+    if (!media || media.tagName === "AUDIO" || media.tagName === "DIV"
+        || !media.offsetWidth || !media.offsetHeight) {
+      _removeShield(key);
+      if (host) host.classList.remove("sbg-zoom--pannable");
+      return;
+    }
+    if (!host) return;
     if (media.dataset && media.dataset.sbgPending === "1") return;
     const st = states[key];
     if (st.scale <= 1) { applyState({ key, media, host }, _IDENT()); return; }
@@ -535,9 +576,14 @@ export function createZoomPanController({
     document.removeEventListener("keyup", onModKey, true);
     window.removeEventListener("blur", onWinBlur);
     clearTimeout(_indicatorTimer);
+    if (_shieldRaf) { cancelAnimationFrame(_shieldRaf); _shieldRaf = 0; }
+    _shieldPending.clear();
     for (const k of [..._shields.keys()]) _removeShield(k);
     indicator.remove();
   }
 
-  return { resetAll, resetPane, reapply, keyZoom, resetSmart, destroy };
+  // abortDrag lets navigation kill a live pan even when Keep Zoom While
+  // Browsing skips the resets, so a drag can't keep steering the outgoing,
+  // detached media element.
+  return { resetAll, resetPane, reapply, keyZoom, resetSmart, destroy, abortDrag: _abortDrag };
 }

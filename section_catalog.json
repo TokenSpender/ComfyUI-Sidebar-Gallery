@@ -2,16 +2,16 @@
   "_comment": "SBG section catalog: the single declarative source of truth for the metadata-section schema. The Python backend derives its tables from it via server/schema.py; the frontend receives derived values through the API (meta_keys, layouts).",
   "version": 1,
 
-  "flags": ["source_app", "initial_image", "initial_images", "has_workflow", "has_prompt", "prompt_enhanced"],
-  "non_bindable_flags": ["initial_images", "has_workflow", "has_prompt", "prompt_enhanced"],
+  "flags": ["source_app", "initial_image", "initial_images", "initial_audios", "has_workflow", "has_prompt", "prompt_enhanced"],
+  "non_bindable_flags": ["initial_images", "initial_audios", "has_workflow", "has_prompt", "prompt_enhanced"],
   "non_bindable_element_keys": { "samplers": ["stage", "role", "label"], "loras": ["loader", "role"] },
 
   "sections": [
     {
       "key": "file_info", "section_id": "file_info", "title": "File Info", "kind": "fileinfo",
       "search_field": "fileinfo", "search_aliases": ["file info"],
-      "summary_keys": ["resolution", "generation_resolution", "width", "height", "duration", "duration_seconds", "codec", "fps", "total_frames"],
-      "media": ["image", "video"],
+      "summary_keys": ["resolution", "generation_resolution", "width", "height", "duration", "duration_seconds", "codec", "fps", "total_frames", "sample_rate", "channels", "bitrate"],
+      "media": ["image", "video", "audio"],
       "default": {
         "style": "flat", "open": true,
         "params": [
@@ -33,6 +33,17 @@
           { "path": "fps", "label": "FPS" },
           { "path": "total_frames", "label": "Frames" },
           { "path": "modified", "label": "Modified" }
+        ],
+        "params_audio": [
+          { "path": "filename", "label": "File" },
+          { "path": "path", "label": "Path" },
+          { "path": "filesize", "label": "Size" },
+          { "path": "duration", "label": "Duration" },
+          { "path": "codec", "label": "Codec" },
+          { "path": "sample_rate", "label": "Sample Rate", "format": "{v} Hz" },
+          { "path": "channels", "label": "Channels" },
+          { "path": "bitrate", "label": "Bitrate", "format": "{v} kbps" },
+          { "path": "modified", "label": "Modified" }
         ]
       }
     },
@@ -40,7 +51,7 @@
       "key": "model", "section_id": "models", "title": "Models", "kind": "scalar",
       "search_field": "model", "search_aliases": ["models"],
       "summary_keys": ["model", "vae", "clip_skip", "clip_models", "text_projection", "audio_vae"],
-      "media": ["image", "video"],
+      "media": ["image", "video", "audio"],
       "default": {
         "style": "flat", "open": true,
         "params": [
@@ -57,7 +68,7 @@
       "key": "positive_prompt", "section_id": "positive", "title": "Positive Prompt", "kind": "text",
       "search_field": "prompt", "search_aliases": [],
       "summary_keys": ["positive_prompt"],
-      "media": ["image", "video"],
+      "media": ["image", "video", "audio"],
       "default": {
         "style": "text", "open": true,
         "params": [ { "path": "positive_prompt", "label": "Positive", "style": "text" } ]
@@ -67,7 +78,7 @@
       "key": "negative_prompt", "section_id": "negative", "title": "Negative Prompt", "kind": "text",
       "search_field": "prompt", "search_aliases": [],
       "summary_keys": ["negative_prompt"],
-      "media": ["image", "video"],
+      "media": ["image", "video", "audio"],
       "default": {
         "style": "text", "open": false,
         "params": [ { "path": "negative_prompt", "label": "Negative", "style": "text", "variant": "neg" } ]
@@ -77,17 +88,56 @@
       "key": "initial_prompt", "section_id": "initial_prompt", "title": "Original Prompt (pre-enhance)", "kind": "text",
       "search_field": "prompt", "search_aliases": [],
       "summary_keys": ["initial_prompt"],
-      "media": ["image", "video"],
+      "media": ["image", "video", "audio"],
       "default": {
         "style": "text", "open": false,
         "params": [ { "path": "initial_prompt", "label": "Original", "style": "text" } ]
       }
     },
     {
+      "key": "track", "section_id": "track", "title": "Track", "kind": "object",
+      "search_field": "track", "search_aliases": ["artist", "album"],
+      "summary_keys": ["track"],
+      "media": ["audio"],
+      "default": {
+        "style": "flat", "open": true,
+        "params": [
+          { "path": "track.title", "label": "Title" },
+          { "path": "track.artist", "label": "Artist" },
+          { "path": "track.album", "label": "Album" },
+          { "path": "track.album_artist", "label": "Album Artist" },
+          { "path": "track.genre", "label": "Genre" },
+          { "path": "track.date", "label": "Date" },
+          { "path": "track.track", "label": "Track #" },
+          { "path": "track.composer", "label": "Composer" }
+        ]
+      }
+    },
+    {
+      "key": "audio_tags", "section_id": "audio_tags", "title": "Tags", "kind": "text",
+      "search_field": "tags", "search_aliases": ["tag"],
+      "summary_keys": ["audio_tags"],
+      "media": ["audio"],
+      "default": {
+        "style": "text", "open": true,
+        "params": [ { "path": "audio_tags", "label": "Tags", "style": "text" } ]
+      }
+    },
+    {
+      "key": "audio_lyrics", "section_id": "audio_lyrics", "title": "Lyrics", "kind": "text",
+      "search_field": "lyrics", "search_aliases": ["lyric"],
+      "summary_keys": ["audio_lyrics"],
+      "media": ["audio"],
+      "default": {
+        "style": "text", "open": true,
+        "params": [ { "path": "audio_lyrics", "label": "Lyrics", "style": "text" } ]
+      }
+    },
+    {
       "key": "samplers", "section_id": "sampling", "title": "Sampling", "kind": "array",
       "search_field": "sampling", "search_aliases": ["sampler"],
       "summary_keys": ["samplers", "shift", "sampling_type"],
-      "media": ["image", "video"],
+      "media": ["image", "video", "audio"],
       "default": {
         "style": "cards", "open": true, "source": "samplers", "highlow": true,
         "params": [
@@ -105,7 +155,7 @@
       "key": "loras", "section_id": "loras", "title": "LoRAs", "kind": "array",
       "search_field": "lora", "search_aliases": ["loras"],
       "summary_keys": ["loras"],
-      "media": ["image", "video"],
+      "media": ["image", "video", "audio"],
       "default": {
         "style": "cards", "open": true, "source": "loras", "highlow": true,
         "params": [
@@ -199,7 +249,7 @@
       "key": "extra", "section_id": "extra", "title": "Extra Metadata", "kind": "object",
       "search_field": "extra", "search_aliases": ["extra metadata", "details"],
       "summary_keys": ["extra"],
-      "media": ["image", "video"],
+      "media": ["image", "video", "audio"],
       "default": {
         "style": "flat", "open": false,
         "params": [ { "path": "extra.*" } ]
@@ -209,7 +259,7 @@
       "key": "workflow_nodes", "section_id": "workflow_nodes", "title": "Workflow Nodes", "kind": "nodes",
       "search_field": "workflow_nodes", "search_aliases": ["workflow nodes"],
       "summary_keys": ["workflow_nodes"],
-      "media": ["image", "video"],
+      "media": ["image", "video", "audio"],
       "default": {
         "style": "nodes", "open": false,
         "params": []
@@ -219,7 +269,7 @@
       "key": "raw", "section_id": "raw", "title": "Raw Metadata", "kind": "raw",
       "search_field": null, "search_aliases": [],
       "summary_keys": [],
-      "media": ["image", "video"],
+      "media": ["image", "video", "audio"],
       "default": {
         "style": "raw", "open": false,
         "params": []

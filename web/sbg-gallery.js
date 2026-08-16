@@ -8,10 +8,10 @@ import {
   _dataCache, searchState,
   _metaCache, _persistItems, _loadPersistedItems,
   h, api, fmtBytes, timeAgo,
-  showToast, isVideo,
+  showToast, isVideo, isAudio, kindIcon,
   _thumbMemCache, _thumbCacheAPI, _metaCacheAPI, _resetIdb,
   initThumbObserver, getThumbObserver, resetThumbObserver, resetFailedThumbs,
-  PLAY_SVG, VIDEO_ICON, IMG_ICON, IMG_FILTER_ICON, SEARCH_SVG, GEAR_SVG,
+  PLAY_SVG, IMG_FILTER_ICON, VID_FILTER_ICON, AUD_FILTER_ICON, SEARCH_SVG, GEAR_SVG,
   S, getSetting, applyCustomThemeVars,
   progressPoller, formatProgress,
 } from "./sbg-core.js";
@@ -253,8 +253,7 @@ export function initGallery(mountEl, config) {
       items = items.filter(it => it.subfolder === state.subfolder || it.subfolder.startsWith(state.subfolder + "/"));
     }
 
-    if (state.kind === "image") items = items.filter(it => it.kind === "image");
-    else if (state.kind === "video") items = items.filter(it => it.kind === "video");
+    if (state.kind) items = items.filter(it => it.kind === state.kind);
 
     if (state._searchMatches) {
       items = items.filter(it => {
@@ -401,11 +400,12 @@ export function initGallery(mountEl, config) {
     }
   }
 
-  const VID_FILTER_ICON = `<svg viewBox="0 0 24 24" width="14" height="14" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><polygon points="23 7 16 12 23 17 23 7"/><rect x="1" y="5" width="15" height="14" rx="2" ry="2"/></svg>`;
   const kindBtnAll = h("button", { class: "sbg-kind-btn sbg-kind-btn--active", text: "All", "data-kind": "", title: "Show all files" });
   const kindBtnImg = h("button", { class: "sbg-kind-btn", html: IMG_FILTER_ICON, "data-kind": "image", title: "Images only" });
   const kindBtnVid = h("button", { class: "sbg-kind-btn", html: VID_FILTER_ICON, "data-kind": "video", title: "Videos only" });
-  const kindGroup = h("div", { class: "sbg-kind-group" }, [kindBtnAll, kindBtnImg, kindBtnVid]);
+  const kindBtnAud = h("button", { class: "sbg-kind-btn", html: AUD_FILTER_ICON, "data-kind": "audio", title: "Audio only" });
+  const kindButtons = [kindBtnAll, kindBtnImg, kindBtnVid, kindBtnAud];
+  const kindGroup = h("div", { class: "sbg-kind-group" }, kindButtons);
 
   const sortSel = h("select", { class: "sbg-select", title: "Sort order", style: "flex:0 0 auto;width:auto" }, [
     h("option", { value: "created_desc", text: "Created ↓" }),
@@ -721,7 +721,7 @@ export function initGallery(mountEl, config) {
           const img = this;
           img.style.display = "none";
           if (img.parentElement && !img.parentElement.querySelector(".sbg-card__placeholder")) {
-            img.parentElement.appendChild(h("div", { class: "sbg-card__placeholder", html: isVideo(it) ? VIDEO_ICON : IMG_ICON }));
+            img.parentElement.appendChild(h("div", { class: "sbg-card__placeholder", html: kindIcon(it) }));
           }
         },
       });
@@ -753,15 +753,17 @@ export function initGallery(mountEl, config) {
           getThumbObserver().observe(thumbWrap);
         });
         thumbWrap.appendChild(h("div", { class: "sbg-card__spinner" }));
-        thumbWrap.appendChild(h("div", { class: "sbg-card__placeholder sbg-card__placeholder--dim", html: isVideo(it) ? VIDEO_ICON : IMG_ICON }));
+        thumbWrap.appendChild(h("div", { class: "sbg-card__placeholder sbg-card__placeholder--dim", html: kindIcon(it) }));
       }
     } else {
-      thumbWrap.appendChild(h("div", { class: "sbg-card__placeholder", html: isVideo(it) ? VIDEO_ICON : IMG_ICON }));
+      thumbWrap.appendChild(h("div", { class: "sbg-card__placeholder", html: kindIcon(it) }));
     }
 
     if (isVideo(it)) {
       thumbWrap.appendChild(h("span", { class: "sbg-card__video-badge", text: (it.ext || "").replace(".", "").toUpperCase() || "VID" }));
       thumbWrap.appendChild(h("div", { class: "sbg-card__play-icon", html: PLAY_SVG }));
+    } else if (isAudio(it)) {
+      thumbWrap.appendChild(h("span", { class: "sbg-card__video-badge", text: (it.ext || "").replace(".", "").toUpperCase() }));
     }
 
     const card = h("div", {
@@ -1264,6 +1266,9 @@ export function initGallery(mountEl, config) {
         statusLeft.textContent = "Ready";
         applyFilters();
         if (!noChange || cacheReset) renderFromScratch();
+        // An open lightbox holds the previous items array, so a full refetch
+        // announces the swap the same way the delta path does.
+        if (!noChange) document.dispatchEvent(new CustomEvent("sbg-items-updated", { detail: { items: state.filteredItems } }));
         // An active search's match set may predate this refetch (root switch,
         // manual rescan, count-invariant escalation): re-run it against the
         // fresh items so new files aren't silently missing from results.
@@ -1415,7 +1420,7 @@ export function initGallery(mountEl, config) {
           // since-form carries adds, in-place changes and removals; its count
           // backstop and the stale flag escalate to a full refetch in the rare
           // states a delta can't reconcile.
-          await fetchNewItems();
+          await fetchNewItems(rid);
         } else if (countMismatch) {
           // Version matches but the count doesn't: a stamp was recorded against
           // a view that missed an add/delete. Self-heal with a full refetch.
@@ -1460,12 +1465,15 @@ export function initGallery(mountEl, config) {
     window._sbgPollTimer = setInterval(() => maybePoll(false), ms);
   }
 
-  async function fetchNewItems() {
-    const files = _dataCache._pendingFiles;
-    _dataCache._pendingFiles = [];
+  async function fetchNewItems(rootId = state.rootId) {
     // Captured root: every cache write below is keyed by it, view updates
     // additionally require it to still be on screen (see fetchAllItems).
-    const rid = state.rootId;
+    const rid = rootId;
+    // A delta that outlived a root switch must not consume the pending
+    // generated-file queue, so it drains only while the captured root is
+    // still the one on screen.
+    const files = rid === state.rootId ? _dataCache._pendingFiles : [];
+    if (files.length) _dataCache._pendingFiles = [];
 
     if (!files.length && (!_dataCache.serverTime[rid] || (_dataCache.items[rid] || []).length === 0)) {
       // No `since` cursor (pre-serverTime snapshot) or nothing cached: a plain
@@ -1880,13 +1888,13 @@ export function initGallery(mountEl, config) {
 
   /* Kind + sort event listeners */
 
-  for (const btn of [kindBtnAll, kindBtnImg, kindBtnVid]) {
+  for (const btn of kindButtons) {
     btn.addEventListener("click", () => {
       _saveScrollPos(); // remember the outgoing view's position
       const newKind = btn.dataset.kind;
       state.kind = newKind;
       _dataCache.lastKind = newKind;
-      for (const b of [kindBtnAll, kindBtnImg, kindBtnVid]) b.classList.remove("sbg-kind-btn--active");
+      for (const b of kindButtons) b.classList.remove("sbg-kind-btn--active");
       btn.classList.add("sbg-kind-btn--active");
       refilter();
     });
@@ -1952,7 +1960,7 @@ export function initGallery(mountEl, config) {
         }
 
         renderFolderNav();
-        for (const b of [kindBtnAll, kindBtnImg, kindBtnVid]) {
+        for (const b of kindButtons) {
           b.classList.toggle("sbg-kind-btn--active", b.dataset.kind === state.kind);
         }
         sortSel.value = state.sort;

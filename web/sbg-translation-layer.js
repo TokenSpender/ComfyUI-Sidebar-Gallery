@@ -23,7 +23,7 @@
  */
 
 import { h, kvRow, breakable, pj, getSetting, saveSetting, S, parseColor, formatColor, APP_REGISTRY, copyRenderProps } from "./sbg-core.js";
-import { DEFAULT_IMAGE_LAYOUT, DEFAULT_VIDEO_LAYOUT } from "./sbg-default-layout.js";
+import { DEFAULT_IMAGE_LAYOUT, DEFAULT_VIDEO_LAYOUT, DEFAULT_AUDIO_LAYOUT } from "./sbg-default-layout.js";
 import { SectionRegistry } from "./sbg-section-registry.js";
 
 // Derived from the single app registry in sbg-core.js, so never hand-extend it.
@@ -47,6 +47,7 @@ function uid(prefix = "s") { return `${prefix}_${Date.now().toString(36)}_${(_ui
 const _clone = (x) => JSON.parse(JSON.stringify(x));
 function defaultImageLayout() { return _clone(DEFAULT_IMAGE_LAYOUT); }
 function defaultVideoLayout() { return _clone(DEFAULT_VIDEO_LAYOUT); }
+function defaultAudioLayout() { return _clone(DEFAULT_AUDIO_LAYOUT); }
 
 // Profile storage (server-backed via settings). A saved layout is the user's
 // document and is never rewritten on read.
@@ -101,10 +102,19 @@ function _defaultTitles() {
  * @param {Object} [profiles] - Profile store to scan; defaults to the saved one.
  * @returns {Object} Map of default section title to the user's title.
  */
+/* Stored profiles can outlive their media kind (a key saved by a removed
+   feature stays in the user's document forever). The global scanners skip
+   them, so an unreachable profile cannot steer search names or badges. */
+function _liveProfiles(profiles) {
+  return Object.entries(profiles || {})
+    .filter(([key]) => MEDIA_KEYS.includes(key.slice(key.lastIndexOf("_") + 1)))
+    .map(([, prof]) => prof);
+}
+
 export function getSectionRenames(profiles = getProfiles()) {
   const defaults = _defaultTitles();
   const renames = {};
-  for (const prof of Object.values(profiles || {})) {
+  for (const prof of _liveProfiles(profiles)) {
     if (!Array.isArray(prof)) continue;
     for (const sec of prof) {
       if (!sec || typeof sec !== "object") continue;
@@ -148,8 +158,14 @@ export function getCustomSectionSearchMap(profiles = getProfiles()) {
         const path = p && p.path;
         if (typeof path !== "string" || !path.trim()) continue;
         if (path.startsWith("workflow_nodes.")) {
-          const cls = path.split(".")[1];
-          if (cls) classes.add(cls);
+          // A class_type may itself contain dots, and the true split point is
+          // unknowable without a summary, so register every dotted prefix.
+          // Search compares by exact class equality, making extras inert.
+          const parts = path.split(".");
+          for (let i = 2; i <= parts.length; i++) {
+            const cls = parts.slice(1, i).join(".");
+            if (cls) classes.add(cls);
+          }
         } else {
           const root = path.split(".")[0];
           const canonical = SectionRegistry.getCanonicalName(root, null);
@@ -170,7 +186,7 @@ export function getCustomSectionSearchMap(profiles = getProfiles()) {
       for (const c of entry.classes) if (!prev.classes.includes(c)) prev.classes.push(c);
     }
   };
-  for (const prof of Object.values(profiles || {})) {
+  for (const prof of _liveProfiles(profiles)) {
     if (!Array.isArray(prof)) continue;
     for (const sec of prof) {
       if (!sec || typeof sec !== "object") continue;
@@ -215,22 +231,36 @@ export function replaceElementColor(channel, oldVal, newVal) {
   return changed;
 }
 
-export function profileKey(app, isVideo) {
+export const MEDIA_KEYS = ["image", "video", "audio"];
+
+/* Accepts a media key or, from older call sites, an isVideo boolean. */
+function _mediaName(media) {
+  if (media === true) return "video";
+  return MEDIA_KEYS.includes(media) ? media : "image";
+}
+
+function defaultLayoutFor(media) {
+  if (media === "video") return defaultVideoLayout();
+  if (media === "audio") return defaultAudioLayout();
+  return defaultImageLayout();
+}
+
+export function profileKey(app, media) {
   const a = APPS.includes(app) ? app : "comfyui";
-  return `${a}_${isVideo ? "video" : "image"}`;
+  return `${a}_${_mediaName(media)}`;
 }
 
-export function getActiveProfile(app, isVideo) {
+export function getActiveProfile(app, media) {
   const profiles = getProfiles();
-  const key = profileKey(app, isVideo);
+  const med = _mediaName(media);
+  const key = profileKey(app, med);
   if (Array.isArray(profiles[key]) && profiles[key].length) return profiles[key];
-  // Fallback chain: comfyui_<media>, then a freshly minted default.
-  const fallback = profiles[`comfyui_${isVideo ? "video" : "image"}`];
+  const fallback = profiles[`comfyui_${med}`];
   if (Array.isArray(fallback) && fallback.length) return JSON.parse(JSON.stringify(fallback));
-  return isVideo ? defaultVideoLayout() : defaultImageLayout();
+  return defaultLayoutFor(med);
 }
 
-export { defaultImageLayout, defaultVideoLayout, uid };
+export { defaultImageLayout, defaultVideoLayout, defaultAudioLayout, uid };
 
 // Path resolution
 
@@ -254,14 +284,24 @@ export function resolvePath(path, summary, match) {
   if (!path || !summary) return [];
   const parts = path.split(".");
 
-  // workflow_nodes.<class_type>[.param...]: match by class_type, allowing duplicates
+  // workflow_nodes.<class_type>[.param...]: match by class_type, allowing duplicates.
+  // A class_type may itself contain dots (TextEncodeAceStepAudio1.5), so the split
+  // between class and param is decided by data: the longest dotted prefix naming a
+  // class present in this summary wins, and the remainder is the param path.
   if (parts[0] === "workflow_nodes" && parts.length >= 2) {
-    const ct = parts[1];
-    const paramPath = parts.length > 2 ? parts.slice(2).join(".") : null;
-    const nodes = filterNodesByMatch(
-      (summary.workflow_nodes || []).filter(n => n && typeof n === "object" && n.class_type === ct),
-      match
-    );
+    const all = (summary.workflow_nodes || []).filter(n => n && typeof n === "object");
+    let matched = [];
+    let paramPath = null;
+    for (let i = parts.length; i >= 2; i--) {
+      const cls = parts.slice(1, i).join(".");
+      const hit = all.filter(n => n.class_type === cls);
+      if (hit.length) {
+        matched = hit;
+        paramPath = i < parts.length ? parts.slice(i).join(".") : null;
+        break;
+      }
+    }
+    const nodes = filterNodesByMatch(matched, match);
     if (!paramPath) return nodes.map(n => n.params || {});
     const out = [];
     for (const n of nodes) {
@@ -313,9 +353,12 @@ function _dig(obj, path) {
 export function resolveSourceElements(source, summary, sourceMatch) {
   if (!source) return summary ? [summary] : [];
   const parts = source.split(".");
-  if (parts[0] === "workflow_nodes" && parts.length === 2) {
+  if (parts[0] === "workflow_nodes" && parts.length >= 2) {
+    // The class is everything after the head, which may itself contain dots
+    // (the same rule resolvePath applies).
+    const cls = parts.slice(1).join(".");
     const nodes = filterNodesByMatch(
-      (summary.workflow_nodes || []).filter(n => n && typeof n === "object" && n.class_type === parts[1]),
+      (summary.workflow_nodes || []).filter(n => n && typeof n === "object" && n.class_type === cls),
       sourceMatch
     );
     // Card title disambiguates instances: the node's title, else its upstream
@@ -421,8 +464,8 @@ function resolveParamValue(path, element, summary, source, match) {
 
 /* Shared section resolution
  * resolveSectionValues() is the single place that decides what a section shows:
- * which tabs are usable, the auto Enhanced/Original prompt toggle, hidden-param
- * and null/"" filtering, wildcard expansion, and the >400-char node-param drop.
+ * which tabs are usable, hidden-param and null/"" filtering, wildcard
+ * expansion, and the >400-char node-param drop.
  * The renderers consume its tree for those decisions and add only DOM/styling;
  * sectionSignature() hashes the same tree; sectionHasData() is simply
  * "tree !== null". Keeping all three off one resolver ensures compare mode
@@ -433,7 +476,7 @@ function resolveParamValue(path, element, summary, source, match) {
  *   {kind:"nodes", nodes:[{label, entries:[[key, displayString], …]}, …]}
  *   {kind:"cards", cards:[{el, fields:[{key?|param, value}, …]}, …]}
  *   {kind:"tabs",  tabs:[{id, tab, sub, tree}, …], own:tree|null}
- *   {kind:"flat"|"text", rows:[{param, value, key?} | {param, tabs:tree}, …]}
+ *   {kind:"flat"|"text", rows:[{param, value, key?}, …]}
  *
  * ctx.preview (layout editor) skips the anchor gate so authors always see their
  * sections; preview placeholders are added by the renderers rather than here,
@@ -454,7 +497,7 @@ export function resolveSectionValues(section, summary, ctx = {}) {
   // Hidden params are excluded from rendering, data, and the compare diff.
   const params = (section.params || []).filter(p => p && (p.style || "kv") !== "hidden");
   if (style === "cards") return _resolveCards(section, params, summary);
-  if (style === "text") return _resolveText(params, summary, inTab);
+  if (style === "text") return _resolveText(params, summary);
   return _resolveFlat(params, summary);
 }
 
@@ -492,21 +535,9 @@ function _resolveFlat(params, summary) {
   return rows.length ? { kind: "flat", rows } : null;
 }
 
-function _resolveText(params, summary, inTab) {
+function _resolveText(params, summary) {
   const rows = [];
   for (const p of params) {
-    // Positive prompt plus an available pre-enhancement original becomes the
-    // auto Enhanced/Original toggle (unless already inside a tab). This synthesis
-    // must live here: the renderer shows the extra Original tab, so the signature
-    // has to hash it too, or two files differing only in initial_prompt read
-    // "same".
-    if (p.path === "positive_prompt" && _hasInitialPrompt(summary) && !inTab) {
-      const tabs = _resolveTabs([
-        { label: "Enhanced", path: "positive_prompt" },
-        { label: "Original", path: "initial_prompt" },
-      ], [], summary);
-      if (tabs) { rows.push({ param: p, tabs }); continue; }
-    }
     const vals = resolvePath(p.path, summary, p.match);
     // A text block renders only the first resolved value.
     if (vals.length) rows.push({ param: p, value: vals[0] });
@@ -600,9 +631,8 @@ function _stripTree(t) {
     case "cards": return ["cards", t.cards.map(c =>
       c.fields.map(f => [f.key || (f.param && f.param.path) || "", _sigValue(f.value)]))];
     case "tabs": return ["tabs", t.tabs.map(x => [x.id, _stripTree(x.tree)]), _stripTree(t.own)];
-    default: return [t.kind, t.rows.map(r => r.tabs
-      ? ["@tabs", _stripTree(r.tabs)]
-      : [(r.key !== undefined ? r.key : (r.param && r.param.path)) || "", _sigValue(r.value)])];
+    default: return [t.kind, t.rows.map(r =>
+      [(r.key !== undefined ? r.key : (r.param && r.param.path)) || "", _sigValue(r.value)])];
   }
 }
 
@@ -812,8 +842,8 @@ function _renderFlat(section, summary, ctx) {
 
 function _renderText(section, summary, ctx) {
   const preview = !!(ctx && ctx.preview);
-  // Values, the auto Enhanced/Original toggle, and show/hide all come from the
-  // shared resolver (same tree the compare signature hashes); DOM only here.
+  // Values and show/hide come from the shared resolver (the same tree the
+  // compare signature hashes), and only DOM work happens here.
   const tree = resolveSectionValues(section, summary, { inTab: !!(ctx && ctx.inTab), preview });
   const byParam = new Map();
   for (const r of ((tree && tree.kind === "text") ? tree.rows : [])) byParam.set(r.param, r);
@@ -821,19 +851,9 @@ function _renderText(section, summary, ctx) {
   for (const p of (section.params || [])) {
     if ((p.style || "kv") === "hidden") continue;
     const r = byParam.get(p);
-    if (r && r.tabs) {
-      // The resolver synthesized the Enhanced/Original toggle for this param;
-      // render its usable tabs. Pass a paramless shell so _renderTabbedUsable
-      // draws just the tabs; this section's own params render through this loop.
-      // The id stays so the remembered-tab key is unchanged.
-      const el = _renderTabbedUsable({ id: section.id, title: section.title },
-        r.tabs.tabs, summary, ctx);
-      if (el) wrap.appendChild(el);
-      continue;
-    }
     if (!r && !preview) continue;
     // _modelDisplay so a model path bound as a text block renders exactly as
-    // the compare signature hashes it; ordinary prompt text passes through.
+    // the compare signature hashes it, while ordinary prompt text passes through.
     const text = r ? (typeof r.value === "string" ? String(_modelDisplay(r.value)) : pj(r.value)) : "—";
     const variant = p.variant || (/negative/i.test(p.path) ? "neg" : "");
     const d = h("div", { class: `sbg-prompt-text${_promptVariantClass(variant)}`, text });
@@ -849,12 +869,6 @@ function _renderText(section, summary, ctx) {
 function _promptVariantClass(variant) {
   if (variant === "neg") return " sbg-prompt-text--neg";
   return "";
-}
-
-function _hasInitialPrompt(summary) {
-  if (!summary) return false;
-  const init = summary.initial_prompt;
-  return init != null && String(init).trim() !== "" && String(init) !== String(summary.positive_prompt || "");
 }
 
 /**
@@ -913,10 +927,12 @@ function _renderTabbedUsable(section, usable, summary, ctx) {
     let idx = 0;
     const lsKey = `SBG.GS.PromptTab.${section.id || "tabs"}`;
     const remembered = localStorage.getItem(lsKey);
-    if (remembered != null) {
-      const ri = usable.findIndex(u => (u.tab.label || "") === remembered);
-      if (ri >= 0) idx = ri;
+    const ri = remembered != null ? usable.findIndex(u => (u.tab.label || "") === remembered) : -1;
+    if (ri >= 0) {
+      idx = ri;
     } else {
+      // A remembered label this section lacks (a tab from another media's
+      // profile sharing the section id) must not override the preference.
       const pref = getSetting("SBG.PromptView", "remember");
       const pathOf = (u) => u.tab.path || (u.sub.params[0] && u.sub.params[0].path);
       if (pref === "initial") { const oi = usable.findIndex(u => pathOf(u) === "initial_prompt"); if (oi >= 0) idx = oi; }
@@ -926,7 +942,6 @@ function _renderTabbedUsable(section, usable, summary, ctx) {
     const render = () => {
       host.innerHTML = "";
       const { sub } = usable[idx];
-      // inTab guards against the positive_prompt auto-toggle re-entering here.
       const el = renderSection(sub, summary, { ...ctx, inTab: true });
       if (el) host.appendChild(el);
       host.style.cssText = "";

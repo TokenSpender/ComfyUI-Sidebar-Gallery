@@ -20,7 +20,7 @@ PNG_SIGNATURE = b"\x89PNG\r\n\x1a\n"
 # Bump when the parser's output changes shape/coverage. Stored summaries are
 # cached in the DB; on startup a mismatch triggers a background re-extraction
 # so existing files pick up the new parser (see routes._check_parser_version).
-PARSER_VERSION = 51
+PARSER_VERSION = 58
 
 # Hard cap on any single captured node text/param string. "Show"/display nodes can
 # be wired to dump enormous blobs, which would bloat the DB and slow search.
@@ -2323,11 +2323,14 @@ def _extract_from_comfyui_prompt(prompt: dict, summary: dict):
     vae_loader_names: list[str] = []
     loras_found: list[dict] = []
     initial_images_found: list[str] = []  # every active input image, in prompt order
+    initial_audios_found: list[str] = []  # every active input audio, in prompt order
     controlnets_found: list[dict] = []
     adetailers_found: list[dict] = []
     positive_texts: list[tuple[str, str]] = []  # (node_id, text)
     negative_texts: list[tuple[str, str]] = []
     initial_prompts: list[tuple[str, str]] = []  # (encoder node_id, original text)
+    tags_texts: list[tuple[str, str]] = []  # (encoder node_id, song style tags)
+    lyrics_texts: list[tuple[str, str]] = []  # (encoder node_id, song lyrics)
     enhancer_encoder_nids: list[str] = []  # encoders whose chain held an enhancer
     upscaling_found: list[dict] = []
     interpolation_found: list[dict] = []
@@ -2561,6 +2564,21 @@ def _extract_from_comfyui_prompt(prompt: dict, summary: dict):
                 if _img not in initial_images_found:
                     initial_images_found.append(_img)
             _is_handled = True
+
+        # Audio loaders (initial audio), the same contract as image loaders:
+        # the widget holds a path (possibly location-annotated), and a loader
+        # nothing consumes is an editing leftover with no part in this file.
+        # Full params stay so workflow_nodes.LoadAudio.audio remains bindable.
+        if "loadaudio" in ct_lower.replace(" ", "").replace("_", ""):
+            _aud_val = inputs.get("audio", "")
+            if (isinstance(_aud_val, str) and _aud_val.strip()
+                    and len(_aud_val) <= 500
+                    and _consumers_map.get(str(node_id))):
+                _aud = _aud_val.strip()
+                if _aud not in initial_audios_found:
+                    initial_audios_found.append(_aud)
+            _is_handled = True
+            _full_handled_params = True
 
         # start_image inputs (WanImageToVideo, img2img, etc.)
         for _si_key in ("start_image", "init_image", "pixels"):
@@ -3222,6 +3240,23 @@ def _extract_from_comfyui_prompt(prompt: dict, summary: dict):
             text = inputs.get("text")
             if text is None:
                 text = inputs.get("prompt")
+            # Song encoders (the TextEncodeAceStepAudio family) carry their
+            # style prompt in "tags" and the song text in "lyrics". Both are
+            # collected as their own audio_* summary keys rather than joining
+            # positive_prompt, so a combined image-plus-audio workflow keeps
+            # the two prompts apart.
+            for _sk, _bucket in (("tags", tags_texts), ("lyrics", lyrics_texts)):
+                _sv = inputs.get(_sk)
+                if isinstance(_sv, list) and len(_sv) >= 1:
+                    _sv = _resolve_text_recursive(prompt, _sv)
+                if isinstance(_sv, str) and _sv.strip():
+                    _bucket.append((str(node_id), _sv.strip()))
+                    # A song encoder carries its generation settings (bpm,
+                    # keyscale, language, ...) as widgets on the encoder
+                    # itself, so keep its scalars in workflow_nodes like
+                    # sampler-pack extras. Ordinary encoders stay stubs, since
+                    # their only widget is the prompt shown elsewhere.
+                    _full_handled_params = True
             if text is None:
                 # Encoders that split the prompt across TWO string inputs: combine
                 # both parts (de-duplicated when identical), in the node's field order:
@@ -3800,6 +3835,10 @@ def _extract_from_comfyui_prompt(prompt: dict, summary: dict):
                                  if n in _base_vis or n not in _post_vis]
             initial_prompts[:] = [(n, t) for n, t in initial_prompts
                                   if n in _base_vis or n not in _post_vis]
+            tags_texts[:] = [(n, t) for n, t in tags_texts
+                             if n in _base_vis or n not in _post_vis]
+            lyrics_texts[:] = [(n, t) for n, t in lyrics_texts
+                               if n in _base_vis or n not in _post_vis]
             enhancer_encoder_nids[:] = [n for n in enhancer_encoder_nids
                                         if n in _base_vis or n not in _post_vis]
             if not enhancer_encoder_nids:
@@ -3913,6 +3952,8 @@ def _extract_from_comfyui_prompt(prompt: dict, summary: dict):
     if initial_images_found:
         summary.setdefault("initial_images", initial_images_found[:8])
         summary.setdefault("initial_image", initial_images_found[0])
+    if initial_audios_found:
+        summary.setdefault("initial_audios", initial_audios_found[:8])
 
     # ControlNet (structured with preprocessor): MERGE duplicates
     if controlnets_found:
@@ -4055,37 +4096,35 @@ def _extract_from_comfyui_prompt(prompt: dict, summary: dict):
     def _nid_sort_key(nid: str):
         return [(0, int(seg)) if seg.isdigit() else (1, seg) for seg in nid.split(":")]
 
-    if positive_texts:
-        seen_p: set[str] = set()
-        unique_p: list[str] = []
-        for _nid, t in sorted(positive_texts, key=lambda it: _nid_sort_key(it[0])):
-            t_clean = re.sub(r'<lora:[^>]+>', '', t).strip()
-            if not t_clean:
-                continue
-            if t_clean not in seen_p:
-                seen_p.add(t_clean)
-                unique_p.append(t_clean)
-        if unique_p:
-            summary.setdefault("positive_prompt", "\n---\n".join(unique_p) if len(unique_p) > 1 else unique_p[0])
+    def _joined_unique(texts: list[tuple[str, str]], clean=None) -> str | None:
+        seen: set[str] = set()
+        unique: list[str] = []
+        for _nid, t in sorted(texts, key=lambda it: _nid_sort_key(it[0])):
+            if clean is not None:
+                t = clean(t)
+                if not t:
+                    continue
+            if t not in seen:
+                seen.add(t)
+                unique.append(t)
+        if not unique:
+            return None
+        return "\n---\n".join(unique) if len(unique) > 1 else unique[0]
 
-    # Initial prompt from prompt enhancer (user's original text before VLM/LLM enhancement)
-    if initial_prompts:
-        seen_ip: set[str] = set()
-        unique_ip: list[str] = []
-        for _nid, t in sorted(initial_prompts, key=lambda it: _nid_sort_key(it[0])):
-            if t not in seen_ip:
-                seen_ip.add(t)
-                unique_ip.append(t)
-        summary.setdefault("initial_prompt", "\n---\n".join(unique_ip) if len(unique_ip) > 1 else unique_ip[0])
-
-    if negative_texts:
-        seen_n: set[str] = set()
-        unique_n: list[str] = []
-        for _nid, t in sorted(negative_texts, key=lambda it: _nid_sort_key(it[0])):
-            if t not in seen_n:
-                seen_n.add(t)
-                unique_n.append(t)
-        summary.setdefault("negative_prompt", "\n---\n".join(unique_n) if len(unique_n) > 1 else unique_n[0])
+    # The positive side strips inline lora tags before dedupe, so two texts
+    # differing only in a lora tag collapse to one.
+    for _texts, _skey, _clean in (
+            (positive_texts, "positive_prompt",
+             lambda t: re.sub(r'<lora:[^>]+>', '', t).strip()),
+            # Initial prompt from the enhancer (the user's text before VLM/LLM
+            # enhancement).
+            (initial_prompts, "initial_prompt", None),
+            (tags_texts, "audio_tags", None),
+            (lyrics_texts, "audio_lyrics", None),
+            (negative_texts, "negative_prompt", None)):
+        _joined = _joined_unique(_texts, _clean) if _texts else None
+        if _joined is not None:
+            summary.setdefault(_skey, _joined)
 
     # Generic workflow nodes
     if generic_nodes:
@@ -4705,6 +4744,62 @@ def read_video_sidecar(path: str) -> dict[str, Any] | None:
     return None
 
 
+def _duration_fields(secs: float) -> dict[str, Any]:
+    mins, s = divmod(int(secs), 60)
+    hrs, mins = divmod(mins, 60)
+    text = f"{hrs}:{mins:02d}:{s:02d}" if hrs else f"{mins}:{s:02d}"
+    return {"duration": text, "duration_seconds": round(secs, 2)}
+
+
+def _extract_embedded_container_meta(container) -> dict[str, Any]:
+    """Prompt/workflow embedded in an open PyAV container's tags.
+
+    VHS_VideoCombine embeds {"prompt": ..., "workflow": ...} as JSON in the
+    container comment tag. mp4 uses lowercase "comment", webm/matroska
+    uppercase "COMMENT". Some savers write the metadata into per-stream tags
+    instead of the container's format tags, so those are checked too (also
+    "description"). ComfyUI's core save nodes (SaveVideo, and the audio savers
+    for flac/mp3/opus) write "prompt" and "workflow" as their own metadata
+    keys. Libavformat surfaces them as container tags under those names for
+    most formats, but ogg carries them as per-stream vorbis comments, so
+    stream tags are folded in for the per-key lookup as well.
+    """
+    out: dict[str, Any] = {}
+    tags = dict(container.metadata or {})
+    for stream in container.streams:
+        for k, v in dict(stream.metadata or {}).items():
+            tags.setdefault(k, v)
+    comment = tags.get("comment", "") or tags.get("COMMENT", "") or tags.get("Comment", "")
+    if not comment:
+        for stream in container.streams:
+            stags = dict(stream.metadata or {})
+            comment = (stags.get("comment", "") or stags.get("COMMENT", "")
+                       or stags.get("description", "") or stags.get("DESCRIPTION", ""))
+            if comment:
+                break
+        if not comment:
+            comment = tags.get("description", "") or tags.get("DESCRIPTION", "")
+    if comment:
+        try:
+            comment_data = json.loads(comment)
+            if isinstance(comment_data, dict):
+                if "prompt" in comment_data:
+                    out["prompt"] = comment_data["prompt"]
+                if "workflow" in comment_data:
+                    out["workflow"] = comment_data["workflow"]
+        except (json.JSONDecodeError, ValueError):
+            pass
+    for key in ("prompt", "workflow"):
+        if key in out:
+            continue
+        v = tags.get(key) or tags.get(key.upper())
+        if isinstance(v, str) and v.strip():
+            parsed_v = _json_best_effort(v)
+            if isinstance(parsed_v, dict):
+                out[key] = parsed_v
+    return out
+
+
 def _read_video_av(path: str) -> dict[str, Any]:
     """Extract video info (duration, resolution, codec, fps) and embedded metadata.
     Reads the container in process with PyAV (a ComfyUI dependency), so no
@@ -4717,61 +4812,15 @@ def _read_video_av(path: str) -> dict[str, Any]:
 
     info: dict[str, Any] = {}
 
-    def _set_duration(secs: float) -> None:
-        mins, s = divmod(int(secs), 60)
-        hrs, mins = divmod(mins, 60)
-        if hrs:
-            info["duration"] = f"{hrs}:{mins:02d}:{s:02d}"
-        else:
-            info["duration"] = f"{mins}:{s:02d}"
-        info["duration_seconds"] = round(secs, 2)
-
     try:
         # "replace" keeps tags whose bytes fail UTF-8 decoding; the default of
         # "strict" would abort the whole open on one bad tag.
         with av.open(path, metadata_errors="replace") as container:
             # Container duration is measured in AV_TIME_BASE (microsecond) ticks.
             if container.duration:
-                _set_duration(container.duration / 1_000_000)
+                info.update(_duration_fields(container.duration / 1_000_000))
 
-            # VHS_VideoCombine embeds {"prompt": ..., "workflow": ...} as JSON in
-            # the container comment tag. mp4 uses lowercase "comment", webm/
-            # matroska uses uppercase "COMMENT".
-            tags = dict(container.metadata or {})
-            comment = tags.get("comment", "") or tags.get("COMMENT", "") or tags.get("Comment", "")
-            if not comment:
-                # Some savers write the metadata into per-stream tags instead of the
-                # container's format tags, so check those too (also try "description").
-                for stream in container.streams:
-                    stags = dict(stream.metadata or {})
-                    comment = (stags.get("comment", "") or stags.get("COMMENT", "")
-                               or stags.get("description", "") or stags.get("DESCRIPTION", ""))
-                    if comment:
-                        break
-                if not comment:
-                    comment = tags.get("description", "") or tags.get("DESCRIPTION", "")
-            if comment:
-                try:
-                    comment_data = json.loads(comment)
-                    if isinstance(comment_data, dict):
-                        if "prompt" in comment_data:
-                            info["prompt"] = comment_data["prompt"]
-                        if "workflow" in comment_data:
-                            info["workflow"] = comment_data["workflow"]
-                except (json.JSONDecodeError, ValueError):
-                    pass
-
-            # ComfyUI's core SaveVideo node writes "prompt" and "workflow" as their
-            # own metadata keys (mp4 mdta atoms) rather than a combined "comment"
-            # JSON; libavformat surfaces them as container tags under those names.
-            for key in ("prompt", "workflow"):
-                if key in info:
-                    continue
-                v = tags.get(key) or tags.get(key.upper())
-                if isinstance(v, str) and v.strip():
-                    parsed_v = _json_best_effort(v)
-                    if isinstance(parsed_v, dict):
-                        info[key] = parsed_v
+            info.update(_extract_embedded_container_meta(container))
 
             vstreams = container.streams.video
             if vstreams:
@@ -4802,7 +4851,83 @@ def _read_video_av(path: str) -> dict[str, Any]:
                     info["total_frames"] = int(nb)
                 # Duration fallback for containers that only stamp the stream.
                 if "duration_seconds" not in info and stream.duration and stream.time_base:
-                    _set_duration(float(stream.duration * stream.time_base))
+                    info.update(_duration_fields(float(stream.duration * stream.time_base)))
+    except Exception:
+        return {}
+
+    return info
+
+
+# Mirror the extension sets in server.db, duplicated so this module keeps
+# importing without the index module.
+AUDIO_EXTS = frozenset({".mp3", ".flac", ".wav", ".ogg", ".opus", ".m4a"})
+VIDEO_EXTS = frozenset({".mp4", ".webm", ".mov", ".mkv", ".avi"})
+
+
+def _read_audio_av(path: str) -> dict[str, Any]:
+    """Extract audio info (duration, codec, sample rate, channels, bitrate) and
+    embedded metadata. Returns an empty dict when PyAV is unavailable or the
+    file cannot be read as audio."""
+    try:
+        import av
+    except Exception:
+        return {}
+
+    info: dict[str, Any] = {}
+
+    # Music tags kept for the Track section. A curated allowlist, since the
+    # tag dict also carries encoder noise and the embedded prompt/workflow
+    # JSON. Tag case varies by format (vorbis comments arrive uppercase), so
+    # lookup is case-insensitive under the canonical lowercase name.
+    _TRACK_TAGS = ("title", "artist", "album", "album_artist", "albumartist",
+                   "genre", "date", "year", "track", "composer", "publisher",
+                   "copyright", "isrc")
+
+    try:
+        with av.open(path, metadata_errors="replace") as container:
+            if container.duration:
+                info.update(_duration_fields(container.duration / 1_000_000))
+
+            info.update(_extract_embedded_container_meta(container))
+
+            tags = dict(container.metadata or {})
+            for stream in container.streams:
+                for k, v in dict(stream.metadata or {}).items():
+                    tags.setdefault(k, v)
+            lower = {str(k).lower(): v for k, v in tags.items()}
+            track: dict[str, str] = {}
+            for name in _TRACK_TAGS:
+                v = lower.get(name)
+                if isinstance(v, str) and v.strip() and len(v) <= 200:
+                    track.setdefault("album_artist" if name == "albumartist" else name,
+                                     v.strip())
+            if track:
+                info["track"] = track
+
+            astreams = container.streams.audio
+            if astreams:
+                stream = astreams[0]
+                cdesc = getattr(stream.codec_context, "codec", None)
+                codec = (getattr(cdesc, "canonical_name", None)
+                         or getattr(stream.codec_context, "name", None))
+                if codec:
+                    info["codec"] = codec
+                sr = getattr(stream.codec_context, "sample_rate", None)
+                if sr:
+                    info["sample_rate"] = int(sr)
+                ch = getattr(stream, "channels", None)
+                if ch:
+                    info["channels"] = int(ch)
+                if "duration_seconds" not in info and stream.duration and stream.time_base:
+                    info.update(_duration_fields(float(stream.duration * stream.time_base)))
+                # Some formats (flac) stamp no per-stream rate. The container
+                # figure counts every stream, so with attached art present it
+                # overstates the audio rate. Better no value than a wrong one.
+                br = getattr(stream, "bit_rate", None)
+                if not br and not container.streams.video:
+                    br = container.bit_rate
+                if br:
+                    info["bitrate"] = int(round(br / 1000))
     except Exception:
         return {}
 
@@ -4810,6 +4935,36 @@ def _read_video_av(path: str) -> dict[str, Any]:
 
 
 # Main entry point
+
+
+def _sidecar_prompt_workflow(path: str, parsed: dict[str, Any]) -> tuple[Any, Any]:
+    """Prompt/workflow from a JSON sidecar next to the file, when one exists.
+    Records the sidecar under parsed["sidecar"] as a side effect."""
+    sidecar = read_video_sidecar(path)
+    if sidecar is None:
+        return None, None
+    parsed["sidecar"] = sidecar
+    prompt = workflow = None
+    if isinstance(sidecar, dict):
+        prompt = sidecar.get("prompt")
+        workflow = sidecar.get("workflow")
+        if workflow is None:
+            for k in ("extra_pnginfo", "EXTRA_PNGINFO"):
+                v = sidecar.get(k)
+                if isinstance(v, dict) and "workflow" in v:
+                    workflow = v["workflow"]
+                    break
+        # A sidecar can also BE the payload: a prompt dict ({class_type, inputs}
+        # keyed by node id) or a workflow (a "nodes" list).
+        if prompt is None and workflow is None:
+            for k, v in sidecar.items():
+                if isinstance(v, dict) and "class_type" in v:
+                    prompt = sidecar
+                    break
+        if prompt is None and workflow is None:
+            if "nodes" in sidecar and isinstance(sidecar.get("nodes"), list):
+                workflow = sidecar
+    return prompt, workflow
 
 
 def read_metadata_for_file(
@@ -4849,45 +5004,29 @@ def read_metadata_for_file(
         prompt = parsed.get("prompt") if isinstance(parsed, dict) else None
         workflow = parsed.get("workflow") if isinstance(parsed, dict) else None
     else:
-        # Video files
-        video_info = _read_video_av(path)
-        if video_info:
-            parsed["video_info"] = video_info
-            if "prompt" in video_info:
-                prompt = video_info.pop("prompt")
-            if "workflow" in video_info:
-                workflow = video_info.pop("workflow")
+        # Only the known container extensions get the libav probe. On
+        # anything else libavformat invents stream fields (a still image
+        # comes back with fps 25), so unknown extensions keep to the
+        # sidecar check below.
+        info = info_key = None
+        if ext in AUDIO_EXTS:
+            info, info_key = _read_audio_av(path), "audio_info"
+        elif ext in VIDEO_EXTS:
+            info, info_key = _read_video_av(path), "video_info"
+        if info:
+            parsed[info_key] = info
+            if "prompt" in info:
+                prompt = info.pop("prompt")
+            if "workflow" in info:
+                workflow = info.pop("workflow")
 
         if prompt is None and workflow is None:
-            sidecar = read_video_sidecar(path)
-            if sidecar is not None:
-                parsed["sidecar"] = sidecar
-                if isinstance(sidecar, dict):
-                    prompt = sidecar.get("prompt")
-                    workflow = sidecar.get("workflow")
-                    if workflow is None:
-                        for k in ("extra_pnginfo", "EXTRA_PNGINFO"):
-                            v = sidecar.get(k)
-                            if isinstance(v, dict) and "workflow" in v:
-                                workflow = v["workflow"]
-                                break
-                    # If sidecar looks like a prompt dict itself ({class_type, inputs} keyed by node_id)
-                    if prompt is None and workflow is None:
-                        is_prompt_dict = False
-                        for k, v in sidecar.items():
-                            if isinstance(v, dict) and "class_type" in v:
-                                is_prompt_dict = True
-                                break
-                        if is_prompt_dict:
-                            prompt = sidecar
-                    # If sidecar looks like a workflow (has "nodes" key)
-                    if prompt is None and workflow is None:
-                        if "nodes" in sidecar and isinstance(sidecar.get("nodes"), list):
-                            workflow = sidecar
+            prompt, workflow = _sidecar_prompt_workflow(path, parsed)
 
     summary = _extract_summary(prompt, workflow, parsed)
 
     video_info = parsed.get("video_info") if isinstance(parsed.get("video_info"), dict) else None
+    audio_info = parsed.get("audio_info") if isinstance(parsed.get("audio_info"), dict) else None
 
     file_w = file_h = None
     if ext in {".png", ".jpg", ".jpeg", ".webp", ".bmp", ".tiff", ".tif"}:
@@ -4898,21 +5037,28 @@ def read_metadata_for_file(
         except Exception:
             pass
 
-    finalize_summary(summary, video_info=video_info, file_width=file_w, file_height=file_h)
+    finalize_summary(summary, video_info=video_info, audio_info=audio_info,
+                     file_width=file_w, file_height=file_h)
 
     return MetadataResult(prompt=prompt, workflow=workflow, parsed=parsed, raw_text=raw_text, summary=summary)
 
 
 def finalize_summary(summary: dict[str, Any], *, video_info: dict | None = None,
+                     audio_info: dict | None = None,
                      file_width: int | None = None, file_height: int | None = None) -> None:
     """Apply the file-authoritative post-extraction steps to a summary.
 
-    Pure function (no file I/O) so the ground-truth evaluation can replay it
-    with recorded file dimensions: merges video technical info, overrides
-    resolution with the file's real size (keeping a differing workflow size as
-    generation_resolution), and derives generation size and the interpolation
-    fps pair.
+    Pure function (no file I/O): merges video or audio technical info,
+    overrides resolution with the file's real size (keeping a differing
+    workflow size as generation_resolution), and derives generation size and
+    the interpolation fps pair.
     """
+    if audio_info:
+        for k in ("duration", "duration_seconds", "codec", "sample_rate",
+                  "channels", "bitrate", "track"):
+            if k in audio_info:
+                summary.setdefault(k, audio_info[k])
+
     if video_info:
         for k in ("duration", "duration_seconds", "codec", "fps", "total_frames"):
             if k in video_info:

@@ -77,23 +77,6 @@ def search_fields() -> set[str]:
     return {e["search_field"] for e in sections() if e.get("search_field")}
 
 
-def search_alias_map() -> dict[str, str]:
-    """Map user-typed names (key, section id, title, aliases) to the backend
-    search field.
-    """
-    out: dict[str, str] = {}
-    for e in sections():
-        sf = e.get("search_field")
-        if not sf:
-            continue
-        out[e["key"].lower()] = sf
-        out[e["section_id"].lower()] = sf
-        out[e["title"].lower()] = sf
-        for alias in e.get("search_aliases", []):
-            out[alias.lower()] = sf
-    return out
-
-
 def section_titles() -> dict[str, str]:
     """Default (catalog) section titles, keyed by section_id.
 
@@ -112,7 +95,7 @@ def default_layout(media: str = "image") -> list[dict[str, Any]]:
         if media not in e.get("media", ["image", "video"]):
             continue
         d = e.get("default", {})
-        params = d.get("params_video") if (media == "video" and d.get("params_video")) else d.get("params", [])
+        params = d.get(f"params_{media}") or d.get("params", [])
         sec: dict[str, Any] = {
             "id": e["section_id"],
             "title": e["title"],

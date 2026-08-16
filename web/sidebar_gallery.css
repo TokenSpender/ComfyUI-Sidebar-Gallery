@@ -483,6 +483,10 @@
 }
 
 .sbg-btn--accent:hover:not(:disabled) {
+  /* The generic .sbg-btn hover ties this rule's specificity and would
+     otherwise repaint background and border. */
+  background: var(--sbg-accent);
+  border-color: transparent;
   filter: brightness(1.1);
   box-shadow: 0 0 10px var(--sbg-accent-glow);
 }
@@ -1213,12 +1217,137 @@
   max-height: 92vh;
   object-fit: contain;
   border-radius: 4px;
-  box-shadow: 0 6px 30px rgba(0, 0, 0, 0.5);
   user-select: none;
 }
 
 .sbg-lb__video {
   outline: none;
+}
+
+/* Lightbox audio */
+
+.sbg-lb__audio-wrap {
+  display: flex;
+  flex-direction: column;
+  align-items: center;
+  justify-content: center;
+  gap: 16px;
+  width: min(90%, 1100px);
+  height: 90vh;
+}
+
+.sbg-lb__audio-stage {
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  flex: 1 1 auto;
+  min-height: 0;
+  width: 100%;
+  cursor: pointer;
+}
+
+.sbg-lb__audio-icon {
+  opacity: 0.35;
+  color: var(--sbg-text, #ddd);
+}
+
+.sbg-lb__audio-icon svg {
+  width: min(34vh, 50vw);
+  height: min(34vh, 50vw);
+}
+
+.sbg-lb__audio-art {
+  max-width: 100%;
+  max-height: 100%;
+  object-fit: contain;
+  border-radius: 4px;
+  user-select: none;
+}
+
+.sbg-lb__audio-scrub {
+  flex: 0 0 auto;
+  width: 100%;
+  height: 96px;
+  cursor: pointer;
+  touch-action: none;
+}
+
+.sbg-lb__audio-controls {
+  display: flex;
+  align-items: center;
+  gap: 12px;
+  flex: 0 0 auto;
+  width: 100%;
+}
+
+.sbg-lb__audio-spacer {
+  flex: 1 1 auto;
+}
+
+.sbg-lb__audio-btn {
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  width: 38px;
+  height: 38px;
+  border: 1px solid var(--sbg-border, rgba(255, 255, 255, 0.15));
+  border-radius: 50%;
+  background: rgba(255, 255, 255, 0.08);
+  color: var(--sbg-text, #ddd);
+  cursor: pointer;
+}
+
+.sbg-lb__audio-btn:hover {
+  background: rgba(255, 255, 255, 0.16);
+}
+
+.sbg-lb__audio-btn--play {
+  width: 44px;
+  height: 44px;
+}
+
+.sbg-lb__audio-time {
+  color: var(--sbg-text-dim, #999);
+  font-size: 12px;
+  font-variant-numeric: tabular-nums;
+  white-space: nowrap;
+}
+
+.sbg-lb__audio-vol {
+  width: 110px;
+  accent-color: var(--sbg-accent, #7c6aef);
+}
+
+/* Compare half showing a non-viewable kind */
+
+.sbg-compare__icon-pane {
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  width: 100%;
+  height: 100%;
+  color: var(--sbg-text, #ddd);
+}
+
+.sbg-compare__icon-pane svg {
+  width: 90px;
+  height: 90px;
+  opacity: 0.35;
+}
+
+/* Lightbox stand-in for kinds with no media element */
+
+.sbg-lb__icon-pane {
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  color: var(--sbg-text, #ddd);
+}
+
+.sbg-lb__icon-pane svg {
+  width: 130px;
+  height: 130px;
+  opacity: 0.35;
 }
 
 /* Lightbox zoom / pan */
@@ -2022,17 +2151,6 @@
   justify-content: center;
 }
 
-.sbg-btn--primary {
-  background: var(--sbg-accent) !important;
-  color: #fff !important;
-  border: none !important;
-  font-weight: 600;
-}
-
-.sbg-btn--primary:hover {
-  opacity: 0.9;
-}
-
 /* VLM badge */
 .sbg-badge--vlm {
   background: rgba(139, 92, 246, 0.25);
@@ -2383,7 +2501,9 @@ textarea.sbg-prompt-text {
   font-weight: 500;
   transition: all var(--sbg-transition);
 }
-.sbg-btn--primary:hover { filter: brightness(1.15); }
+/* Ties the generic .sbg-btn hover's specificity and sits later in the file,
+   so the accent background survives hovering. */
+.sbg-btn--primary:hover:not(:disabled) { background: var(--sbg-accent, #7c6aef); filter: brightness(1.15); }
 
 .sbg-btn--sm {
   padding: 3px 8px;

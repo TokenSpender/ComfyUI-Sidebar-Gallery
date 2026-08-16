@@ -290,6 +290,21 @@ export function fileUrl(it) {
 
 export function isVideo(it) { return it.kind === "video"; }
 
+export function isAudio(it) { return it.kind === "audio"; }
+
+/* Media key for layout profiles. */
+export function mediaKey(it) {
+  if (isVideo(it)) return "video";
+  if (isAudio(it)) return "audio";
+  return "image";
+}
+
+export function kindIcon(it) {
+  if (isVideo(it)) return VIDEO_ICON;
+  if (isAudio(it)) return AUDIO_ICON;
+  return IMG_ICON;
+}
+
 /* Persistent IndexedDB cache (thumbnails + metadata) */
 
 let _idbCachedPromise = null;
@@ -431,16 +446,20 @@ export const _thumbCacheAPI = {
           _thumbMemSet(url, blobUrl);
           return blobUrl;
         }
-        const resp = await fetch(url);
-        if (resp.ok) {
-          const blob = await resp.blob();
-          await _idbPut('thumbs', url, blob);
-          const blobUrl = URL.createObjectURL(blob);
-          _thumbMemSet(url, blobUrl);
-          return blobUrl;
-        }
-      } catch { /* no IndexedDB available, so fall through */ }
-      return url;
+      } catch { /* no IndexedDB available, so the network path still serves */ }
+      // Only a definitive 404 becomes the raw-URL "missing server-side"
+      // signal. Network failures and server errors throw, so callers can
+      // tell a transient outage apart from a thumbnail that does not exist.
+      const resp = await fetch(url);
+      if (resp.ok) {
+        const blob = await resp.blob();
+        try { await _idbPut('thumbs', url, blob); } catch { }
+        const blobUrl = URL.createObjectURL(blob);
+        _thumbMemSet(url, blobUrl);
+        return blobUrl;
+      }
+      if (resp.status === 404) return url;
+      throw new Error(`thumb fetch ${resp.status}`);
     });
   },
 
@@ -558,13 +577,20 @@ export function initThumbObserver() {
       _thumbObserver.unobserve(wrap);
       const item = wrap._sbgItem;
       if (!item || !item.thumb_url) continue;
-      if (_thumbFailedUrls.has(item.thumb_url)) continue;
 
+      // Settle the card to its no-thumbnail look. Virtual scroll rebuilds
+      // cards in the loading state (spinner plus dimmed icon), so a card
+      // whose URL already failed, and the one that fails now, must both be
+      // normalized or they spin forever.
       const giveUp = () => {
         _thumbFailedUrls.add(item.thumb_url);
         const spinner = wrap.querySelector(".sbg-card__spinner");
         if (spinner) spinner.remove();
+        const placeholder = wrap.querySelector(".sbg-card__placeholder");
+        if (placeholder) placeholder.classList.remove("sbg-card__placeholder--dim");
       };
+      if (_thumbFailedUrls.has(item.thumb_url)) { giveUp(); continue; }
+
       const scheduleRetry = (attempt) => {
         if (attempt < THUMB_RETRY_DELAYS.length) {
           setTimeout(() => { if (wrap.isConnected && wrap._sbgItem === item) tryLoad(attempt + 1); }, THUMB_RETRY_DELAYS[attempt]);
@@ -575,10 +601,17 @@ export function initThumbObserver() {
           // The wrap may have been removed (filter change) or rebound to another
           // item by the time the fetch resolves; don't inject a stale thumbnail.
           if (!wrap.isConnected || wrap._sbgItem !== item) return;
-          // A raw URL means the thumbnail is missing server-side, e.g. a
-          // just-generated file whose thumbnail is still being built. Retry with
-          // backoff so it self-heals in place without a manual rescan.
-          if (blobUrl === item.thumb_url) { scheduleRetry(attempt); return; }
+          // A raw URL is now specifically an HTTP 404 (transient failures
+          // throw and take the retry path below). For videos that can be a
+          // file still being written right after generation, so retry with
+          // backoff (images share the path harmlessly, and their endpoint
+          // only 404s for a missing file). For audio it means the server
+          // wrote its nothing-renderable marker, so settle immediately. A
+          // changed file gets a new mtime and a new URL.
+          if (blobUrl === item.thumb_url) {
+            if (item.kind === "audio") { giveUp(); } else { scheduleRetry(attempt); }
+            return;
+          }
           const img = h("img", { class: "sbg-card__thumb", loading: "lazy" });
           img.src = blobUrl;
           const spinner = wrap.querySelector(".sbg-card__spinner");
@@ -623,7 +656,10 @@ export function resetFailedThumbs() {
 export const PLAY_SVG = `<svg viewBox="0 0 24 24" width="16" height="16" fill="white"><polygon points="8,5 19,12 8,19"/></svg>`;
 export const VIDEO_ICON = `<svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.5"><polygon points="23 7 16 12 23 17 23 7"/><rect x="1" y="5" width="15" height="14" rx="2" ry="2"/></svg>`;
 export const IMG_ICON = `<svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.5"><rect x="3" y="3" width="18" height="18" rx="2" ry="2"/><circle cx="8.5" cy="8.5" r="1.5"/><polyline points="21 15 16 10 5 21"/></svg>`;
+export const AUDIO_ICON = `<svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.5"><path d="M9 18V5l12-2v13"/><circle cx="6" cy="18" r="3"/><circle cx="18" cy="16" r="3"/></svg>`;
 export const IMG_FILTER_ICON = `<svg viewBox="0 0 24 24" width="14" height="14" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><rect x="3" y="3" width="18" height="18" rx="2"/><circle cx="8.5" cy="8.5" r="1.5"/><path d="M21 15l-5-5L5 21"/></svg>`;
+export const VID_FILTER_ICON = `<svg viewBox="0 0 24 24" width="14" height="14" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><polygon points="23 7 16 12 23 17 23 7"/><rect x="1" y="5" width="15" height="14" rx="2" ry="2"/></svg>`;
+export const AUD_FILTER_ICON = `<svg viewBox="0 0 24 24" width="14" height="14" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M9 18V5l12-2v13"/><circle cx="6" cy="18" r="3"/><circle cx="18" cy="16" r="3"/></svg>`;
 export const SEARCH_SVG = `<svg viewBox="0 0 24 24" width="14" height="14" fill="none" stroke="currentColor" stroke-width="2"><circle cx="11" cy="11" r="7"/><line x1="16.65" y1="16.65" x2="21" y2="21"/></svg>`;
 export const GEAR_SVG = `<svg viewBox="0 0 24 24" width="14" height="14" fill="none" stroke="currentColor" stroke-width="2"><circle cx="12" cy="12" r="3"/><path d="M19.4 15a1.65 1.65 0 0 0 .33 1.82l.06.06a2 2 0 0 1-2.83 2.83l-.06-.06a1.65 1.65 0 0 0-1.82-.33 1.65 1.65 0 0 0-1 1.51V21a2 2 0 0 1-4 0v-.09A1.65 1.65 0 0 0 9 19.4a1.65 1.65 0 0 0-1.82.33l-.06.06a2 2 0 0 1-2.83-2.83l.06-.06A1.65 1.65 0 0 0 4.68 15a1.65 1.65 0 0 0-1.51-1H3a2 2 0 0 1 0-4h.09A1.65 1.65 0 0 0 4.6 9a1.65 1.65 0 0 0-.33-1.82l-.06-.06a2 2 0 0 1 2.83-2.83l.06.06A1.65 1.65 0 0 0 9 4.68a1.65 1.65 0 0 0 1-1.51V3a2 2 0 0 1 4 0v.09a1.65 1.65 0 0 0 1 1.51 1.65 1.65 0 0 0 1.82-.33l.06-.06a2 2 0 0 1 2.83 2.83l-.06.06A1.65 1.65 0 0 0 19.4 9a1.65 1.65 0 0 0 1.51 1H21a2 2 0 0 1 0 4h-.09a1.65 1.65 0 0 0-1.51 1z"/></svg>`;
 
@@ -664,10 +700,12 @@ export const S = {
   LB_SHOW_COPY_PROMPT: "SBG.LbShowCopyPrompt",
   LB_SHOW_COPY_WF: "SBG.LbShowCopyWF",
   LB_SHOW_LOAD_WF: "SBG.LbShowLoadWF",
+  LB_SHOW_COMPARE: "SBG.LbShowCompare",
   LB_COLOR_DOWNLOAD: "SBG.LbColorDownload",
   LB_COLOR_COPY_PROMPT: "SBG.LbColorCopyPrompt",
   LB_COLOR_COPY_WF: "SBG.LbColorCopyWF",
   LB_COLOR_LOAD_WF: "SBG.LbColorLoadWF",
+  LB_COLOR_COMPARE: "SBG.LbColorCompare",
   PROMPT_VIEW: "SBG.PromptView",
   SEARCH_TAG_COLOR: "SBG.SearchTagColor",
   SEARCH_TAG_NEG_COLOR: "SBG.SearchTagNegColor",

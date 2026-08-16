@@ -26,8 +26,8 @@ def _count_hits(haystack: str, needle: str) -> int:
 _HANDLED_FIELDS = frozenset({
     "app", "source_app", "model", "vae", "clip", "lora", "sampler",
     "controlnet", "prompt", "keyword", "pos_prompt", "neg_prompt",
-    "mmaudio", "sampling", "adetailer", "upscaling", "interpolation",
-    "fileinfo", "extra", "workflow_nodes",
+    "tags", "lyrics", "track", "mmaudio", "sampling", "adetailer",
+    "upscaling", "interpolation", "fileinfo", "extra", "workflow_nodes",
 })
 
 
@@ -187,6 +187,13 @@ def match_summary(s: dict, field: str, value: str, node_classes: list | None = N
         if neg_count:
             results.append({"field": "neg_prompt", "count": neg_count})
 
+    for _f, _k in (("tags", "audio_tags"), ("lyrics", "audio_lyrics")):
+        if field in (_f, "any"):
+            tv = str(s.get(_k, "")).lower()
+            tv_count = tv.count(value) if value else (1 if tv else 0)
+            if tv_count:
+                results.append({"field": _f, "count": tv_count})
+
     if field in ("app", "source_app", "any"):
         app = str(s.get("source_app", "")).lower()
         if value and value in app:
@@ -199,6 +206,13 @@ def match_summary(s: dict, field: str, value: str, node_classes: list | None = N
             count = _entry_hits(mma, value)
             if count:
                 results.append({"field": "mmaudio", "count": count})
+
+    if field in ("track", "any"):
+        trk = s.get("track")
+        if isinstance(trk, dict):
+            count = _entry_hits(trk, value)
+            if count:
+                results.append({"field": "track", "count": count})
 
     if field in ("sampling", "any"):
         samplers = s.get("samplers", [])
@@ -307,8 +321,10 @@ def match_summary(s: dict, field: str, value: str, node_classes: list | None = N
     # (top-level keys with no matcher, e.g. legacy seed/steps/cfg/scheduler,
     # must stay OFF this list so the deep search reaches them).
     checked_keys = {"model", "vae", "clip_models",              # model matcher
+                    "audio_vae", "text_projection",             # model matcher components
                     "loras", "samplers", "sampler_name",        # lora/sampler matchers
                     "clip_skip", "shift", "sampling_type",      # sampling matcher
+                    "audio_tags", "audio_lyrics", "track",      # tags/lyrics/track matchers
                     "source_app", "controlnet", "positive_prompt", "negative_prompt",
                     "workflow_nodes", "mmaudio", "adetailer", "upscaling", "interpolation", "extra",
                     "resolution", "codec", "fps", "total_frames", "duration", "duration_seconds"}

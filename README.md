@@ -10,7 +10,7 @@ A customizable gallery that supports all metadata.
 
 </div>
 
-Sidebar Gallery is a ComfyUI extension that adds a media browser to the sidebar. It indexes the images and videos in your output folders, reads the generation metadata embedded in each file, and presents it as a structured, searchable panel. It supports images and videos made with ComfyUI, Automatic1111, Forge, SD.Next, Fooocus, and CivitAI's on-site generator.
+Sidebar Gallery is a ComfyUI extension that adds a media browser to the sidebar. It indexes the images, videos, and audio in your output folders, reads the generation metadata embedded in each file, and presents it as a structured, searchable panel. It supports images, videos, and audio made with ComfyUI, Automatic1111, Forge, SD.Next, Fooocus, and CivitAI's on-site generator.
 
 ## Gallery
 
@@ -18,7 +18,7 @@ The gallery indexes your ComfyUI `output` folder, together with any other folder
 
 ![Sidebar gallery](https://raw.githubusercontent.com/TokenSpender/ComfyUI-Sidebar-Gallery/media/assets/sidebar.png)
 
-Thumbnails are generated on demand, including for video. You can browse subfolders, filter to images or video, set the sort order, and adjust both the thumbnail size and the number of items per row. The viewer zooms with the scroll wheel and pans by dragging, on images and videos alike; zoom keys, middle-click reset, the sensitivity, and keeping the zoom while browsing are all configurable.
+Thumbnails are generated on demand, and audio files show their embedded cover art if they have one (a waveform is drawn from the audio otherwise). You can browse subfolders, filter by media type, set the sort order, and adjust both the thumbnail size and the number of items per row. The viewer zooms with the scroll wheel and pans by dragging, on images and videos alike. Zoom keys, middle-click reset, the sensitivity, and keeping the zoom while browsing are all configurable. Audio plays in the viewer with a waveform scrubber and playback controls.
 
 ## Metadata
 

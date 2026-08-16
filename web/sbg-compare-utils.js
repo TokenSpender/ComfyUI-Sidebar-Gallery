@@ -21,6 +21,19 @@ export function initialImageList(s) {
   return s.initial_image ? [s.initial_image] : [];
 }
 
+/** Source audio entries (initial_audios). Same entry shapes as the image list. */
+export function initialAudioList(s) {
+  if (!s) return [];
+  return Array.isArray(s.initial_audios) ? s.initial_audios : [];
+}
+
+/** Every source media entry, images then audio. The one source for
+ *  "does this summary carry source media" so tab gating, compare blocks,
+ *  and content keys cannot drift apart. */
+export function sourceMediaList(s) {
+  return [...initialImageList(s), ...initialAudioList(s)];
+}
+
 /** ComfyUI marks a widget path loaded from outside the input folder with a
  *  trailing annotation ("sub/img.png [output]"). Split that into the bare path
  *  and the location token; a string without the annotation comes back with a

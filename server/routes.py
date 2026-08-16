@@ -19,7 +19,7 @@ import folder_paths
 import server
 
 from .config import config_path, load_config, save_config
-from .db import IMAGE_EXTS, VIDEO_EXTS
+from .db import ALL_MEDIA_EXTS, IMAGE_EXTS, kind_from_ext
 from . import db as media_db
 from .metadata import PARSER_VERSION, read_metadata_for_file, guess_mime, sanitize_for_json
 from . import schema
@@ -32,10 +32,10 @@ from .security import AllowedRoot, make_root_id, safe_join
 #
 # _SCAN_EXECUTOR: minutes-long whole-library work (incremental scans, meta-key
 #   aggregation, removed-root purges). 2 workers keeps disk/SQLite contention bounded.
-# _IO_EXECUTOR: interactive per-item work (image/video thumbnails, search,
-#   new-file processing). 4 workers; video jobs are capped at 2 by
-#   _VIDEO_THUMB_GATE before they are ever submitted, so they can never occupy
-#   the whole pool.
+# _IO_EXECUTOR: interactive per-item work (image/video/audio thumbnails,
+#   search, new-file processing). 4 workers. Video and audio DECODE jobs
+#   share the two-slot _MEDIA_DECODE_GATE before they are ever submitted, so
+#   decode work can never occupy more than half the pool.
 # The list_all payload build stays on the DEFAULT executor so gallery opens
 # never queue behind either pool.
 _SCAN_EXECUTOR = ThreadPoolExecutor(max_workers=2, thread_name_prefix="sbg-scan")
@@ -63,9 +63,9 @@ def _clamped_int(val: Any, fallback: int, lo: int = 64, hi: int = 1024) -> int:
 _THUMB_DIR = Path(__file__).resolve().parents[1] / ".thumbs"
 _THUMB_DIR.mkdir(exist_ok=True)
 
-# Sweep temp files left by a hard kill mid-thumbnail-write (never served,
-# but they'd accumulate otherwise).
-for _stale_tmp in _THUMB_DIR.glob("tmp_*.jpg"):
+# Sweep temp files left by a hard kill mid-write (never served, but they'd
+# accumulate otherwise).
+for _stale_tmp in _THUMB_DIR.glob("tmp_*"):
     try:
         _stale_tmp.unlink()
     except OSError:
@@ -82,7 +82,7 @@ def _gc_thumbs(max_bytes: int = _THUMB_CACHE_MAX_BYTES) -> None:
         entries = []
         total = 0
         for f in _THUMB_DIR.iterdir():
-            if f.suffix != ".jpg" or f.name.startswith("tmp_"):
+            if f.suffix not in (".jpg", ".json") or f.name.startswith("tmp_"):
                 continue
             try:
                 st = f.stat()
@@ -125,6 +125,12 @@ def _image_thumb_path(full_path: str, size: int = 512) -> Path:
     return _THUMB_DIR / f"i_{_thumb_hash(full_path, size)}.jpg"
 
 
+# The "aw" prefix supersedes the earlier "a" scheme so stale zero-byte
+# no-art markers cannot pin these files to 404.
+def _audio_thumb_path(full_path: str, size: int = 512) -> Path:
+    return _THUMB_DIR / f"aw_{_thumb_hash(full_path, size)}.jpg"
+
+
 def _thumb_url(rid_q: str, rp_q: str, size: int, kind: str, mtime) -> str | None:
     """Content-addressed thumbnail URL. The &v=<mtime> token makes a regenerated
     file (new mtime) resolve to a fresh url, so its immutable-cached thumbnail
@@ -136,6 +142,8 @@ def _thumb_url(rid_q: str, rp_q: str, size: int, kind: str, mtime) -> str | None
         return f"/sidebar_gallery/preview?root_id={rid_q}&relpath={rp_q}&size={size}&format=jpeg&v={v}"
     if kind == "video":
         return f"/sidebar_gallery/video_thumb?root_id={rid_q}&relpath={rp_q}&size={size}&v={v}"
+    if kind == "audio":
+        return f"/sidebar_gallery/audio_thumb?root_id={rid_q}&relpath={rp_q}&size={size}&v={v}"
     return None
 
 
@@ -176,13 +184,14 @@ def _client_item(root_id, relpath, ext, kind, size, mtime, ctime, thumb_size,
     return item
 
 
-# Acquired BEFORE submitting to _IO_EXECUTOR so queued video jobs wait on the
-# event loop instead of holding pool workers.
-_VIDEO_THUMB_GATE = asyncio.Semaphore(2)
+# Acquired BEFORE submitting to _IO_EXECUTOR so queued decode jobs wait on
+# the event loop instead of holding pool workers. Shared by video thumbnails
+# and the audio thumbnail/peaks generators.
+_MEDIA_DECODE_GATE = asyncio.Semaphore(2)
 
 
 async def _video_thumb_off_loop(full, tp, size):
-    async with _VIDEO_THUMB_GATE:
+    async with _MEDIA_DECODE_GATE:
         loop = asyncio.get_running_loop()
         return await loop.run_in_executor(
             _IO_EXECUTOR, lambda: _generate_video_thumbnail(full, tp, size))
@@ -252,6 +261,263 @@ def _generate_video_thumbnail(full_path: str, out_path: Path, size: int = 512) -
                 tmp_path.unlink()
         except OSError:
             pass
+
+
+# Frame cap for waveform decoding that bounds the walk on damaged or endless
+# streams while covering hours of ordinary audio.
+_WAVEFORM_MAX_FRAMES = 400_000
+
+# One generation per output artifact at a time. A second request for the same
+# artifact waits on the mutex inside its worker (bounded to one parked worker
+# by the shared gate) rather than decoding the file again.
+_audio_gen_locks: dict[str, threading.Lock] = {}
+_audio_gen_locks_guard = threading.Lock()
+_AUDIO_GEN_LOCKS_PRUNE_AT = 1024
+
+
+def _audio_gen_lock(out_path: Path) -> threading.Lock:
+    with _audio_gen_locks_guard:
+        if len(_audio_gen_locks) > _AUDIO_GEN_LOCKS_PRUNE_AT:
+            for key in list(_audio_gen_locks):
+                lk = _audio_gen_locks[key]
+                if lk.acquire(blocking=False):
+                    lk.release()
+                    del _audio_gen_locks[key]
+        return _audio_gen_locks.setdefault(str(out_path), threading.Lock())
+
+
+async def _audio_job_off_loop(fn):
+    async with _MEDIA_DECODE_GATE:
+        loop = asyncio.get_running_loop()
+        return await loop.run_in_executor(_IO_EXECUTOR, fn)
+
+
+def _collect_audio_peaks(container, buckets: int):
+    """Per-bucket peak levels in [0, 1] from the container's decoded samples,
+    or None when there is no decodable audio. Buckets divide the SAMPLE axis.
+    A frame spanning several buckets fills each of them, so a clip with fewer
+    frames than buckets still yields a dense envelope."""
+    import numpy as np
+
+    astreams = container.streams.audio
+    if not astreams:
+        return None
+    frame_peaks = []
+    frame_samples = []
+    for frame in container.decode(astreams[0]):
+        arr = frame.to_ndarray()
+        if not arr.size:
+            continue
+        arr = np.abs(arr.astype(np.float32))
+        fmt = (frame.format.name or "")
+        if "s16" in fmt:
+            arr /= 32768.0
+        elif "s32" in fmt:
+            arr /= 2147483648.0
+        elif fmt.startswith("u8"):
+            arr = np.abs(arr - 128.0) / 128.0
+        frame_peaks.append(float(arr.max()))
+        n = int(frame.samples or 0)
+        if not n:
+            # Packed layouts flatten to (1, samples * channels), so the raw
+            # width overcounts by the channel count.
+            ch = max(1, int(getattr(getattr(frame, "layout", None), "nb_channels", 1) or 1))
+            n = arr.shape[-1] // ch if arr.shape[0] == 1 else arr.shape[-1]
+        frame_samples.append(max(1, n))
+        if len(frame_peaks) >= _WAVEFORM_MAX_FRAMES:
+            break
+    if not frame_peaks:
+        return None
+
+    total = float(sum(frame_samples))
+    levels = [0.0] * buckets
+    pos = 0.0
+    for peak, n in zip(frame_peaks, frame_samples):
+        a = int(pos / total * buckets)
+        pos += n
+        b = int(pos / total * buckets)
+        for i in range(max(0, a), min(buckets, b + 1)):
+            if peak > levels[i]:
+                levels[i] = peak
+    top = max(levels)
+    if top > 0:
+        levels = [lvl / top for lvl in levels]
+    return [round(lvl, 4) for lvl in levels]
+
+
+def _waveform_image(container, size: int):
+    """Peak-bar waveform image from the container's decoded samples, or None
+    when there is no decodable audio. Square canvas with the bars in a middle
+    band, so the card's cover-fit never crops the ends off."""
+    from PIL import Image, ImageDraw
+
+    bars = max(48, min(160, size // 4))
+    levels = _collect_audio_peaks(container, bars)
+    if levels is None:
+        return None
+
+    img = Image.new("RGB", (size, size), (24, 24, 32))
+    draw = ImageDraw.Draw(img)
+    bar_w = size / bars
+    mid = size / 2
+    for i, lvl in enumerate(levels):
+        half = max(1.0, lvl * (size * 0.30))
+        x0 = i * bar_w + bar_w * 0.18
+        x1 = (i + 1) * bar_w - bar_w * 0.18
+        draw.rectangle([x0, mid - half, x1, mid + half], fill=(142, 152, 196))
+    return img
+
+
+_AUDIO_PEAK_BUCKETS = 240
+
+
+def _audio_peaks_path(full_path: str) -> Path:
+    return _THUMB_DIR / f"awp_{_thumb_hash(full_path, _AUDIO_PEAK_BUCKETS)}.json"
+
+
+def _mark_decoder_failure(exc: BaseException, out_path: Path) -> None:
+    """Settle undecodable media to the nothing-renderable marker so it is not
+    re-decoded on every view. IO-flavored errors (locked or vanishing files)
+    stay retryable."""
+    try:
+        import av
+        if isinstance(exc, av.FFmpegError) and not isinstance(exc, OSError):
+            out_path.touch()
+    except Exception:
+        pass
+
+
+def _generate_audio_peaks(full_path: str, out_path: Path) -> None:
+    """Write the player's waveform payload of peak levels plus whether the file
+    carries embedded art (which the client shows on the stage). A zero-byte
+    marker records undecodable audio."""
+    with _audio_gen_lock(out_path):
+        if out_path.exists():
+            return
+        try:
+            import av
+        except Exception:
+            return
+        tmp_path = out_path.with_name(f"tmp_{threading.get_ident()}_{out_path.name}")
+        try:
+            out_path.parent.mkdir(parents=True, exist_ok=True)
+            with av.open(full_path, metadata_errors="replace") as container:
+                has_art = bool(container.streams.video)
+                levels = _collect_audio_peaks(container, _AUDIO_PEAK_BUCKETS)
+            if levels is None:
+                out_path.touch()
+                return
+            tmp_path.write_text(json.dumps({"peaks": levels, "art": has_art}), encoding="utf-8")
+            os.replace(tmp_path, out_path)
+        except Exception as exc:
+            _mark_decoder_failure(exc, out_path)
+        finally:
+            try:
+                if tmp_path.exists():
+                    tmp_path.unlink()
+            except OSError:
+                pass
+
+
+@routes.get("/sidebar_gallery/audio_peaks")
+async def get_audio_peaks(request: web.Request):
+    root_id = request.rel_url.query.get("root_id", "")
+    relpath = request.rel_url.query.get("relpath", "")
+
+    root = _find_root(root_id)
+    if root is None:
+        return web.Response(status=404)
+
+    try:
+        full = safe_join(root.path, relpath)
+    except ValueError:
+        return web.Response(status=400)
+    if not os.path.isfile(full):
+        return web.Response(status=404)
+    # Any-extension requests would decode arbitrary media in full (a video's
+    # audio track included), so only indexed audio kinds are served.
+    if kind_from_ext(os.path.splitext(full)[1].lower()) != "audio":
+        return web.Response(status=404)
+
+    pp = _audio_peaks_path(full)
+    if not pp.exists():
+        await _audio_job_off_loop(lambda: _generate_audio_peaks(full, pp))
+    try:
+        if not (pp.exists() and pp.stat().st_size > 0):
+            return web.Response(status=404)
+    except OSError:
+        return web.Response(status=404)
+
+    return web.FileResponse(
+        str(pp),
+        headers={
+            "Content-Type": "application/json",
+            "Cache-Control": "public, max-age=31536000, immutable",
+        },
+    )
+
+
+def _generate_audio_thumbnail(full_path: str, out_path: Path, size: int = 512) -> bool:
+    """Render embedded cover art (an attached picture stream) as the thumbnail,
+    or a waveform drawn from the decoded samples when there is no art. A
+    zero-byte marker at out_path records "nothing renderable", so later views
+    skip reopening the container. The serving side treats an empty file as
+    absent. Atomic temp-file + rename, same rationale as the video path."""
+    with _audio_gen_lock(out_path):
+        if out_path.exists():
+            try:
+                return out_path.stat().st_size > 0
+            except OSError:
+                return False
+        try:
+            import av
+        except Exception:
+            return False
+        # Concurrent generations of one file must not share a temp path.
+        tmp_path = out_path.with_name(f"tmp_{threading.get_ident()}_{out_path.name}")
+        try:
+            out_path.parent.mkdir(parents=True, exist_ok=True)
+            img = None
+            had_art_streams = False
+            with av.open(full_path, metadata_errors="replace") as container:
+                vstreams = container.streams.video
+                had_art_streams = bool(vstreams)
+                if vstreams:
+                    frame = next(container.decode(vstreams[0]), None)
+                    if frame is not None:
+                        scale = min(size / frame.width, size / frame.height, 1.0)
+                        nw = max(1, round(frame.width * scale))
+                        nh = max(1, round(frame.height * scale))
+                        try:
+                            small = frame.reformat(width=nw, height=nh, format="rgb24",
+                                                   interpolation="LANCZOS")
+                        except Exception:
+                            small = frame.reformat(width=nw, height=nh, format="rgb24")
+                        img = small.to_image()
+                else:
+                    img = _waveform_image(container, size)
+            if img is None and had_art_streams:
+                # A declared art stream that yields no frame (truncated art)
+                # still deserves the waveform. Reopen since the art decode
+                # advanced the demuxer.
+                with av.open(full_path, metadata_errors="replace") as container:
+                    img = _waveform_image(container, size)
+            if img is None:
+                out_path.touch()
+                return False
+            img.save(str(tmp_path), format="JPEG", quality=85)
+            if tmp_path.exists() and tmp_path.stat().st_size > 0:
+                os.replace(tmp_path, out_path)
+            return out_path.exists()
+        except Exception as exc:
+            _mark_decoder_failure(exc, out_path)
+            return False
+        finally:
+            try:
+                if tmp_path.exists():
+                    tmp_path.unlink()
+            except OSError:
+                pass
 
 
 def _generate_image_thumbnail(full_path: str, out_path: Path, size: int = 512) -> bool:
@@ -1070,7 +1336,13 @@ def _process_new_files(root, root_id: str, files: list, thumb_size: int) -> list
                 continue
 
             ext = os.path.splitext(fname)[1].lower()
-            kind = "video" if ext in VIDEO_EXTS else "image"
+            # The executed event can deliver output types the gallery does not
+            # index (3D formats among others). The scanner filters these, so
+            # the delta path must too, or they become permanent rows with dead
+            # thumbnails.
+            if ext not in ALL_MEDIA_EXTS:
+                continue
+            kind = kind_from_ext(ext)
             try:
                 st = os.stat(full)
             except OSError:
@@ -1091,9 +1363,13 @@ def _process_new_files(root, root_id: str, files: list, thumb_size: int) -> list
 
             has_thumb = False
             try:
-                tp = (_image_thumb_path(full, thumb_size) if kind == "image"
-                      else _video_thumb_path(full, thumb_size))
-                has_thumb = tp.exists()
+                if kind == "image":
+                    has_thumb = _image_thumb_path(full, thumb_size).exists()
+                elif kind == "video":
+                    has_thumb = _video_thumb_path(full, thumb_size).exists()
+                elif kind == "audio":
+                    _tp = _audio_thumb_path(full, thumb_size)
+                    has_thumb = _tp.exists() and _tp.stat().st_size > 0
             except Exception:
                 pass
 
@@ -1299,7 +1575,12 @@ async def get_metadata(request: web.Request):
                 return
             if not db_row or summary:
                 _ext = os.path.splitext(relpath_clean)[1].lower()
-                _kind = "video" if _ext in VIDEO_EXTS else "image"
+                # Same gate as the scanner and the delta path. An unindexed
+                # extension must never gain a row, or it lists as a dead card
+                # until a scan sweeps it.
+                if _ext not in ALL_MEDIA_EXTS:
+                    return
+                _kind = kind_from_ext(_ext)
                 with media_db._get_conn() as _conn:
                     media_db.upsert_file(_conn, root_id, relpath_clean, _ext, _kind,
                                          int(st.st_size), float(st.st_mtime),
@@ -1519,6 +1800,44 @@ async def get_video_thumb(request: web.Request):
     )
 
 
+@routes.get("/sidebar_gallery/audio_thumb")
+async def get_audio_thumb(request: web.Request):
+    root_id = request.rel_url.query.get("root_id", "")
+    relpath = request.rel_url.query.get("relpath", "")
+    size = _clamped_int(request.rel_url.query.get("size"), 256)
+
+    root = _find_root(root_id)
+    if root is None:
+        return web.Response(status=404)
+
+    try:
+        full = safe_join(root.path, relpath)
+    except ValueError:
+        return web.Response(status=400)
+    if not os.path.isfile(full):
+        return web.Response(status=404)
+
+    if kind_from_ext(os.path.splitext(full)[1].lower()) != "audio":
+        return web.Response(status=404)
+
+    tp = _audio_thumb_path(full, size)
+    if not tp.exists():
+        await _audio_job_off_loop(lambda: _generate_audio_thumbnail(full, tp, size))
+    try:
+        if not (tp.exists() and tp.stat().st_size > 0):
+            return web.Response(status=404)
+    except OSError:
+        return web.Response(status=404)
+
+    return web.FileResponse(
+        str(tp),
+        headers={
+            "Content-Type": "image/jpeg",
+            "Cache-Control": "public, max-age=31536000, immutable",
+        },
+    )
+
+
 # On-demand thumbnail generation
 
 
@@ -1529,7 +1848,6 @@ async def generate_thumb(request: web.Request) -> web.Response:
         return err
     root_id = body.get("root_id", "")
     relpath = body.get("relpath", "")
-    kind = body.get("kind", "image")
     size = _clamped_int(body.get("size"), 512)
 
     root = _find_root(root_id)
@@ -1543,12 +1861,25 @@ async def generate_thumb(request: web.Request) -> web.Response:
     if not os.path.isfile(full):
         return web.Response(status=404)
 
+    kind = kind_from_ext(os.path.splitext(full)[1].lower())
+    if kind not in ("image", "video", "audio"):
+        return web.Response(status=404)
+
     # Generate off the event loop: decoding and PIL are blocking and the
     # video path can take seconds (see the GET handlers above).
     loop = asyncio.get_running_loop()
     if kind == "video":
         tp = _video_thumb_path(full, size)
         ok = await _video_thumb_off_loop(full, tp, size)
+    elif kind == "audio":
+        tp = _audio_thumb_path(full, size)
+        await _audio_job_off_loop(lambda: _generate_audio_thumbnail(full, tp, size))
+        try:
+            if not (tp.exists() and tp.stat().st_size > 0):
+                return web.Response(status=404)
+        except OSError:
+            return web.Response(status=404)
+        ok = True
     else:
         tp = _image_thumb_path(full, size)
         ok = await loop.run_in_executor(_IO_EXECUTOR, lambda: _generate_image_thumbnail(full, tp, size))
@@ -1597,7 +1928,7 @@ async def get_status(request: web.Request) -> web.Response:
     thumb_bytes = 0
     try:
         for f in _THUMB_DIR.iterdir():
-            if f.suffix == ".jpg":
+            if f.suffix in (".jpg", ".json"):
                 thumb_count += 1
                 try:
                     thumb_bytes += f.stat().st_size

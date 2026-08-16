@@ -1051,6 +1051,517 @@ export const DEFAULT_IMAGE_LAYOUT = [
   }
 ];
 
+export const DEFAULT_AUDIO_LAYOUT = [
+  {
+    "id": "file_info",
+    "title": "File Info",
+    "style": "flat",
+    "open": true,
+    "params": [
+      {
+        "path": "filename",
+        "label": "",
+        "style": "title"
+      },
+      {
+        "path": "path",
+        "label": "Path",
+        "_prevStyle": "kv",
+        "style": "hidden"
+      },
+      {
+        "path": "filesize",
+        "label": "Size",
+        "style": "pill",
+        "color": {
+          "bg": "rgba(255, 255, 255, 0.2)"
+        }
+      },
+      {
+        "path": "duration",
+        "label": "Duration",
+        "style": "pill",
+        "color": {
+          "bg": "rgba(255, 255, 255, 0.2)"
+        }
+      },
+      {
+        "path": "codec",
+        "label": "Codec",
+        "style": "pill",
+        "color": {
+          "bg": "rgba(255, 255, 255, 0.2)"
+        }
+      },
+      {
+        "path": "sample_rate",
+        "label": "Sample Rate",
+        "style": "pill",
+        "format": "{v} Hz",
+        "color": {
+          "bg": "rgba(255, 255, 255, 0.2)"
+        }
+      },
+      {
+        "path": "bitrate",
+        "label": "Bitrate",
+        "style": "pill",
+        "format": "{v} kbps",
+        "color": {
+          "bg": "rgba(255, 255, 255, 0.2)"
+        }
+      },
+      {
+        "path": "channels",
+        "label": "Channels",
+        "style": "pill",
+        "format": "Channels: {v}"
+      },
+      {
+        "path": "modified",
+        "label": "Modified",
+        "_prevStyle": "kv",
+        "style": "hidden"
+      }
+    ]
+  },
+  {
+    "id": "track",
+    "title": "Track",
+    "style": "flat",
+    "open": true,
+    "params": [
+      {
+        "path": "track.title",
+        "label": "Title",
+        "style": "detail"
+      },
+      {
+        "path": "track.artist",
+        "label": "Artist",
+        "style": "detail"
+      },
+      {
+        "path": "track.album",
+        "label": "Album",
+        "style": "detail"
+      },
+      {
+        "path": "track.album_artist",
+        "label": "Album Artist",
+        "style": "detail",
+        "color": {}
+      },
+      {
+        "path": "track.genre",
+        "label": "Genre",
+        "style": "detail"
+      },
+      {
+        "path": "track.date",
+        "label": "Date",
+        "style": "detail"
+      },
+      {
+        "path": "track.track",
+        "label": "Track #",
+        "style": "detail"
+      },
+      {
+        "path": "track.composer",
+        "label": "Composer",
+        "style": "detail"
+      }
+    ]
+  },
+  {
+    "id": "models",
+    "title": "Models",
+    "style": "cards",
+    "open": true,
+    "params": [
+      {
+        "path": "model",
+        "label": "Model",
+        "style": "title",
+        "color": {
+          "text": "rgba(254, 196, 62, 1)"
+        }
+      },
+      {
+        "path": "clip_models",
+        "label": "CLIP",
+        "style": "detail"
+      },
+      {
+        "path": "text_projection",
+        "label": "Text Projection",
+        "style": "detail"
+      },
+      {
+        "path": "vae",
+        "label": "VAE",
+        "style": "detail"
+      },
+      {
+        "path": "audio_vae",
+        "label": "Audio VAE",
+        "style": "detail"
+      }
+    ]
+  },
+  {
+    "id": "sampling",
+    "title": "Sampling",
+    "style": "cards",
+    "open": true,
+    "source": "samplers",
+    "highlow": true,
+    "params": [
+      {
+        "path": "samplers.sampler_name",
+        "label": "Sampler",
+        "style": "pill",
+        "color": {
+          "bg": "rgba(255, 255, 255, 0.2)"
+        }
+      },
+      {
+        "path": "samplers.scheduler",
+        "label": "Scheduler",
+        "style": "pill",
+        "color": {
+          "bg": "rgba(255, 255, 255, 0.2)"
+        }
+      },
+      {
+        "path": "samplers.cfg",
+        "label": "CFG",
+        "style": "pill",
+        "format": "CFG: {v}",
+        "color": {
+          "bg": "rgba(255, 255, 255, 0.2)"
+        }
+      },
+      {
+        "path": "samplers.steps",
+        "label": "Steps",
+        "style": "pill",
+        "format": "Steps: {v}",
+        "color": {
+          "bg": "rgba(255, 255, 255, 0.2)"
+        }
+      },
+      {
+        "path": "samplers.shift",
+        "label": "Shift",
+        "style": "pill",
+        "format": "Shift: {v}"
+      },
+      {
+        "path": "samplers.denoise",
+        "label": "Denoise",
+        "style": "hidden",
+        "format": "Denoise: {v}",
+        "color": {
+          "bg": "rgba(255, 255, 255, 0.2)"
+        },
+        "_prevStyle": "pill"
+      },
+      {
+        "path": "samplers.seed",
+        "label": "Seed",
+        "style": "detail"
+      }
+    ]
+  },
+  {
+    "id": "loras",
+    "title": "LoRAs",
+    "style": "cards",
+    "open": true,
+    "source": "loras",
+    "highlow": false,
+    "params": [
+      {
+        "path": "loras.name",
+        "label": "LoRA Name",
+        "style": "title",
+        "color": {
+          "text": "rgba(255, 255, 255, 1)"
+        }
+      },
+      {
+        "path": "loras.strength_model",
+        "label": "Strength",
+        "style": "detail",
+        "format": "Strength: {v}",
+        "color": {
+          "text": "rgba(254, 196, 62, 1)"
+        }
+      }
+    ]
+  },
+  {
+    "id": "song",
+    "title": "Song",
+    "style": "flat",
+    "open": true,
+    "params": [
+      {
+        "path": "workflow_nodes.TextEncodeAceStepAudio1.5.bpm",
+        "label": "BPM",
+        "style": "pill",
+        "format": "BPM: {v}",
+        "color": {
+          "bg": "rgba(255, 255, 255, 0.2)"
+        }
+      },
+      {
+        "path": "workflow_nodes.TextEncodeAceStepAudio1.5.keyscale",
+        "label": "Key",
+        "style": "pill",
+        "format": "Key: {v}",
+        "color": {
+          "bg": "rgba(255, 255, 255, 0.2)"
+        }
+      },
+      {
+        "path": "workflow_nodes.TextEncodeAceStepAudio1.5.timesignature",
+        "label": "Time Signature",
+        "style": "pill",
+        "format": "Time Signature: {v}",
+        "color": {
+          "bg": "rgba(255, 255, 255, 0.2)"
+        }
+      },
+      {
+        "path": "workflow_nodes.TextEncodeAceStepAudio1.5.language",
+        "label": "Language",
+        "style": "detail",
+        "format": "Language: {v}"
+      },
+      {
+        "path": "workflow_nodes.TextEncodeAceStepAudio1.5.cfg_scale",
+        "label": "Cfg Scale",
+        "style": "pill",
+        "format": "CFG Scale: {v}"
+      },
+      {
+        "path": "workflow_nodes.TextEncodeAceStepAudio1.5.generate_audio_codes",
+        "label": "Generate Audio Codes",
+        "style": "detail"
+      },
+      {
+        "path": "workflow_nodes.TextEncodeAceStepAudio1.5.temperature",
+        "label": "Temperature",
+        "style": "pill",
+        "format": "Temperature: {v}"
+      },
+      {
+        "path": "workflow_nodes.TextEncodeAceStepAudio1.5.top_p",
+        "label": "Top P",
+        "style": "pill",
+        "format": "Top P: {v}"
+      },
+      {
+        "path": "workflow_nodes.TextEncodeAceStepAudio1.5.top_k",
+        "label": "Top K",
+        "style": "pill",
+        "format": "Top K: {v}"
+      },
+      {
+        "path": "workflow_nodes.TextEncodeAceStepAudio1.5.min_p",
+        "label": "Min P",
+        "style": "pill",
+        "format": "Min P: {v}"
+      },
+      {
+        "path": "workflow_nodes.TextEncodeAceStepAudio1.5.seed",
+        "label": "Seed",
+        "style": "detail"
+      }
+    ]
+  },
+  {
+    "id": "voice",
+    "title": "Voice",
+    "style": "flat",
+    "open": true,
+    "params": [
+      {
+        "path": "workflow_nodes.ChatterBoxEngineNode.language",
+        "label": "Language",
+        "style": "pill",
+        "format": "Lang: {v}",
+        "color": {
+          "bg": "rgba(255, 255, 255, 0.2)"
+        }
+      },
+      {
+        "path": "workflow_nodes.ChatterBoxEngineNode.exaggeration",
+        "label": "Exaggeration",
+        "style": "pill",
+        "format": "Exaggeration: {v}",
+        "color": {
+          "bg": "rgba(255, 255, 255, 0.2)"
+        }
+      },
+      {
+        "path": "workflow_nodes.ChatterBoxEngineNode.temperature",
+        "label": "Temperature",
+        "style": "pill",
+        "format": "Temp: {v}",
+        "color": {
+          "bg": "rgba(255, 255, 255, 0.2)"
+        }
+      },
+      {
+        "path": "workflow_nodes.ChatterBoxEngineNode.cfg_weight",
+        "label": "CFG Weight",
+        "style": "pill",
+        "format": "CFG: {v}",
+        "color": {
+          "bg": "rgba(255, 255, 255, 0.2)"
+        }
+      },
+      {
+        "path": "workflow_nodes.CharacterVoicesNode.voice_name",
+        "label": "Voice",
+        "style": "detail"
+      },
+      {
+        "path": "workflow_nodes.UnifiedTTSTextNode.text",
+        "label": "Spoken Text",
+        "style": "text",
+        "color": {
+          "bg": "rgba(23, 43, 32, 1)"
+        }
+      }
+    ]
+  },
+  {
+    "id": "positive",
+    "title": "Positive Prompt",
+    "style": "text",
+    "open": true,
+    "params": [],
+    "color": {
+      "bg": "rgba(22, 42, 31, 1)",
+      "border": "rgba(33, 196, 93, 0.25)",
+      "text": "rgba(224, 224, 255, 1)"
+    },
+    "tabs": [
+      {
+        "id": "tab_msaud1in_0",
+        "label": "Initial",
+        "style": "text",
+        "params": [
+          {
+            "path": "initial_prompt",
+            "label": "Initial Prompt",
+            "style": "text",
+            "color": {
+              "bg": "rgba(0, 0, 0, 0)"
+            }
+          }
+        ]
+      },
+      {
+        "id": "tab_msaud1en_1",
+        "label": "Enhanced",
+        "style": "text",
+        "params": [
+          {
+            "path": "positive_prompt",
+            "label": "Positive Prompt",
+            "style": "text",
+            "color": {
+              "bg": "rgba(0, 0, 0, 0)"
+            }
+          }
+        ]
+      },
+      {
+        "id": "tab_msuu1nnh_0",
+        "label": "Tags",
+        "style": "text",
+        "params": [
+          {
+            "path": "audio_tags",
+            "label": "Tags",
+            "style": "text",
+            "color": {
+              "bg": "rgba(0, 0, 0, 0)"
+            }
+          }
+        ],
+        "pillColor": {}
+      },
+      {
+        "id": "tab_msuu1q52_1",
+        "label": "Lyrics",
+        "style": "text",
+        "params": [
+          {
+            "path": "audio_lyrics",
+            "label": "Lyrics",
+            "style": "text",
+            "color": {
+              "bg": "rgba(0, 0, 0, 0)"
+            }
+          }
+        ],
+        "color": {}
+      }
+    ]
+  },
+  {
+    "id": "negative",
+    "title": "Negative Prompt",
+    "style": "text",
+    "open": true,
+    "params": [
+      {
+        "path": "negative_prompt",
+        "label": "Negative Prompt",
+        "style": "text"
+      }
+    ],
+    "color": {
+      "bg": "rgba(42, 24, 27, 1)",
+      "border": "rgba(239, 68, 68, 0.25)"
+    }
+  },
+  {
+    "id": "workflow_nodes",
+    "title": "Workflow Nodes",
+    "style": "nodes",
+    "open": false,
+    "params": []
+  },
+  {
+    "id": "extra",
+    "title": "Extra Metadata",
+    "style": "flat",
+    "open": false,
+    "params": [
+      {
+        "path": "extra.*"
+      }
+    ],
+    "hidden": true
+  },
+  {
+    "id": "raw",
+    "title": "Raw Metadata",
+    "style": "raw",
+    "open": false,
+    "params": [],
+    "hidden": true
+  }
+];
+
 export const DEFAULT_VIDEO_LAYOUT = [
   {
     "id": "file_info",
@@ -1089,7 +1600,6 @@ export const DEFAULT_VIDEO_LAYOUT = [
         "path": "duration",
         "label": "Duration",
         "style": "pill",
-        "format": "{v}s",
         "color": {
           "bg": "rgba(255, 255, 255, 0.2)"
         }

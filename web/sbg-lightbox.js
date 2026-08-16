@@ -9,7 +9,8 @@ import { app } from "../../scripts/app.js";
 
 import {
   ensureCss, h, api, fmtBytes, pj, kvRow,
-  showToast, copyText, fileUrl, isVideo,
+  showToast, copyText, fileUrl, isVideo, isAudio, mediaKey, kindIcon,
+  AUDIO_ICON,
   _metaCache, _metaCacheAPI, _mediaState,
   singleFlight,
   searchState, highlightSearchMatches,
@@ -17,20 +18,34 @@ import {
 } from "./sbg-core.js";
 
 import * as TL from "./sbg-translation-layer.js";
-import { itemKey, nextCompareIdx, remapCompareIdx, initialImageList, normalizeInitialEntry } from "./sbg-compare-utils.js";
+import { itemKey, nextCompareIdx, remapCompareIdx, initialImageList, initialAudioList, sourceMediaList, normalizeInitialEntry } from "./sbg-compare-utils.js";
 import { createZoomPanController } from "./sbg-lightbox-zoom.js";
 import { descFromKeyEvent, descFromMouseEvent, matchExplicit, matchBare } from "./sbg-keybinds.js";
 
-// Fully release a <video>'s decoder. Removing the element from the DOM is not
-// enough: the browser keeps the (hardware) decoder alive until garbage
+const COMPARE_LABEL = "Compare";
+const COMPARE_EXIT_LABEL = "✕ Exit Compare";
+
+// Fully release a media element's decoder. Removing the element from the DOM
+// is not enough, since the browser keeps the (hardware) decoder alive until garbage
 // collection, and Firefox-on-Windows has a tiny H.265/HEVC decoder pool. A few
 // un-released video elements exhaust it, after which every subsequent H.265 clip
 // fails with "could not be decoded" / NS_ERROR_DOM_MEDIA_NOT_SUPPORTED_ERR
 // (H.264 has a software fallback, so it keeps playing; a page refresh frees them
-// all). Clearing src + load() drops the decoder immediately.
-function releaseVideo(el) {
-  if (!el || el.tagName !== "VIDEO") return;
-  try { el.pause(); el.removeAttribute("src"); el.load(); } catch { }
+// all). Clearing src + load() drops the decoder immediately. A detached <audio>
+// likewise keeps playing until collected, so it gets the same release. Audio
+// arrives wrapped in a container, hence the descendant lookup.
+function releaseMedia(el) {
+  if (!el) return;
+  // Panes owning observers or other non-DOM resources attach a dispose hook.
+  if (el._sbgDispose) {
+    try { el._sbgDispose(); } catch { }
+    el._sbgDispose = null;
+  }
+  const m = (el.tagName === "VIDEO" || el.tagName === "AUDIO")
+    ? el
+    : (el.querySelector ? el.querySelector("video, audio") : null);
+  if (!m) return;
+  try { m.pause(); m.removeAttribute("src"); m.load(); } catch { }
 }
 
 // Resolve a source/initial image's summary metadata, cached so navigating
@@ -147,25 +162,29 @@ export function openLightbox(_initialItems, startItemOrIndex, openEvent) {
   const closeBtn = h("button", { class: "sbg-lb__close", text: "✕", title: `Close (${keyClose})` });
 
   const bottomName = h("span", { class: "sbg-lb__bottom-name" });
-  const dlBtn = h("a", { class: "sbg-btn sbg-btn--sm", text: "⬇ Download", title: "Download file", download: "", target: "_blank" });
+  const dlBtn = h("a", { class: "sbg-btn sbg-btn--sm", text: "Download", title: "Download file", download: "", target: "_blank" });
   const loadWfBtn = h("button", { class: "sbg-btn sbg-btn--sm sbg-btn--accent", text: "Load Workflow", title: "Load workflow into ComfyUI", disabled: "true" });
   const copyPromptBtn = h("button", { class: "sbg-btn sbg-btn--sm", text: "Copy Prompt", title: "Copy positive prompt", disabled: "true" });
   const copyWfBtn = h("button", { class: "sbg-btn sbg-btn--sm", text: "Copy WF", title: "Copy workflow JSON", disabled: "true" });
+
+  const compareBtn = h("button", { class: "sbg-btn sbg-btn--sm", text: COMPARE_LABEL, title: `Compare with another file${keyCompare ? ` (${keyCompare})` : ""}` });
 
   if (!getSetting(S.LB_SHOW_DOWNLOAD, true)) dlBtn.style.display = "none";
   if (!getSetting(S.LB_SHOW_COPY_PROMPT, true)) copyPromptBtn.style.display = "none";
   if (!getSetting(S.LB_SHOW_COPY_WF, true)) copyWfBtn.style.display = "none";
   if (!getSetting(S.LB_SHOW_LOAD_WF, true)) loadWfBtn.style.display = "none";
+  if (!getSetting(S.LB_SHOW_COMPARE, true)) compareBtn.style.display = "none";
 
   const _lbcDl = getSetting(S.LB_COLOR_DOWNLOAD, "");
   const _lbcCp = getSetting(S.LB_COLOR_COPY_PROMPT, "");
   const _lbcWf = getSetting(S.LB_COLOR_COPY_WF, "");
   const _lbcLw = getSetting(S.LB_COLOR_LOAD_WF, "");
+  const _lbcCmp = getSetting(S.LB_COLOR_COMPARE, "");
   if (_lbcDl) dlBtn.style.background = _lbcDl;
   if (_lbcCp) copyPromptBtn.style.background = _lbcCp;
   if (_lbcWf) copyWfBtn.style.background = _lbcWf;
   if (_lbcLw) loadWfBtn.style.background = _lbcLw;
-  const compareBtn = h("button", { class: "sbg-btn sbg-btn--sm", text: "⚖ Compare", title: `Compare with another image${keyCompare ? ` (${keyCompare})` : ""}` });
+  if (_lbcCmp) compareBtn.style.background = _lbcCmp;
 
   const bottomBar = h("div", { class: "sbg-lb__bottom" }, [
     bottomName,
@@ -183,7 +202,7 @@ export function openLightbox(_initialItems, startItemOrIndex, openEvent) {
   const savedMetaWidth = localStorage.getItem("SBG.MetaPanelWidth");
   const _metaHeaderBadge = h("span", { class: "sbg-source-app" }); // placeholder, filled by renderMeta
 
-  // The tab bar is only shown when initial_image data exists.
+  // The tab bar is only shown when source media (initial image/audio) exists.
   const _tabGenerated = h("button", { class: "sbg-lb__meta-tab sbg-lb__meta-tab--active", text: "Generated" });
   const _tabInitialImage = h("button", { class: "sbg-lb__meta-tab", text: "Initial Image" });
   const initTabColor = getSetting(S.INITIAL_IMAGE_TAB_COLOR, "");
@@ -360,7 +379,7 @@ export function openLightbox(_initialItems, startItemOrIndex, openEvent) {
     _pendingInitialArgs = null;
     const tabPersist = getSetting(S.META_TAB_PERSIST, false);
     if (!tabPersist && !_compareActive) _setActiveMetaTab("generated");
-    if (!_compareActive) _metaTabs.style.display = "none"; // hide until initial_image found
+    if (!_compareActive) _metaTabs.style.display = "none"; // hide until source media found
 
     if (!m) {
       metaBody.appendChild(h("div", { class: "sbg-lb__loading", text: "No metadata" }));
@@ -407,8 +426,8 @@ export function openLightbox(_initialItems, startItemOrIndex, openEvent) {
     // object lacks `filename` and `kind`, but the gallery item has both.
     const fileItem = (items && items[idx]) || m.file || {};
     const _app = s.source_app || "comfyui";
-    const _isVid = isVideo(fileItem);
-    const _profile = TL.getActiveProfile(_app, _isVid);
+    const _media = mediaKey(fileItem);
+    const _profile = TL.getActiveProfile(_app, _media);
     const _merged = _mergeFileInfo(s, fileItem);
 
     for (const section of _profile) {
@@ -416,7 +435,7 @@ export function openLightbox(_initialItems, startItemOrIndex, openEvent) {
       if (section.hidden) continue;  // hidden via the layout-editor eye toggle
       if (!TL.sectionHasData(section, _merged)) continue;
       const rawData = section.style === "raw" ? (m.workflow || m.prompt || null) : null;
-      const contentEl = TL.renderSection(section, _merged, { rawData, profileKey: TL.profileKey(_app, _isVid) });
+      const contentEl = TL.renderSection(section, _merged, { rawData, profileKey: TL.profileKey(_app, _media) });
       if (!contentEl) continue;
       metaBody.appendChild(makeSection(section, contentEl));
     }
@@ -435,8 +454,9 @@ export function openLightbox(_initialItems, startItemOrIndex, openEvent) {
     while (metaBody.firstChild) _generatedMetaContent.appendChild(metaBody.firstChild);
     metaBody.appendChild(_generatedMetaContent);
 
-    if (initialImageList(s).length) {
+    if (sourceMediaList(s).length) {
       _metaTabs.style.display = "";
+      _tabInitialImage.textContent = _initialTabLabel(initialImageList(s).length, initialAudioList(s).length);
       // LAZY: don't build the blocks (async metadata chains + /view probes per
       // source image) unless the tab is actually shown. _switchMetaTab builds
       // from these pending args on first activation; compare mode has its own
@@ -456,10 +476,16 @@ export function openLightbox(_initialItems, startItemOrIndex, openEvent) {
   // token joins the path so two entries differing only by annotation stay
   // distinct.
   function _initialContentKey(s, rootId) {
-    return `${rootId || ""}:${initialImageList(s).map(e => {
+    return `${rootId || ""}:${sourceMediaList(s).map(e => {
       const n = normalizeInitialEntry(e);
       return n.path + (n.srcType ? "|" + n.srcType : "");
     }).join("\x00")}`;
+  }
+
+  // The tab covers every source kind, named for the source kinds present.
+  function _initialTabLabel(imgs, auds) {
+    if (imgs && auds) return "Initial Media";
+    return auds ? "Initial Audio" : "Initial Image";
   }
 
   // Fresh wrapper of per-image blocks. The DOM is intentionally NOT cached:
@@ -471,30 +497,37 @@ export function openLightbox(_initialItems, startItemOrIndex, openEvent) {
   // invalidates its siblings' cached work.
   function _getInitialContent(s, rootId) {
     const list = initialImageList(s);
+    const audios = initialAudioList(s);
     const el = h("div", {});
     list.forEach((entry, i) => {
       const label = list.length > 1 ? `Source Image ${i + 1} of ${list.length}` : "Source Image";
       el.appendChild(_buildInitialContent(entry, rootId, label));
     });
+    audios.forEach((entry, i) => {
+      const label = audios.length > 1 ? `Source Audio ${i + 1} of ${audios.length}` : "Source Audio";
+      el.appendChild(_buildInitialContent(entry, rootId, label, "audio"));
+    });
     return el;
   }
 
-  // Which /view type (input/output/temp) serves a source image, resolved once
-  // per image per session; "none" = all three 404ed (skip probing next time).
+  // Which /view type (input/output/temp) serves a source file, resolved once
+  // per file per session. A stored "none" means all three 404ed, so the
+  // probe chain is skipped next time.
   const _initViewType = new Map();
 
-  // One source image's block, used by the normal Initial Image tab and by
-  // compare mode for both sides.
-  function _buildInitialContent(entry, rootId, label) {
+  // One source media block, image or audio by kind, used by the normal
+  // Initial tab and by compare mode for both sides.
+  function _buildInitialContent(entry, rootId, label, kind) {
     const initWrap = h("div", { class: "sbg-meta-group", style: "padding:8px" });
 
     const { path: imgPath, name: imgName, srcType } = normalizeInitialEntry(entry);
     initWrap.appendChild(h("div", { style: "font-size:12px;font-weight:600;color:var(--sbg-text);margin-bottom:6px", text: label || "Source Image" }));
 
-    // Thumbnail preview via ComfyUI's /view endpoint. The image can live in
-    // input, output, or temp; an annotated path names its location, which is
-    // probed first, and the working type is remembered per image so the
-    // onerror probe chain runs at most once per session.
+    // Preview via ComfyUI's /view endpoint, an image thumbnail or an audio
+    // player by source kind. The file can live in input, output, or temp, and
+    // an annotated path names its location, which is probed first. The
+    // working type is remembered per file so the onerror probe chain runs at
+    // most once per session.
     if (imgPath) {
       const parts = imgPath.replace(/\\/g, "/").split("/");
       const basename = parts.pop();
@@ -504,12 +537,14 @@ export function openLightbox(_initialItems, startItemOrIndex, openEvent) {
         : `/view?filename=${encodeURIComponent(basename)}&type=${type}`;
       const vk = `${rootId || ""}:${imgPath}` + (srcType ? "|" + srcType : "");
       const known = _initViewType.get(vk);
-      const img = h("img", { class: "sbg-initial-image-preview" });
+      const media = kind === "audio"
+        ? h("audio", { controls: "true", preload: "metadata", style: "width:100%;margin-bottom:6px" })
+        : h("img", { class: "sbg-initial-image-preview" });
       if (known === "none") {
-        img.style.display = "none";
+        media.style.display = "none";
       } else if (known) {
-        img.src = viewUrl(known);
-        initWrap.appendChild(img);
+        media.src = viewUrl(known);
+        initWrap.appendChild(media);
       } else {
         const _viewTypes = srcType
           ? [srcType, ...["input", "output", "temp"].filter(t => t !== srcType)]
@@ -517,16 +552,18 @@ export function openLightbox(_initialItems, startItemOrIndex, openEvent) {
         let _vt = 0;
         const _tryNextView = () => {
           if (_vt >= _viewTypes.length) {
-            img.style.display = "none";
+            media.style.display = "none";
             _initViewType.set(vk, "none");
             return;
           }
-          img.src = viewUrl(_viewTypes[_vt++]);
+          media.src = viewUrl(_viewTypes[_vt++]);
         };
-        img.onerror = _tryNextView;
-        img.onload = () => _initViewType.set(vk, _viewTypes[_vt - 1]);
+        media.onerror = _tryNextView;
+        const _remember = () => _initViewType.set(vk, _viewTypes[_vt - 1]);
+        if (kind === "audio") media.onloadedmetadata = _remember;
+        else media.onload = _remember;
         _tryNextView();
-        initWrap.appendChild(img);
+        initWrap.appendChild(media);
       }
     }
 
@@ -553,7 +590,7 @@ export function openLightbox(_initialItems, startItemOrIndex, openEvent) {
           metaNote.remove();
           const initS = m.summary;
           const initMerged = _mergeFileInfo(initS, m.file);
-          const initProfile = TL.getActiveProfile(initS.source_app || "comfyui", false);
+          const initProfile = TL.getActiveProfile(initS.source_app || "comfyui", kind === "audio" ? "audio" : false);
           for (const section of initProfile) {
             if (!section || !section.title) continue;
             if (!TL.sectionHasData(section, initMerged)) continue;
@@ -632,6 +669,10 @@ export function openLightbox(_initialItems, startItemOrIndex, openEvent) {
       } else {
         zoomCtl.resetAll();
       }
+    } else if (_compareActive && zoomSettings.compareZoom !== "synced") {
+      zoomCtl.abortDrag("left");
+    } else {
+      zoomCtl.abortDrag();
     }
 
     // Keep the previous frame visible until the new media can paint, so there's
@@ -649,8 +690,9 @@ export function openLightbox(_initialItems, startItemOrIndex, openEvent) {
     const mediaHost = (_compareActive && _compareElements) ? _compareElements.leftFig : mediaContainer;
     for (const child of [...mediaHost.children]) {
       if (_isCompareTag(child)) continue;
-      if (child.tagName === "VIDEO" || (child.dataset && child.dataset.sbgPending === "1")) {
-        releaseVideo(child);
+      if (child.tagName === "VIDEO"
+          || (child.dataset && (child.dataset.sbgPending === "1" || child.dataset.sbgMedia))) {
+        releaseMedia(child);
         // Detaching an <img> does NOT abort its in-flight fetch, and a pending
         // decode() keeps the full download + rasterization alive. Clearing src
         // does abort both. Without this, holding the nav key queues a complete
@@ -659,8 +701,12 @@ export function openLightbox(_initialItems, startItemOrIndex, openEvent) {
         if (child.tagName === "IMG") child.removeAttribute("src");
         // The rapid-nav path defers buildMedia, so until it runs the media
         // keys (mute, frame step, spacebar) would otherwise act on this
-        // released, detached element; null makes them explicit no-ops.
-        if (child === currentMediaEl) currentMediaEl = null;
+        // released, detached element. Nulling it makes them explicit no-ops. The
+        // audio element lives inside its wrap, so check containment too.
+        if (child === currentMediaEl
+            || (currentMediaEl && child.contains && child.contains(currentMediaEl))) {
+          currentMediaEl = null;
+        }
         child.remove();
       }
     }
@@ -680,7 +726,7 @@ export function openLightbox(_initialItems, startItemOrIndex, openEvent) {
         // The media may have been adopted into (or out of) the compare figure
         // between fade start and swap; remove it wherever it lives now.
         if (!old.parentNode) continue;
-        releaseVideo(old);
+        releaseMedia(old);
         old.remove();
       }
       // Keep Zoom While Browsing: the fresh element starts untransformed, so
@@ -697,15 +743,20 @@ export function openLightbox(_initialItems, startItemOrIndex, openEvent) {
     // only the settled frame loads. The counter/labels below still track every
     // step, and single-step navigation (gaps > _RAPID_NAV_MS) is unaffected.
     const _RAPID_NAV_MS = 160;
+    const _FULL_PRELOAD_MAX_BYTES = 16 * 1024 * 1024;
     const rapid = performance.now() - _lastNavAt < _RAPID_NAV_MS;
     _lastNavAt = performance.now();
 
     const buildMedia = () => {
     if (isVideo(it)) {
-      // preload="metadata" (not "auto"): "auto" eagerly buffers/decodes the whole
-      // clip the moment its src is set, keeping the HEVC decoder engaged longer
-      // than needed. autoplay still plays it; this trims decoder/IO pressure.
-      const video = h("video", { class: "sbg-lb__video", controls: "true", autoplay: "true", preload: "metadata" });
+      // Small clips buffer whole for the same reason audio does: a streamed
+      // element relies on suspend/resume, and a resume gone wrong marks
+      // end-of-stream at the buffered frontier, ending the clip early. Large
+      // files keep preload="metadata", since "auto" eagerly buffers/decodes
+      // the whole clip the moment its src is set, keeping the HEVC decoder
+      // engaged longer than needed. autoplay still plays either way.
+      const _preload = (it.size && it.size <= _FULL_PRELOAD_MAX_BYTES) ? "auto" : "metadata";
+      const video = h("video", { class: "sbg-lb__video", controls: "true", autoplay: "true", preload: _preload });
       video.dataset.sbgPending = "1";
       video.style.position = "absolute";
       video.style.opacity = "0";
@@ -744,6 +795,174 @@ export function openLightbox(_initialItems, startItemOrIndex, openEvent) {
       _insertMedia(video);
       video.src = fileUrl(it);
       if (video.readyState >= 2) _swapIn(video); // already buffered (revisit)
+    } else if (isAudio(it)) {
+      const wrap = h("div", { class: "sbg-lb__audio-wrap" });
+      wrap.dataset.sbgMedia = "audio";
+      wrap.dataset.sbgPending = "1";
+      wrap.style.position = "absolute";
+      wrap.style.opacity = "0";
+
+      // Full preload: with preload="metadata" Firefox fetches a prefix and
+      // relies on suspend/resume for the rest, and a resume gone wrong marks
+      // end-of-stream at the buffered frontier, ending short clips early.
+      // Audio files are small, so buffering them whole closes that window.
+      const audio = h("audio", { autoplay: "true", preload: "auto" });
+      audio.volume = _mediaState.volume;
+      audio.muted = _mediaState.muted;
+      const _toggle = () => {
+        if (audio.paused) {
+          const p = audio.play();
+          // A toggle or teardown can abort a pending play(). That rejection
+          // is expected and must not surface as an unhandled error.
+          if (p && p.catch) p.catch(() => { });
+        } else {
+          audio.pause();
+        }
+      };
+
+      // Stage: embedded cover art when the file has any (the peaks payload
+      // says so, since the thumbnail alone can't be told apart from a rendered
+      // waveform), the kind icon otherwise.
+      const stage = h("div", { class: "sbg-lb__audio-stage" });
+      stage.addEventListener("click", _toggle);
+      const icon = h("div", { class: "sbg-lb__audio-icon", html: AUDIO_ICON });
+      stage.appendChild(icon);
+
+      // Seek surface: peak bars with played-portion coloring.
+      const scrub = h("canvas", { class: "sbg-lb__audio-scrub" });
+      let peaks = null;
+      const drawWave = () => {
+        if (!scrub.isConnected) return;
+        const w = scrub.clientWidth, hgt = scrub.clientHeight;
+        if (!w || !hgt) return;
+        const dpr = Math.min(window.devicePixelRatio || 1, 2);
+        if (scrub.width !== Math.round(w * dpr)) { scrub.width = Math.round(w * dpr); scrub.height = Math.round(hgt * dpr); }
+        const ctx = scrub.getContext("2d");
+        ctx.setTransform(dpr, 0, 0, dpr, 0, 0);
+        ctx.clearRect(0, 0, w, hgt);
+        const accent = getComputedStyle(scrub).getPropertyValue("--sbg-accent").trim() || "#7c6aef";
+        const frac = isFinite(audio.duration) && audio.duration > 0 ? audio.currentTime / audio.duration : 0;
+        const n = peaks ? peaks.length : 120;
+        const bw = w / n;
+        for (let i = 0; i < n; i++) {
+          const lvl = peaks ? peaks[i] : 0.3;
+          const half = Math.max(1, lvl * hgt * 0.46);
+          ctx.fillStyle = (i + 0.5) / n <= frac ? accent : "rgba(255, 255, 255, 0.28)";
+          ctx.fillRect(i * bw + bw * 0.18, hgt / 2 - half, Math.max(1, bw * 0.64), half * 2);
+        }
+      };
+      const seekAt = (e) => {
+        if (!isFinite(audio.duration) || audio.duration <= 0) return;
+        const r = scrub.getBoundingClientRect();
+        const f = Math.min(1, Math.max(0, (e.clientX - r.left) / r.width));
+        audio.currentTime = f * audio.duration;
+        drawWave();
+      };
+      let scrubbing = false;
+      const _endScrub = (e) => { scrubbing = false; try { scrub.releasePointerCapture(e.pointerId); } catch { } };
+      scrub.addEventListener("pointerdown", (e) => {
+        if (e.button !== 0) return;
+        try { scrub.setPointerCapture(e.pointerId); } catch { }
+        scrubbing = true;
+        seekAt(e);
+      });
+      scrub.addEventListener("pointermove", (e) => { if (scrubbing) seekAt(e); });
+      scrub.addEventListener("pointerup", _endScrub);
+      // The pointer stream can end without a pointerup (context menu, capture
+      // loss). Without these the next hover would keep seeking.
+      scrub.addEventListener("pointercancel", _endScrub);
+      scrub.addEventListener("lostpointercapture", () => { scrubbing = false; });
+
+      // Controls row.
+      const playBtn = h("button", { class: "sbg-lb__audio-btn sbg-lb__audio-btn--play", html: _PLAY_SVG, title: "Play/Pause (Space)" });
+      playBtn.addEventListener("click", _toggle);
+      const timeEl = h("span", { class: "sbg-lb__audio-time", text: "0:00 / 0:00" });
+      const muteBtn = h("button", { class: "sbg-lb__audio-btn", html: audio.muted ? _VOL_MUTED_SVG : _VOL_SVG, title: "Mute" });
+      muteBtn.addEventListener("click", () => { audio.muted = !audio.muted; });
+      const volSlider = h("input", { type: "range", class: "sbg-lb__audio-vol", min: "0", max: "1", step: "0.01" });
+      volSlider.value = String(audio.volume);
+      volSlider.addEventListener("input", () => { audio.volume = Number(volSlider.value); if (audio.muted && audio.volume > 0) audio.muted = false; });
+      // A focused input suppresses every lightbox keybinding, so release
+      // focus once the pointer interaction ends.
+      volSlider.addEventListener("pointerup", () => volSlider.blur());
+      const controls = h("div", { class: "sbg-lb__audio-controls" }, [playBtn, timeEl, h("span", { class: "sbg-lb__audio-spacer" }), muteBtn, volSlider]);
+
+      audio.onvolumechange = () => {
+        _mediaState.volume = audio.volume;
+        _mediaState.muted = audio.muted;
+        muteBtn.innerHTML = audio.muted ? _VOL_MUTED_SVG : _VOL_SVG;
+        volSlider.value = String(audio.volume);
+      };
+      audio.onplay = () => { playBtn.innerHTML = _PAUSE_SVG; };
+      audio.onpause = () => { playBtn.innerHTML = _PLAY_SVG; };
+      audio.ontimeupdate = () => {
+        timeEl.textContent = `${_fmtAudioTime(audio.currentTime)} / ${_fmtAudioTime(audio.duration)}`;
+        if (!scrubbing) drawWave();
+      };
+      audio.ondurationchange = () => { timeEl.textContent = `${_fmtAudioTime(audio.currentTime)} / ${_fmtAudioTime(audio.duration)}`; };
+      audio.onseeked = drawWave;
+      audio.onloadeddata = () => { _swapIn(wrap); drawWave(); };
+      audio.oncanplay = () => _swapIn(wrap);
+      // Transient-failure recovery like the video branch, except decode
+      // errors are excluded. Audio decodes in software with no decoder
+      // contention, so a decode failure (a missing output sink surfaces as
+      // one) is deterministic for this file and environment, and retrying
+      // would audibly restart the clip from zero on every attempt.
+      // Network-class failures keep the backoff so a file served during a
+      // server restart still recovers.
+      let _audRetries = 0;
+      audio.onerror = () => {
+        if (destroyed || _navGen !== gen) return;
+        if (audio.error && audio.error.code !== MediaError.MEDIA_ERR_DECODE && _audRetries < 6) {
+          _audRetries++;
+          setTimeout(() => {
+            if (destroyed || _navGen !== gen) return;
+            try { audio.pause(); audio.removeAttribute("src"); audio.load(); } catch { }
+            audio.src = fileUrl(it);
+          }, Math.min(1500, 300 * _audRetries));
+        } else {
+          _swapIn(wrap);
+        }
+      };
+
+      const _waveResize = new ResizeObserver(drawWave);
+      _waveResize.observe(scrub);
+      wrap._sbgDispose = () => { try { _waveResize.disconnect(); } catch { } };
+
+      const _pv = Math.floor((it.mtime_real ?? it.mtime ?? 0) * 1000);
+      fetch(`/sidebar_gallery/audio_peaks?root_id=${encodeURIComponent(it.root_id)}&relpath=${encodeURIComponent(it.relpath)}&v=${_pv}`)
+        .then(r => (r.ok ? r.json() : null))
+        .then(d => {
+          if (!wrap.isConnected || !d) return;
+          if (Array.isArray(d.peaks) && d.peaks.length) peaks = d.peaks;
+          if (d.art && it.thumb_url) {
+            const art = h("img", { class: "sbg-lb__audio-art" });
+            art.onload = () => { if (icon.parentNode) icon.replaceWith(art); };
+            art.src = it.thumb_url;
+          }
+          drawWave();
+        })
+        .catch(() => { });
+
+      wrap.appendChild(stage);
+      wrap.appendChild(scrub);
+      wrap.appendChild(controls);
+      wrap.appendChild(audio);
+      currentMediaEl = audio;
+      _insertMedia(wrap);
+      audio.src = fileUrl(it);
+      if (audio.readyState >= 2) _swapIn(wrap);
+    } else if (it.kind && it.kind !== "image") {
+      // A kind this build does not recognize (a stale row from an older
+      // index) shows its icon. Feeding the raw file to an img would download
+      // it whole to render a broken image.
+      const pane = h("div", { class: "sbg-lb__icon-pane", html: kindIcon(it) });
+      pane.dataset.sbgPending = "1";
+      pane.style.position = "absolute";
+      pane.style.opacity = "0";
+      currentMediaEl = null;
+      _insertMedia(pane);
+      _swapIn(pane);
     } else {
       const img = h("img", { class: "sbg-lb__img" });
       img.dataset.sbgPending = "1";
@@ -843,10 +1062,10 @@ export function openLightbox(_initialItems, startItemOrIndex, openEvent) {
           _getSummaryMeta(adj).catch(() => { });
         }
 
-        // Only prefetch images. Prefetching a video would download the whole file
-        // for a neighbour the user may never open; revisits of an already-viewed
-        // video are covered by /file's immutable caching instead.
-        if (!isVideo(adj)) {
+        // Only prefetch images. Prefetching any other kind would download
+        // the whole file for a neighbour the user may never open. Revisits
+        // are covered by /file's caching instead.
+        if (!adj.kind || adj.kind === "image") {
           const pre = new Image();
           pre.src = fileUrl(adj);
           // Warm the DECODED bitmap rather than just the HTTP cache: goTo reveals the
@@ -908,8 +1127,11 @@ export function openLightbox(_initialItems, startItemOrIndex, openEvent) {
     clearTimeout(_prefetchTimer);
     if (_compareActive) closeCompareMode();
     // Release the decoder instead of just pausing it: a bare pause() here would leak an
-    // HEVC decoder on every lightbox close (see releaseVideo()).
-    releaseVideo(currentMediaEl);
+    // HEVC decoder on every lightbox close (see releaseMedia()).
+    releaseMedia(currentMediaEl);
+    // The audio pane's wrapper carries its own release hook and is never
+    // currentMediaEl, so sweep the container too.
+    for (const child of [...mediaContainer.children]) releaseMedia(child);
     zoomCtl.destroy();
     overlay.remove();
     document.removeEventListener("keydown", onKey, true);
@@ -921,12 +1143,34 @@ export function openLightbox(_initialItems, startItemOrIndex, openEvent) {
 
   let _prefetchTimer = null;
 
+  /* Audio player chrome */
+
+  const _PLAY_SVG = `<svg viewBox="0 0 24 24" width="18" height="18" fill="currentColor"><polygon points="7,4 20,12 7,20"/></svg>`;
+  const _PAUSE_SVG = `<svg viewBox="0 0 24 24" width="18" height="18" fill="currentColor"><rect x="6" y="4" width="4" height="16"/><rect x="14" y="4" width="4" height="16"/></svg>`;
+  const _VOL_SVG = `<svg viewBox="0 0 24 24" width="16" height="16" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><polygon points="11 5 6 9 2 9 2 15 6 15 11 19 11 5" fill="currentColor" stroke="none"/><path d="M15.5 8.5a5 5 0 0 1 0 7"/><path d="M18.5 5.5a9 9 0 0 1 0 13"/></svg>`;
+  const _VOL_MUTED_SVG = `<svg viewBox="0 0 24 24" width="16" height="16" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><polygon points="11 5 6 9 2 9 2 15 6 15 11 19 11 5" fill="currentColor" stroke="none"/><line x1="15" y1="9" x2="21" y2="15"/><line x1="21" y1="9" x2="15" y2="15"/></svg>`;
+
+  function _fmtAudioTime(s) {
+    if (!isFinite(s) || s < 0) return "0:00";
+    const m = Math.floor(s / 60);
+    const sec = Math.floor(s % 60);
+    return `${m}:${String(sec).padStart(2, "0")}`;
+  }
+
   // Step a paused video by one frame. The step uses the file's real frame
   // rate when the indexer extracted one, and 1/30s otherwise. A playing video
-  // pauses first so the step lands on a visible frame.
+  // pauses first so the step lands on a visible frame. Audio has no frames,
+  // so the same keys seek by a fixed interval without pausing.
+  const _AUDIO_SEEK_STEP_S = 5;
   function _frameStep(dir) {
     const v = currentMediaEl;
-    if (!v || v.tagName !== "VIDEO") return true;
+    if (!v) return true;
+    if (v.tagName === "AUDIO") {
+      if (!isFinite(v.duration)) return true;
+      v.currentTime = Math.min(Math.max(0, v.currentTime + dir * _AUDIO_SEEK_STEP_S), Math.max(0, v.duration - 0.001));
+      return true;
+    }
+    if (v.tagName !== "VIDEO") return true;
     if (!v.paused) v.pause();
     if (!isFinite(v.duration)) return true;
     const fps = Number(meta?.summary?.fps);
@@ -1011,7 +1255,9 @@ export function openLightbox(_initialItems, startItemOrIndex, openEvent) {
     { keys: keyZoomOut, run: () => { zoomCtl.keyZoom(-1); return true; } },
     {
       keys: keyMute, run: () => {
-        if (currentMediaEl && currentMediaEl.tagName === "VIDEO") currentMediaEl.muted = !currentMediaEl.muted;
+        if (currentMediaEl && (currentMediaEl.tagName === "VIDEO" || currentMediaEl.tagName === "AUDIO")) {
+          currentMediaEl.muted = !currentMediaEl.muted;
+        }
         return true;
       },
     },
@@ -1048,9 +1294,13 @@ export function openLightbox(_initialItems, startItemOrIndex, openEvent) {
 
     if (e.key === " " || e.code === "Space") {
       e.preventDefault();
-      if (currentMediaEl && currentMediaEl.tagName === "VIDEO") {
-        if (currentMediaEl.paused) currentMediaEl.play();
-        else currentMediaEl.pause();
+      if (currentMediaEl && (currentMediaEl.tagName === "VIDEO" || currentMediaEl.tagName === "AUDIO")) {
+        if (currentMediaEl.paused) {
+          const p = currentMediaEl.play();
+          if (p && p.catch) p.catch(() => { });
+        } else {
+          currentMediaEl.pause();
+        }
       }
       return;
     }
@@ -1212,7 +1462,7 @@ export function openLightbox(_initialItems, startItemOrIndex, openEvent) {
     // "left"; clear any single-mode zoom so element and state can't disagree.
     zoomCtl.resetAll();
 
-    compareBtn.textContent = "✕ Exit Compare";
+    compareBtn.textContent = COMPARE_EXIT_LABEL;
     compareBtn.classList.add("sbg-btn--active");
 
     // Both halves share one structure: a fixed 50% cell centering a figure
@@ -1278,10 +1528,10 @@ export function openLightbox(_initialItems, startItemOrIndex, openEvent) {
     _compareActive = false;
     _compareSummary = null;
     _cmpGen++; // invalidate any in-flight compare metadata fetch
-    compareBtn.textContent = "⚖ Compare";
+    compareBtn.textContent = COMPARE_LABEL;
     compareBtn.classList.remove("sbg-btn--active");
     if (_compareElements) {
-      releaseVideo(_compareElements.rightMedia);
+      releaseMedia(_compareElements.rightMedia);
       // Hand the current media (incl. any pending cross-fade element) back to
       // the media container before tearing the split view down.
       for (const child of [..._compareElements.leftFig.children]) {
@@ -1325,17 +1575,25 @@ export function openLightbox(_initialItems, startItemOrIndex, openEvent) {
     if (!zoomSettings.keepOnNav) {
       if (zoomSettings.compareZoom === "synced") zoomCtl.resetAll();
       else zoomCtl.resetPane("right");
+    } else if (zoomSettings.compareZoom === "synced") {
+      zoomCtl.abortDrag();
+    } else {
+      zoomCtl.abortDrag("right");
     }
-    // The compared item can be a video too, so swap the element type rather than
-    // stuffing a video URL into an <img> (which renders a broken-thumbnail icon).
-    const wantVideo = isVideo(compItem);
+    // The compared element must match the item's kind: video plays, image
+    // decodes, and every other kind shows a kind-icon pane so the file URL
+    // never lands in an img (a broken icon after downloading the whole file).
+    const wantTag = isVideo(compItem) ? "VIDEO"
+      : (!compItem.kind || compItem.kind === "image") ? "IMG" : "DIV";
     let mediaEl = _compareElements.rightMedia;
-    if (wantVideo !== (mediaEl.tagName === "VIDEO")) {
-      const neu = wantVideo
+    if (mediaEl.tagName !== wantTag) {
+      const neu = wantTag === "VIDEO"
         ? h("video", { loop: "", autoplay: "", controls: "", playsinline: "" })
-        : h("img", {});
-      if (wantVideo) neu.muted = true; // required for autoplay
-      releaseVideo(mediaEl);
+        : wantTag === "DIV"
+          ? h("div", { class: "sbg-compare__icon-pane" })
+          : h("img", {});
+      if (wantTag === "VIDEO") neu.muted = true; // required for autoplay
+      releaseMedia(mediaEl);
       mediaEl.replaceWith(neu);
       _compareElements.rightMedia = neu;
       mediaEl = neu;
@@ -1355,13 +1613,18 @@ export function openLightbox(_initialItems, startItemOrIndex, openEvent) {
       mediaEl.onloadeddata = _clearPending;
       mediaEl.oncanplay = _clearPending;
       mediaEl.onerror = _clearPending;
-    } else {
+    } else if (mediaEl.tagName === "IMG") {
       mediaEl.onload = _clearPending;
       mediaEl.onerror = _clearPending;
     }
-    mediaEl.src = fileUrl(compItem);
-    // Already buffered (revisit / cached): clear synchronously.
-    if (mediaEl.tagName === "VIDEO" ? mediaEl.readyState >= 2 : mediaEl.complete) _clearPending();
+    if (mediaEl.tagName === "DIV") {
+      mediaEl.innerHTML = kindIcon(compItem);
+      _clearPending();
+    } else {
+      mediaEl.src = fileUrl(compItem);
+      // Already buffered (revisit / cached): clear synchronously.
+      if (mediaEl.tagName === "VIDEO" ? mediaEl.readyState >= 2 : mediaEl.complete) _clearPending();
+    }
     _updateCompareLabels();
 
     // Generation guard: fast navigation can leave several fetches in flight,
@@ -1424,11 +1687,16 @@ export function openLightbox(_initialItems, startItemOrIndex, openEvent) {
       return;
     }
 
-    // Tab-bar ownership: show it when either side has initial image data,
+    // Tab-bar ownership: show it when either side has source media data,
     // hide it (and fall back to the Generated diff) when neither does, so
     // compare navigation can't strand the user on a stale or invisible tab.
     const curS = meta.summary || {};
-    const showTabs = !!(initialImageList(curS).length || initialImageList(compareSummary).length);
+    const showTabs = !!(sourceMediaList(curS).length || sourceMediaList(compareSummary).length);
+    if (showTabs) {
+      _tabInitialImage.textContent = _initialTabLabel(
+        initialImageList(curS).length + initialImageList(compareSummary).length,
+        initialAudioList(curS).length + initialAudioList(compareSummary).length);
+    }
     _metaTabs.style.display = showTabs ? "" : "none";
     if (!showTabs && _activeMetaTab === "initial") _setActiveMetaTab("generated");
     if (_activeMetaTab === "initial") _showCompInitial();
@@ -1454,15 +1722,15 @@ export function openLightbox(_initialItems, startItemOrIndex, openEvent) {
     const note = (text) => h("div", { style: "font-size:10px;opacity:0.5;padding:4px 0;", text });
     const block = (label, color, s, rootId) => {
       const wrap = _sideBlock(label, color);
-      if (initialImageList(s).length) wrap.appendChild(_getInitialContent(s, rootId));
-      else wrap.appendChild(note("No initial image data"));
+      if (sourceMediaList(s).length) wrap.appendChild(_getInitialContent(s, rootId));
+      else wrap.appendChild(note("No source media data"));
       return wrap;
     };
     // When both sides resolve to the same source-image set, say "same"
     // explicitly instead of rendering the identical blocks twice, because that
     // IS the answer the user is comparing for (blocks are built fresh per side,
     // so this is purely a UX choice with no DOM constraint behind it).
-    const sameSource = initialImageList(curS).length && initialImageList(cmpS).length
+    const sameSource = sourceMediaList(curS).length && sourceMediaList(cmpS).length
       && _initialContentKey(curS, items[idx]?.root_id) === _initialContentKey(cmpS, items[_compareIdx]?.root_id);
     metaBody.appendChild(block("Current", CMP_GREEN, curS, items[idx]?.root_id));
     metaBody.appendChild(_hairline());
@@ -1480,9 +1748,9 @@ export function openLightbox(_initialItems, startItemOrIndex, openEvent) {
     const currentSummary = meta.summary || {};
     const compItem = items[_compareIdx];
 
-    const _isVidCmp = items[idx] ? isVideo(items[idx]) : false;
+    const _cmpMedia = items[idx] ? mediaKey(items[idx]) : "image";
     const _cmpApp = currentSummary.source_app || compareSummary.source_app || "comfyui";
-    const _cmpProfile = TL.getActiveProfile(_cmpApp, _isVidCmp);
+    const _cmpProfile = TL.getActiveProfile(_cmpApp, _cmpMedia);
     // Use the gallery item for file-level fields, like renderMeta: the
     // /metadata file object lacks `filename`, which would otherwise force a
     // permanent one-sided File Info diff.

@@ -27,7 +27,16 @@ _DB_PATH = Path(__file__).resolve().parents[1] / "sidebar_gallery_cache.db"
 
 IMAGE_EXTS = {".png", ".jpg", ".jpeg", ".webp"}
 VIDEO_EXTS = {".mp4", ".webm", ".mov", ".mkv", ".avi"}
-ALL_MEDIA_EXTS = IMAGE_EXTS | VIDEO_EXTS
+AUDIO_EXTS = {".mp3", ".flac", ".wav", ".ogg", ".opus", ".m4a"}
+ALL_MEDIA_EXTS = IMAGE_EXTS | VIDEO_EXTS | AUDIO_EXTS
+
+
+def kind_from_ext(ext: str) -> str:
+    if ext in VIDEO_EXTS:
+        return "video"
+    if ext in AUDIO_EXTS:
+        return "audio"
+    return "image"
 
 # Parallel metadata reads during a full reindex. Opening + parsing each file is the
 # slow part on a network share; reading a batch concurrently overlaps that I/O. Kept
@@ -752,7 +761,7 @@ def _iter_media_files(base_abs, excluded, skip_hidden, errors: _ScanErrors | Non
                     errors.file_errors += 1
                 continue
             rel = os.path.relpath(entry.path, base_abs).replace("\\", "/")
-            kind = "video" if ext in VIDEO_EXTS else "image"
+            kind = kind_from_ext(ext)
             yield rel, ext, kind, int(st.st_size), float(st.st_mtime), float(st.st_ctime)
         _filter_scan_dirs(subdirs, excluded, skip_hidden=skip_hidden)
         for name in subdirs:
@@ -1050,14 +1059,19 @@ def full_reindex(
                 ).fetchall()
                 for r in existing_rows:
                     if r["relpath"] not in new_relpaths:
-                        # A row can postdate the Phase 1 snapshot: a file
+                        # A row can postdate the Phase 1 snapshot when a file
                         # generated while the rebuild ran gets its row from
                         # the delta endpoint or the metadata backfill.
                         # Deleting on the stale snapshot alone would sweep it
                         # and announce a false removal, so a candidate only
-                        # goes when the file is genuinely absent from disk, or
-                        # sits under a folder the current rules exclude.
-                        if (os.path.isfile(os.path.join(base_abs, r["relpath"]))
+                        # goes when the file is genuinely absent from disk,
+                        # sits under a folder the current rules exclude, or
+                        # carries an extension the gallery no longer indexes
+                        # (matching the incremental scan, whose enumerator
+                        # filters those out and so prunes their rows).
+                        _row_ext = os.path.splitext(r["relpath"])[1].lower()
+                        if (_row_ext in ALL_MEDIA_EXTS
+                                and os.path.isfile(os.path.join(base_abs, r["relpath"]))
                                 and not _now_excluded(r["relpath"])):
                             continue
                         if delete_file(conn, rid, r["relpath"]):
@@ -1143,6 +1157,7 @@ def _compute_all_meta_keys() -> dict:
     adetailer_keys: set[str] = set()
     interpolation_keys: set[str] = set()
     mmaudio_keys: set[str] = set()
+    track_keys: set[str] = set()
     extra_keys: set[str] = set()
 
     # Which top-level keys are array-of-dict vs object sections comes from the
@@ -1151,7 +1166,8 @@ def _compute_all_meta_keys() -> dict:
     _key_dest = {
         "samplers": sampler_keys, "loras": lora_keys, "controlnet": controlnet_keys,
         "upscaling": upscaling_keys, "adetailer": adetailer_keys,
-        "interpolation": interpolation_keys, "mmaudio": mmaudio_keys, "extra": extra_keys,
+        "interpolation": interpolation_keys, "mmaudio": mmaudio_keys,
+        "track": track_keys, "extra": extra_keys,
     }
 
     try:
@@ -1236,6 +1252,7 @@ def _compute_all_meta_keys() -> dict:
         "adetailer_keys": sorted(adetailer_keys),
         "interpolation_keys": sorted(interpolation_keys),
         "mmaudio_keys": sorted(mmaudio_keys),
+        "track_keys": sorted(track_keys),
         "extra_keys": sorted(extra_keys),
     }
 

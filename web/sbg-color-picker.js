@@ -29,7 +29,7 @@ export function createColorPicker(options) {
     hueHeight: HUE_H = 14,
     showPreview = true,
     showSaved = true,
-    savedChipSize = 20,
+    savedChipSize = 26,
   } = options;
 
   let cH, cS, cL, cA;
@@ -123,31 +123,31 @@ export function createColorPicker(options) {
   col.appendChild(opRow);
 
   // Preview + colour input
-  let preview = null, hexInp = null;
-  // Commit the typed hex value. Declared at picker scope rather than only
+  let preview = null, colorInp = null;
+  // Commit the typed colour value. Declared at picker scope rather than only
   // inside the showPreview block so the returned `commit` can flush a pending
-  // edit when the host tears the picker down: layout-editor popovers are
-  // *removed* on outside-click, which can pre-empt the input's own
-  // change/blur event.
-  let _hexDirty = false;
-  let commitHex = () => {};
+  // edit when the host tears the picker down, since layout-editor popovers
+  // leave the DOM entirely on outside-click, which can pre-empt the input's
+  // own change/blur event.
+  let _colorDirty = false;
+  let commitTyped = () => {};
   if (showPreview) {
     const previewRow = h("div", { style: "display:flex;align-items:center;gap:8px;margin-bottom:8px;" });
     preview = h("div", { style: "width:32px;height:32px;border-radius:6px;border:1px solid rgba(255,255,255,0.15);flex-shrink:0;" });
     preview.style.background = withChecker(currentColor);
-    hexInp = h("input", { type: "text", class: "sbg-gs-input sbg-gs-input--sm", value: curRgbaStr(), style: "flex:1;font-family:monospace;font-size:12px;" });
-    commitHex = () => {
-      if (!_hexDirty) return;  // nothing typed, so don't re-apply on a plain teardown
-      _hexDirty = false;
-      const pc = parseColor(hexInp.value.trim());
+    colorInp = h("input", { type: "text", class: "sbg-gs-input sbg-gs-input--sm", value: curRgbaStr(), style: "flex:1;font-family:monospace;font-size:12px;" });
+    commitTyped = () => {
+      if (!_colorDirty) return;  // nothing typed, so don't re-apply on a plain teardown
+      _colorDirty = false;
+      const pc = parseColor(colorInp.value.trim());
       if (pc) { [cH, cS, cL] = rgbToHsl(pc.r, pc.g, pc.b); cA = pc.a; drawSL(); drawHue(); _apply(); }
-      else { hexInp.value = currentColor; }
+      else { colorInp.value = currentColor; }
     };
-    hexInp.addEventListener("input", () => { _hexDirty = true; });
+    colorInp.addEventListener("input", () => { _colorDirty = true; });
     // `change` fires on blur (clicking another control or outside) and on Enter.
-    hexInp.addEventListener("change", commitHex);
-    hexInp.addEventListener("keydown", (e) => { if (e.key === "Enter") commitHex(); });
-    previewRow.appendChild(preview); previewRow.appendChild(hexInp);
+    colorInp.addEventListener("change", commitTyped);
+    colorInp.addEventListener("keydown", (e) => { if (e.key === "Enter") commitTyped(); });
+    previewRow.appendChild(preview); previewRow.appendChild(colorInp);
     col.appendChild(previewRow);
   }
 
@@ -186,7 +186,7 @@ export function createColorPicker(options) {
     currentColor = curStr();
     if (preview) preview.style.background = withChecker(currentColor);
     // Programmatic value set rather than a user edit, so clear the dirty flag.
-    if (hexInp) { hexInp.value = curRgbaStr(); _hexDirty = false; }
+    if (colorInp) { colorInp.value = curRgbaStr(); _colorDirty = false; }
     opRange.value = String(Math.round(cA * 100));
     opVal.textContent = Math.round(cA * 100) + "%";
     onChange(currentColor);
@@ -207,5 +207,5 @@ export function createColorPicker(options) {
     document.removeEventListener("mouseup", onHueUp);
   }
 
-  return { panel, destroy, setColor, init, commit: commitHex };
+  return { panel, destroy, setColor, init, commit: commitTyped };
 }

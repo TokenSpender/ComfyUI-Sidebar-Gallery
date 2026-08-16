@@ -52,6 +52,9 @@ app.registerExtension({
     const promptPad = getSetting(S.PROMPT_PADDING, "");
     if (promptPad) document.documentElement.style.setProperty("--sbg-prompt-padding", promptPad + "px");
 
+    const hlBg = localStorage.getItem("SBG.GS.HighlightBg");
+    if (hlBg) document.documentElement.style.setProperty("--sbg-highlight-bg", hlBg);
+
     /* Global drag-drop handler for workflow loading */
 
     document.body.addEventListener("dragover", (e) => {
@@ -303,10 +306,11 @@ app.registerExtension({
 
         const output = detail.output;
         if (!output) return;
-        const hasMedia = output.images || output.gifs;
+        const hasMedia = output.images || output.gifs || output.audio;
         if (!hasMedia) return;
 
-        const mediaList = [...(output.images || []), ...(output.gifs || [])];
+        const mediaList = [...(output.images || []), ...(output.gifs || []),
+                           ...(output.audio || [])];
         for (const m of mediaList) {
           if (m.filename) {
             _dataCache._pendingFiles.push({

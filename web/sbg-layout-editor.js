@@ -11,16 +11,17 @@
  * The bottom "All Fields / Nodes" tray lists every metadata path the server knows
  * about, grouped with friendly names. Drag one onto a section to add it.
  *
- * Per-app (ComfyUI/A1111/…) × per-media (image/video) profiles, persisted
- * server-side via the translation layer.
+ * Per-app (ComfyUI/A1111/…) × per-media (image/video/audio) profiles,
+ * persisted server-side via the translation layer.
  */
 
-import { h, showToast, parseColor, formatColor, checkerBg, copyRenderProps, confirmClick } from "./sbg-core.js";
+import { h, showToast, parseColor, formatColor, checkerBg, copyRenderProps, confirmClick, getSetting, S } from "./sbg-core.js";
 import * as TL from "./sbg-translation-layer.js";
 import { initSortable } from "./sbg-sortable.js";
 import { createColorPicker } from "./sbg-color-picker.js";
 
-const MEDIA = ["image", "video"];
+const MEDIA = TL.MEDIA_KEYS;
+const MEDIA_LABELS = { image: "Images", video: "Videos", audio: "Audio" };
 const SECTION_STYLES = ["flat", "cards", "text", "nodes", "raw"];
 const PARAM_STYLES = ["kv", "pill", "detail", "title", "text", "hidden"];
 const HIGHLOW_SOURCES = new Set(["loras", "samplers"]);
@@ -31,20 +32,24 @@ const labelize = (s) => String(s).split(".").pop()
   .replace(/[_\-]+/g, " ").replace(/\s+/g, " ").trim()
   .replace(/\b\w/g, c => c.toUpperCase());
 
-// Friendlier grouping for the field tray / picker.
+// Friendlier grouping for the field tray / picker. Groups claim paths
+// first-match-wins (see forEachPathGroup), and the final catch-all keeps
+// every served path pickable even when no earlier group knows it.
 const PATH_GROUPS = [
-  { key: "file", label: "File Info", test: p => ["filename", "path", "filesize", "resolution", "generation_resolution", "width", "height", "modified", "duration", "codec", "fps", "total_frames"].includes(p) },
+  { key: "file", label: "File Info", test: p => ["filename", "path", "filesize", "resolution", "generation_resolution", "width", "height", "modified", "duration", "duration_seconds", "codec", "fps", "total_frames", "sample_rate", "channels", "bitrate"].includes(p) },
   { key: "models", label: "Models", test: p => ["model", "vae", "clip_skip", "clip_models", "model_hash", "text_projection", "audio_vae"].includes(p) },
-  { key: "prompts", label: "Prompts", test: p => /prompt/i.test(p) },
-  { key: "samplers", label: "Sampling", test: p => p.startsWith("samplers.") },
+  { key: "prompts", label: "Prompts", test: p => !p.includes(".") && (/prompt/i.test(p) || p === "audio_tags" || p === "audio_lyrics") },
+  { key: "samplers", label: "Sampling", test: p => p.startsWith("samplers.") || p === "shift" || p === "sampling_type" },
   { key: "loras", label: "LoRAs", test: p => p.startsWith("loras.") },
   { key: "controlnet", label: "ControlNet", test: p => p.startsWith("controlnet.") },
   { key: "adetailer", label: "ADetailer", test: p => p.startsWith("adetailer.") },
   { key: "upscaling", label: "Upscaling", test: p => p.startsWith("upscaling.") },
   { key: "interpolation", label: "Interpolation", test: p => p.startsWith("interpolation.") },
   { key: "mmaudio", label: "MMAudio", test: p => p.startsWith("mmaudio.") },
+  { key: "track", label: "Track", test: p => p.startsWith("track.") },
   { key: "extra", label: "Extra", test: p => p.startsWith("extra") },
   { key: "nodes", label: "Workflow Nodes", test: p => p.startsWith("workflow_nodes.") },
+  { key: "other", label: "Other", test: () => true },
 ];
 
 // Human node titles keyed by class_type, from /meta_keys, so the tray reads
@@ -57,12 +62,11 @@ let _nodeInstances = {};
 
 function prettyPathLabel(path, inst) {
   if (path.startsWith("workflow_nodes.")) {
-    const parts = path.split(".");
-    const ct = parts[1];
+    const { ct, pk } = splitNodePath(path.split("."));
     const title = _nodeTitles[ct];
     let nodeLabel = title && title !== ct ? `${title} (${ct})` : ct;
     if (inst) nodeLabel = instanceLabel(ct, inst);
-    return parts.length > 2 ? `${nodeLabel} → ${labelize(parts.slice(2).join("."))}` : nodeLabel;
+    return pk ? `${nodeLabel} → ${labelize(pk)}` : nodeLabel;
   }
   return labelize(path);
 }
@@ -88,6 +92,19 @@ function instancesForType(ct) {
   return Array.isArray(insts) && insts.length > 1 ? insts : null;
 }
 
+/** Class/param split for a workflow_nodes path. A class_type may itself
+ *  contain dots, so the longest prefix naming a class known from /meta_keys
+ *  wins, with the single-segment split as the fallback. */
+function splitNodePath(parts) {
+  for (let i = parts.length; i >= 2; i--) {
+    const cls = parts.slice(1, i).join(".");
+    if (_nodeTitles[cls] !== undefined || _nodeInstances[cls] !== undefined) {
+      return { ct: cls, pk: i < parts.length ? parts.slice(i).join(".") : null };
+    }
+  }
+  return { ct: parts[1], pk: parts.length > 2 ? parts.slice(2).join(".") : null };
+}
+
 /**
  * Expand a tray/picker path into its offered items. Node-type paths with
  * multiple distinguishable instances become one item per instance (carrying
@@ -95,9 +112,7 @@ function instancesForType(ct) {
  */
 function expandPathItems(pth) {
   if (pth.startsWith("workflow_nodes.")) {
-    const parts = pth.split(".");
-    const ct = parts[1];
-    const pk = parts.length > 2 ? parts.slice(2).join(".") : null;
+    const { ct, pk } = splitNodePath(pth.split("."));
     const insts = instancesForType(ct);
     if (insts) {
       // Instances that actually carry this param (param lists differ between
@@ -323,22 +338,22 @@ export function renderLayout(content, galleryCtx, closeGS) {
   let activeMedia = _viewMemory.media;
   let profiles = TL.getProfiles();
   let serverPaths = null;
-  const mockByMedia = { image: null, video: null };
+  const mockByMedia = Object.fromEntries(MEDIA.map((m) => [m, null]));
   const expanded = _viewMemory.expanded; // section/tab ids currently expanded in the left pane
   let trayOpen = _viewMemory.trayOpen;
 
-  function activeKey() { return TL.profileKey(activeApp, activeMedia === "video"); }
+  function activeKey() { return TL.profileKey(activeApp, activeMedia); }
   // Materialise (and return) the stored section array for an (app, media). A
   // profile touched for the first time is seeded from its current effective
   // layout, so it keeps every inherited section plus whatever gets added.
-  function layoutFor(app, isVideo) {
-    const k = TL.profileKey(app, isVideo);
+  function layoutFor(app, media) {
+    const k = TL.profileKey(app, media);
     if (!Array.isArray(profiles[k]) || !profiles[k].length) {
-      profiles[k] = JSON.parse(JSON.stringify(TL.getActiveProfile(app, isVideo)));
+      profiles[k] = JSON.parse(JSON.stringify(TL.getActiveProfile(app, media)));
     }
     return profiles[k];
   }
-  function activeLayout() { return layoutFor(activeApp, activeMedia === "video"); }
+  function activeLayout() { return layoutFor(activeApp, activeMedia); }
   function persist() { TL.saveProfiles(profiles); }
   function mock() { return mockByMedia[activeMedia]; }
   function secById(id) { return activeLayout().find(s => s.id === id); }
@@ -361,7 +376,9 @@ export function renderLayout(content, galleryCtx, closeGS) {
   // first tab, so those fields are not orphaned under the tab UI. Reads sec.params
   // by reference; the caller clears sec.params afterwards.
   function makeAbsorbTab(sec, label) {
-    const t = { id: TL.uid("tab"), label: label || sec.title || "Tab", style: sec.style || "flat", source: sec.source, params: sec.params };
+    // copyRenderProps like the sibling converters, so an explicit high/low
+    // setting (and the other shared render properties) survives absorption.
+    const t = copyRenderProps(sec, { id: TL.uid("tab"), label: label || sec.title || "Tab", style: sec.style || "flat", params: sec.params });
     expanded.add(t.id);
     return t;
   }
@@ -482,17 +499,16 @@ export function renderLayout(content, galleryCtx, closeGS) {
     // profile key back into its app/media (TL.profileKey owns that format).
     const LAYOUTS = [];
     for (const app of TL.APPS) for (const med of MEDIA) {
-      const isVideo = med === "video";
-      LAYOUTS.push({ app, isVideo, key: TL.profileKey(app, isVideo), label: `${TL.APP_LABELS[app] || app} · ${isVideo ? "Videos" : "Images"}` });
+      LAYOUTS.push({ app, med, key: TL.profileKey(app, med), label: `${TL.APP_LABELS[app] || app} · ${MEDIA_LABELS[med]}` });
     }
     const keys = LAYOUTS.map(d => d.key);
     const byKey = new Map(LAYOUTS.map(d => [d.key, d]));
     const layoutLabel = (key) => (byKey.get(key) || {}).label || key;
     // Source sections read WITHOUT materialising the profile (getActiveProfile
     // returns the stored array when present, a fallback copy otherwise).
-    const sourceSections = (key) => { const d = byKey.get(key); return d ? TL.getActiveProfile(d.app, d.isVideo) : []; };
+    const sourceSections = (key) => { const d = byKey.get(key); return d ? TL.getActiveProfile(d.app, d.med) : []; };
     let fromKey = activeKey();
-    let toKey = TL.profileKey(activeApp, activeMedia !== "video");
+    let toKey = TL.profileKey(activeApp, MEDIA[(MEDIA.indexOf(activeMedia) + 1) % MEDIA.length]);
 
     const overlay = h("div", { class: "sbg-ly3-xfer-overlay" });
     const dlg = h("div", { class: "sbg-ly3-xfer" });
@@ -627,7 +643,7 @@ export function renderLayout(content, galleryCtx, closeGS) {
       const replace = toKey !== fromKey && rb && rb.value === "replace";
       const dst = byKey.get(toKey);
       if (!dst) return;
-      const target = layoutFor(dst.app, dst.isVideo);
+      const target = layoutFor(dst.app, dst.med);
       // Only expand copied sections when the copy lands in the layout on screen; a
       // materialised target keeps the source layout's ids, so adding them to the
       // shared expanded set would expand or redirect the same id in the active
@@ -735,22 +751,22 @@ export function renderLayout(content, galleryCtx, closeGS) {
     topBar.appendChild(h("span", { class: "sbg-ly3-sep" }));
     const medWrap = h("div", { class: "sbg-ly3-tabs" });
     for (const med of MEDIA) {
-      const b = h("button", { class: `sbg-btn sbg-btn--sm${activeMedia === med ? " sbg-btn--primary" : ""}`, text: med === "image" ? "Images" : "Videos" });
+      const b = h("button", { class: `sbg-btn sbg-btn--sm${activeMedia === med ? " sbg-btn--primary" : ""}`, text: MEDIA_LABELS[med] });
       b.addEventListener("click", () => { activeMedia = med; _viewMemory.media = med; ensureMock(); render(); });
       medWrap.appendChild(b);
     }
     topBar.appendChild(medWrap);
 
     const actions = h("div", { class: "sbg-ly3-actions" });
-    if (activeMedia === "video") {
+    if (activeMedia !== "image") {
       const clone = h("button", { class: "sbg-btn sbg-btn--sm", text: "⇐ Clone Images" });
       clone.addEventListener("click", () => {
         // Materialise the image layout the same way every other reader does, so an
         // emptied-but-stored image profile clones its real effective layout rather
-        // than an empty array (which would then reseed as the video default).
-        const src = layoutFor(activeApp, false);
+        // than an empty array (which would then reseed as this media's default).
+        const src = layoutFor(activeApp, "image");
         profiles[activeKey()] = JSON.parse(JSON.stringify(src));
-        persist(); render(); showToast("Cloned image layout to video");
+        persist(); render(); showToast(`Cloned image layout to ${MEDIA_LABELS[activeMedia].toLowerCase()}`);
       });
       actions.appendChild(clone);
     }
@@ -1144,8 +1160,13 @@ export function renderLayout(content, galleryCtx, closeGS) {
   function forEachPathGroup(filter, cap, excluded, emit) {
     const all = serverPaths || buildServerPaths(null);
     let shown = 0;
+    // First-match-wins: a path renders under one group only, so overlapping
+    // tests (the final catch-all matches every path) cannot list a field twice.
+    const claimed = new Set();
     for (const grp of PATH_GROUPS) {
-      const inGrp = all.filter(pth => grp.test(pth)).flatMap(expandPathItems)
+      const grpPaths = all.filter(pth => !claimed.has(pth) && grp.test(pth));
+      for (const pth of grpPaths) claimed.add(pth);
+      const inGrp = grpPaths.flatMap(expandPathItems)
         .filter(it => (!excluded || !excluded.has(_matchKey(it.path, it.match)))
           && (!filter || it.path.toLowerCase().includes(filter) || it.label.toLowerCase().includes(filter)));
       if (!inGrp.length) continue;
@@ -1311,7 +1332,7 @@ export function renderLayout(content, galleryCtx, closeGS) {
       clr.addEventListener("click", () => { delete p[colorKey]; persist(); refreshPreview(); _paintSwatch(anchor, null, d); closePopovers(); });
       clearRow.appendChild(clr);
     }
-    // If an outside-click removes the popover before the hex input's own
+    // If an outside-click removes the popover before the colour input's own
     // change/blur fires, flush any pending typed colour first. Reads the current
     // `picker` (mountPicker reassigns it on channel switch).
     pop._commitActive = () => { if (picker && picker.commit) picker.commit(); };
@@ -1489,8 +1510,8 @@ export function renderLayout(content, galleryCtx, closeGS) {
   function pathToSearch(path) {
     const parts = String(path).split(".");
     const head = parts[0];
-    if (head === "workflow_nodes") return { field: parts[1] || "workflow_nodes", value: "" };
-    const HEAD_FIELD = { samplers: "sampling", loras: "lora", controlnet: "controlnet", adetailer: "adetailer", upscaling: "upscaling", interpolation: "interpolation", mmaudio: "mmaudio", extra: "extra", model: "model", vae: "model", clip_skip: "sampling", positive_prompt: "prompt", negative_prompt: "prompt", initial_prompt: "prompt" };
+    if (head === "workflow_nodes") return { field: splitNodePath(parts).ct || "workflow_nodes", value: "" };
+    const HEAD_FIELD = { samplers: "sampling", loras: "lora", controlnet: "controlnet", adetailer: "adetailer", upscaling: "upscaling", interpolation: "interpolation", mmaudio: "mmaudio", track: "track", extra: "extra", model: "model", vae: "model", clip_skip: "sampling", positive_prompt: "prompt", negative_prompt: "prompt", initial_prompt: "prompt", audio_tags: "tags", audio_lyrics: "lyrics" };
     if (HEAD_FIELD[head]) return { field: HEAD_FIELD[head], value: "" };
     if (["filename", "path", "filesize", "resolution", "modified", "duration", "codec", "fps", "total_frames"].includes(head)) return { field: "fileinfo", value: "" };
     return { field: "any", value: parts[parts.length - 1] };
@@ -1519,7 +1540,7 @@ export function renderLayout(content, galleryCtx, closeGS) {
       const arr = (list, pfx) => (list || []).forEach(k => { if (!(skipEl[pfx] || []).includes(k)) paths.add(pfx + "." + k); });
       arr(keys.sampler_keys, "samplers"); arr(keys.lora_keys, "loras"); arr(keys.controlnet_keys, "controlnet");
       arr(keys.adetailer_keys, "adetailer"); arr(keys.upscaling_keys, "upscaling"); arr(keys.interpolation_keys, "interpolation");
-      arr(keys.mmaudio_keys, "mmaudio"); arr(keys.extra_keys, "extra");
+      arr(keys.mmaudio_keys, "mmaudio"); arr(keys.track_keys, "track"); arr(keys.extra_keys, "extra");
       for (const [ct, ps] of Object.entries(keys.workflow_nodes || {})) for (const pk of ps) paths.add(`workflow_nodes.${ct}.${pk}`);
     }
     return [...paths].sort();
@@ -1545,11 +1566,12 @@ export function renderLayout(content, galleryCtx, closeGS) {
   // actually has them, and keep fetching until all configured sources are
   // covered (or we hit a cap).
   const _MOCK_ARR = new Set(["samplers", "loras", "controlnet", "adetailer", "upscaling", "interpolation", "workflow_nodes"]);
-  const _MOCK_OBJ = new Set(["mmaudio", "extra"]);
+  const _MOCK_OBJ = new Set(["mmaudio", "track", "extra"]);
   // File-info comes from the gallery item and isn't reliably in the summary, so
   // don't let these block "all sources covered".
   const _MOCK_FILE_INFO = new Set(["filename", "path", "filesize", "size", "resolution", "modified",
-    "duration", "codec", "fps", "total_frames", "width", "height"]);
+    "duration", "codec", "fps", "total_frames", "width", "height",
+    "sample_rate", "channels", "bitrate"]);
 
   /** Top-level summary keys the active layout actually references. */
   function neededSources() {
@@ -1569,9 +1591,12 @@ export function renderLayout(content, galleryCtx, closeGS) {
   function ensureMock() {
     if (mockByMedia[activeMedia]) return;
     const items = (galleryCtx && galleryCtx.allItems) || [];
-    const wantVideo = activeMedia === "video";
-    const pool = items.filter(it => (it.kind === "video") === wantVideo);
-    if (!pool.length) { mockByMedia[activeMedia] = {}; return; }
+    // Item kinds use the same names as the media tabs.
+    const pool = items.filter(it => (it.kind || "image") === activeMedia);
+    if (!pool.length) {
+      mockByMedia[activeMedia] = {};
+      return;
+    }
 
     // Sample size for example values. These fire as one parallel burst the
     // moment the Layout tab opens, and the preview paints at 12 examples, so
@@ -1593,7 +1618,10 @@ export function renderLayout(content, galleryCtx, closeGS) {
     const finish = () => {
       if (done) return; done = true;
       const f = sample[0];
-      merged.filename = merged.filename || f.filename;
+      // The lightbox's _mergeFileInfo applies Filename Display to the real
+      // panel, so the preview applies the same setting to its example.
+      const relStyle = getSetting(S.FILENAME_STYLE, "basename") === "relpath";
+      merged.filename = merged.filename || (relStyle ? (f.relpath || f.filename) : f.filename);
       merged.path = merged.path || f.relpath;
       mockByMedia[activeMedia] = merged;
       refreshPreview(); renderEditor();
@@ -1638,8 +1666,11 @@ export function renderLayout(content, galleryCtx, closeGS) {
     const first = activeLayout().find(s => s.style !== "nodes" && s.style !== "raw");
     if (first) expanded.add(first.id);
   }
-  render();
+  // Mock before render, matching the media-tab click path. An empty pool
+  // sets its mock synchronously for the first paint, and a populated one
+  // starts its example fetches now so the repaint lands sooner.
   ensureMock();
+  render();
   fetch("/sidebar_gallery/meta_keys").then(r => r.json())
     .then(keys => {
       _nodeTitles = (keys && keys.workflow_node_titles) || {};
