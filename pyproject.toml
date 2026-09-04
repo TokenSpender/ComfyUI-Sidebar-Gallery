@@ -1,7 +1,7 @@
 [project]
 name = "comfyui-sidebar-gallery"
 description = "A media browser for the ComfyUI sidebar that indexes the images, videos, and audio in your output folders and shows their embedded generation metadata in a searchable panel."
-version = "1.1.3"
+version = "1.1.4"
 license = { file = "LICENSE" }
 requires-python = ">=3.9"
 dependencies = ["Pillow>=9.0.0", "av"]

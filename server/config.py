@@ -113,26 +113,22 @@ def load_config() -> SidebarGalleryConfig:
 def save_config(data: dict[str, Any]) -> SidebarGalleryConfig:
     cfg = load_config()
 
-    # extra_roots: only NEW entries must pass the isdir check; keep already-saved
-    # roots even when their drive is momentarily offline, and preserve the saved
-    # list when the key is absent or malformed, since editing other settings (e.g.
-    # the excluded list) must never silently drop a configured folder.
+    # A submitted list can only keep or drop roots the file already holds.
+    # New roots can only be added by manually editing the file.
     extra_roots_in = data.get("extra_roots")
     if isinstance(extra_roots_in, list):
-        existing = set(cfg.extra_roots)
+        existing = {_normalize_dir(p): p for p in cfg.extra_roots}
         extra_roots: list[str] = []
         for raw in extra_roots_in:
             if not isinstance(raw, str):
                 continue
-            s = raw.strip()
-            if not s:
-                continue
             try:
-                norm = _normalize_dir(s)
+                norm = _normalize_dir(raw)
             except Exception:
                 continue
-            if (norm in existing or os.path.isdir(norm)) and norm not in extra_roots:
-                extra_roots.append(norm)
+            kept = existing.get(norm)
+            if kept is not None and kept not in extra_roots:
+                extra_roots.append(kept)
     else:
         extra_roots = list(cfg.extra_roots)
 

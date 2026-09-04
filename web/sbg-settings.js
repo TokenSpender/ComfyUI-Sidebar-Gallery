@@ -661,27 +661,15 @@ function renderSettings() {
     foldersList.appendChild(row("Output", "ComfyUI's output folder", null));
     for (const p of cfg.extra_roots || []) foldersList.appendChild(row(p.split(/[\\/]/).pop() || p, p, p));
 
-    const addWrap = h("div", { class: "sbg-gs-row", style: "align-items:center;gap:6px" });
-    const inp = h("input", { type: "text", class: "sbg-gs-input", placeholder: "C:\\path\\to\\folder", style: "flex:1" });
-    const addBtn = h("button", { class: "sbg-btn sbg-btn--accent", text: "+ Add" });
-    const doAdd = async () => {
-      const p = inp.value.trim();
-      if (!p) return;
-      try {
-        const res = await _postRoots([...(cfg.extra_roots || []), p]);
-        const added = (res.extra_roots || []).length > (cfg.extra_roots || []).length;
-        if (!added) { showToast("Folder not added - check the path exists on the ComfyUI machine"); return; }
-        showToast("Folder added - it will be indexed when you open it");
-        inp.value = "";
-        if (galleryCtx.refreshConfig) await galleryCtx.refreshConfig();
-        _renderFolders();
-      } catch (e) { showToast("Failed to add folder: " + (e?.message || e)); }
-    };
-    addBtn.addEventListener("click", doAdd);
-    inp.addEventListener("keydown", (ev) => { if (ev.key === "Enter") doAdd(); });
-    addWrap.appendChild(inp);
-    addWrap.appendChild(addBtn);
-    foldersList.appendChild(addWrap);
+    const addHint = h("div", { class: "sbg-gs-desc", style: "margin-top:8px" });
+    addHint.appendChild(document.createTextNode(
+      "To add a folder, open sidebar_gallery_config.json and put the path in its extra_roots list, for example "));
+    addHint.appendChild(h("code", { text: '{"extra_roots": ["C:/Renders"]}' }));
+    addHint.appendChild(document.createTextNode(". The gallery picks the change up within a few seconds."));
+    foldersList.appendChild(addHint);
+    if (cfg.config_path) {
+      foldersList.appendChild(h("div", { class: "sbg-gs-desc", style: "font-family:monospace;overflow-wrap:anywhere;user-select:text", text: cfg.config_path, title: cfg.config_path }));
+    }
   }
 
   wrap.appendChild(h("div", { class: "sbg-gs-section-title", text: "Excluded folders", style: "margin-top:16px" }));

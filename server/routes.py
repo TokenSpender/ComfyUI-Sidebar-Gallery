@@ -903,6 +903,8 @@ def _config_payload(cfg) -> dict:
         "auto_refresh_interval_s": cfg.auto_refresh_interval_s,
         "roots": [{"id": r.root_id, "label": r.label, "path": r.path if r.root_id != "output" else None}
                   for r in _all_roots()],
+        # Where a folder gets added.
+        "config_path": str(config_path()),
         # Catalog default titles keyed by section_id: lets the frontend
         # recognize layout-editor retitles for search-name resolution.
         "section_titles": schema.section_titles(),
