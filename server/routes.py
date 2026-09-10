@@ -19,6 +19,7 @@ import folder_paths
 import server
 
 from .config import config_path, load_config, save_config
+from . import favorites as favorites_store
 from .db import ALL_MEDIA_EXTS, IMAGE_EXTS, kind_from_ext
 from . import db as media_db
 from .metadata import PARSER_VERSION, read_metadata_for_file, guess_mime, sanitize_for_json
@@ -798,6 +799,46 @@ async def post_settings(request: web.Request):
             {"error": "Expected {key, value} or {settings: {...}}"}, status=400)
 
 
+@routes.get("/sidebar_gallery/favorites")
+async def get_favorites(request: web.Request):
+    root_id = request.rel_url.query.get("root_id", "output")
+    if _find_root(root_id) is None:
+        return web.json_response({"error": "Unknown root"}, status=404)
+    loop = asyncio.get_running_loop()
+    relpaths, version = await loop.run_in_executor(
+        _IO_EXECUTOR,
+        lambda: (favorites_store.list_for_root(root_id), favorites_store.favorites_version()),
+    )
+    return web.json_response({"root_id": root_id, "relpaths": relpaths, "version": version})
+
+
+@routes.post("/sidebar_gallery/favorites")
+async def post_favorites(request: web.Request):
+    body, err = await _json_dict_body(request)
+    if err is not None:
+        return err
+    root_id = body.get("root_id")
+    if not isinstance(root_id, str):
+        return web.json_response({"error": "Expected root_id"}, status=400)
+    root = _find_root(root_id)
+    if root is None:
+        return web.json_response({"error": "Unknown root"}, status=400)
+    relpath = body.get("relpath")
+    if not isinstance(relpath, str):
+        return web.json_response({"error": "Expected relpath"}, status=400)
+    try:
+        safe_join(root.path, relpath)
+    except ValueError:
+        return web.json_response({"error": "Invalid path"}, status=400)
+    starred = body.get("starred")
+    if not isinstance(starred, bool):
+        return web.json_response({"error": "Expected starred bool"}, status=400)
+    loop = asyncio.get_running_loop()
+    version = await loop.run_in_executor(
+        _IO_EXECUTOR, favorites_store.set_favorite, root_id, relpath, starred)
+    return web.json_response({"ok": True, "starred": starred, "version": version})
+
+
 # Index management
 
 
@@ -1308,6 +1349,7 @@ async def poll_changes(request: web.Request) -> web.Response:
         # Lets the delta-first client drop stale metadata caches without ever
         # needing a full list_all.
         "meta_epoch": media_db.get_meta_epoch(),
+        "favorites_version": favorites_store.favorites_version(),
         "reindexing": media_db.is_full_reindex_running(),
         "server_time": time.time(),
     })

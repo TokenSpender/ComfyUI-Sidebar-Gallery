@@ -14,6 +14,7 @@ import {
   _metaCache, _metaCacheAPI, _mediaState,
   singleFlight,
   searchState, highlightSearchMatches,
+  favIsStarred, favToggle, favSubscribe,
   S, getSetting, APP_REGISTRY,
 } from "./sbg-core.js";
 
@@ -163,6 +164,7 @@ export function openLightbox(_initialItems, startItemOrIndex, openEvent) {
 
   const bottomName = h("span", { class: "sbg-lb__bottom-name" });
   const dlBtn = h("a", { class: "sbg-btn sbg-btn--sm", text: "Download", title: "Download file", download: "", target: "_blank" });
+  const starBtn = h("button", { class: "sbg-btn sbg-btn--sm sbg-lb__star", text: "★ Star", title: "Star this file" });
   const loadWfBtn = h("button", { class: "sbg-btn sbg-btn--sm sbg-btn--accent", text: "Load Workflow", title: "Load workflow into ComfyUI", disabled: "true" });
   const copyPromptBtn = h("button", { class: "sbg-btn sbg-btn--sm", text: "Copy Prompt", title: "Copy positive prompt", disabled: "true" });
   const copyWfBtn = h("button", { class: "sbg-btn sbg-btn--sm", text: "Copy WF", title: "Copy workflow JSON", disabled: "true" });
@@ -188,7 +190,7 @@ export function openLightbox(_initialItems, startItemOrIndex, openEvent) {
 
   const bottomBar = h("div", { class: "sbg-lb__bottom" }, [
     bottomName,
-    h("div", { class: "sbg-lb__bottom-actions" }, [dlBtn, copyPromptBtn, copyWfBtn, loadWfBtn, compareBtn]),
+    h("div", { class: "sbg-lb__bottom-actions" }, [starBtn, dlBtn, copyPromptBtn, copyWfBtn, loadWfBtn, compareBtn]),
   ]);
 
   const mediaArea = h("div", { class: "sbg-lb__media-area" }, [
@@ -643,6 +645,26 @@ export function openLightbox(_initialItems, startItemOrIndex, openEvent) {
     return m;
   }
 
+  function _updateStarBtn() {
+    const it = items[idx];
+    const starred = it ? favIsStarred(it.root_id, it.relpath) : false;
+    starBtn.classList.toggle("sbg-lb__star--on", starred);
+    starBtn.textContent = starred ? "★ Starred" : "★ Star";
+    starBtn.disabled = !it;
+  }
+
+  starBtn.addEventListener("click", async () => {
+    const it = items[idx];
+    if (!it) return;
+    await favToggle(it);
+    _updateStarBtn();
+  });
+
+  const _unsubFavLb = favSubscribe(({ rootId, relpath }) => {
+    const it = items[idx];
+    if (it && it.root_id === rootId && it.relpath === relpath) _updateStarBtn();
+  });
+
   function goTo(newIdx) {
     if (newIdx < 0 || newIdx >= items.length) return;
     // Compare mode invariant: the two panes never show the same file. When
@@ -991,6 +1013,7 @@ export function openLightbox(_initialItems, startItemOrIndex, openEvent) {
     };
 
     bottomName.textContent = `${it.filename}  (${idx + 1} / ${items.length})`;
+    _updateStarBtn();
     dlBtn.href = fileUrl(it);
     dlBtn.download = it.filename || "";
     prevBtn.style.visibility = idx === 0 ? "hidden" : "visible";
@@ -1119,6 +1142,7 @@ export function openLightbox(_initialItems, startItemOrIndex, openEvent) {
     prevBtn.style.visibility = idx === 0 ? "hidden" : "visible";
     nextBtn.style.visibility = idx === items.length - 1 ? "hidden" : "visible";
     bottomName.textContent = `${items[idx]?.filename || ""}  (${idx + 1} / ${items.length})`;
+    _updateStarBtn();
   }
   document.addEventListener("sbg-items-updated", _onItemsUpdated);
 
@@ -1139,6 +1163,7 @@ export function openLightbox(_initialItems, startItemOrIndex, openEvent) {
     document.removeEventListener("auxclick", onAuxClick, true);
     document.removeEventListener("sbg-items-updated", _onItemsUpdated);
     document.removeEventListener("sbg-layout-changed", _onLayoutChanged);
+    try { _unsubFavLb(); } catch { }
   }
 
   let _prefetchTimer = null;

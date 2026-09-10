@@ -24,6 +24,7 @@ export const _dataCache = {
   lastRootId: "output",
   lastSubfolder: "",
   lastKind: "",
+  lastStarredOnly: false,
   lastSort: null,
   // Per-response bookkeeping is keyed per root so a response for one root can't
   // stamp values that another root's logic then trusts (since timestamps,
@@ -303,6 +304,88 @@ export function kindIcon(it) {
   if (isVideo(it)) return VIDEO_ICON;
   if (isAudio(it)) return AUDIO_ICON;
   return IMG_ICON;
+}
+
+const _favoritesByRoot = new Map();
+const _favoritesVersionByRoot = new Map();
+const _favoritesRequestsInFlight = new Map();
+const _favoritesSubscribers = new Set();
+let _lastSeenFavoritesVersion = 0;
+
+export function favIsStarred(rootId, relpath) {
+  const starredRelpaths = _favoritesByRoot.get(rootId);
+  return !!(starredRelpaths && starredRelpaths.has(relpath));
+}
+
+export function favSubscribe(callback) {
+  _favoritesSubscribers.add(callback);
+  return () => { _favoritesSubscribers.delete(callback); };
+}
+
+function _notifyFavoritesSubscribers(rootId, relpath, starred) {
+  for (const callback of _favoritesSubscribers) {
+    try { callback({ rootId, relpath, starred }); } catch { }
+  }
+}
+
+export function favLoad(rootId) {
+  const inFlight = _favoritesRequestsInFlight.get(rootId);
+  if (inFlight) return inFlight;
+  const request = (async () => {
+    const data = await api("/sidebar_gallery/favorites", { root_id: rootId });
+    const starredRelpaths = new Set(Array.isArray(data.relpaths) ? data.relpaths : []);
+    _favoritesByRoot.set(rootId, starredRelpaths);
+    if (typeof data.version === "number") {
+      _lastSeenFavoritesVersion = data.version;
+      _favoritesVersionByRoot.set(rootId, data.version);
+    }
+    return starredRelpaths;
+  })();
+  _favoritesRequestsInFlight.set(rootId, request);
+  request.finally(() => {
+    if (_favoritesRequestsInFlight.get(rootId) === request) _favoritesRequestsInFlight.delete(rootId);
+  }).catch(() => { });
+  return request;
+}
+
+export async function favEnsure(rootId) {
+  const cachedRelpaths = _favoritesByRoot.get(rootId);
+  if (cachedRelpaths && _favoritesVersionByRoot.get(rootId) === _lastSeenFavoritesVersion) {
+    return cachedRelpaths;
+  }
+  try { return await favLoad(rootId); }
+  catch { return cachedRelpaths || new Set(); }
+}
+
+export async function favToggle(item) {
+  const rootId = item.root_id;
+  const relpath = item.relpath;
+  const starredRelpaths = await favEnsure(rootId);
+  if (!_favoritesByRoot.has(rootId)) _favoritesByRoot.set(rootId, starredRelpaths);
+  const starred = !starredRelpaths.has(relpath);
+  if (starred) starredRelpaths.add(relpath); else starredRelpaths.delete(relpath);
+  _notifyFavoritesSubscribers(rootId, relpath, starred);
+  try {
+    const data = await api("/sidebar_gallery/favorites", null, {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({ root_id: rootId, relpath, starred }),
+    });
+    if (typeof data.version === "number") {
+      _lastSeenFavoritesVersion = data.version;
+      _favoritesVersionByRoot.set(rootId, data.version);
+    }
+    return starred;
+  } catch {
+    if (starred) starredRelpaths.delete(relpath); else starredRelpaths.add(relpath);
+    _notifyFavoritesSubscribers(rootId, relpath, !starred);
+    showToast("Could not save star");
+    return !starred;
+  }
+}
+
+export function favApplyVersion(version) {
+  return typeof version === "number" && version !== _lastSeenFavoritesVersion;
 }
 
 /* Persistent IndexedDB cache (thumbnails + metadata) */
@@ -662,6 +745,7 @@ export const VID_FILTER_ICON = `<svg viewBox="0 0 24 24" width="14" height="14" 
 export const AUD_FILTER_ICON = `<svg viewBox="0 0 24 24" width="14" height="14" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M9 18V5l12-2v13"/><circle cx="6" cy="18" r="3"/><circle cx="18" cy="16" r="3"/></svg>`;
 export const SEARCH_SVG = `<svg viewBox="0 0 24 24" width="14" height="14" fill="none" stroke="currentColor" stroke-width="2"><circle cx="11" cy="11" r="7"/><line x1="16.65" y1="16.65" x2="21" y2="21"/></svg>`;
 export const GEAR_SVG = `<svg viewBox="0 0 24 24" width="14" height="14" fill="none" stroke="currentColor" stroke-width="2"><circle cx="12" cy="12" r="3"/><path d="M19.4 15a1.65 1.65 0 0 0 .33 1.82l.06.06a2 2 0 0 1-2.83 2.83l-.06-.06a1.65 1.65 0 0 0-1.82-.33 1.65 1.65 0 0 0-1 1.51V21a2 2 0 0 1-4 0v-.09A1.65 1.65 0 0 0 9 19.4a1.65 1.65 0 0 0-1.82.33l-.06.06a2 2 0 0 1-2.83-2.83l.06-.06A1.65 1.65 0 0 0 4.68 15a1.65 1.65 0 0 0-1.51-1H3a2 2 0 0 1 0-4h.09A1.65 1.65 0 0 0 4.6 9a1.65 1.65 0 0 0-.33-1.82l-.06-.06a2 2 0 0 1 2.83-2.83l.06.06A1.65 1.65 0 0 0 9 4.68a1.65 1.65 0 0 0 1-1.51V3a2 2 0 0 1 4 0v.09a1.65 1.65 0 0 0 1 1.51 1.65 1.65 0 0 0 1.82-.33l.06-.06a2 2 0 0 1 2.83 2.83l-.06.06A1.65 1.65 0 0 0 19.4 9a1.65 1.65 0 0 0 1.51 1H21a2 2 0 0 1 0 4h-.09a1.65 1.65 0 0 0-1.51 1z"/></svg>`;
+export const STAR_SVG = `<svg viewBox="0 0 24 24" width="14" height="14" fill="none" stroke="currentColor" stroke-width="2" stroke-linejoin="round"><polygon points="12 2 15.09 8.26 22 9.27 17 14.14 18.18 21.02 12 17.77 5.82 21.02 7 14.14 2 9.27 8.91 8.26 12 2"/></svg>`;
 
 /* Setting IDs */
 

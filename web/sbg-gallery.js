@@ -12,6 +12,8 @@ import {
   _thumbMemCache, _thumbCacheAPI, _metaCacheAPI, _resetIdb,
   initThumbObserver, getThumbObserver, resetThumbObserver, resetFailedThumbs,
   PLAY_SVG, IMG_FILTER_ICON, VID_FILTER_ICON, AUD_FILTER_ICON, SEARCH_SVG, GEAR_SVG,
+  STAR_SVG,
+  favIsStarred, favSubscribe, favEnsure, favLoad, favToggle, favApplyVersion,
   S, getSetting, applyCustomThemeVars,
   progressPoller, formatProgress,
 } from "./sbg-core.js";
@@ -178,6 +180,7 @@ export function initGallery(mountEl, config) {
   // before this mount installs fresh ones.
   if (window._sbgPollTimer) { clearInterval(window._sbgPollTimer); window._sbgPollTimer = null; }
   if (window._sbgRefreshAbort) { try { window._sbgRefreshAbort.abort(); } catch { } window._sbgRefreshAbort = null; }
+  if (window._sbgFavUnsub) { try { window._sbgFavUnsub(); } catch { } window._sbgFavUnsub = null; }
 
   // Bound the persistent thumbnail cache (content-addressed entries orphan as
   // files change and IndexedDB has no LRU). Fire-and-forget on mount.
@@ -215,6 +218,7 @@ export function initGallery(mountEl, config) {
     subfolder: "",
     q: "",
     kind: "",
+    starredOnly: false,
     sort: defaultSort,
     allItems: [],
     filteredItems: [],
@@ -254,6 +258,8 @@ export function initGallery(mountEl, config) {
     }
 
     if (state.kind) items = items.filter(it => it.kind === state.kind);
+
+    if (state.starredOnly) items = items.filter(it => favIsStarred(it.root_id, it.relpath));
 
     if (state._searchMatches) {
       items = items.filter(it => {
@@ -406,6 +412,15 @@ export function initGallery(mountEl, config) {
   const kindBtnAud = h("button", { class: "sbg-kind-btn", html: AUD_FILTER_ICON, "data-kind": "audio", title: "Audio only" });
   const kindButtons = [kindBtnAll, kindBtnImg, kindBtnVid, kindBtnAud];
   const kindGroup = h("div", { class: "sbg-kind-group" }, kindButtons);
+
+  const starFilterBtn = h("button", { class: "sbg-kind-btn sbg-star-filter", html: STAR_SVG, title: "Show starred only" });
+  starFilterBtn.addEventListener("click", () => {
+    _saveScrollPos(); // remember the outgoing view's position
+    state.starredOnly = !state.starredOnly;
+    _dataCache.lastStarredOnly = state.starredOnly;
+    _syncStarFilterBtn();
+    refilter();
+  });
 
   const sortSel = h("select", { class: "sbg-select", title: "Sort order", style: "flex:0 0 auto;width:auto" }, [
     h("option", { value: "created_desc", text: "Created ↓" }),
@@ -589,7 +604,7 @@ export function initGallery(mountEl, config) {
 
   const toolbar = h("div", { class: "sbg-toolbar" }, [
     searchWrap,
-    h("div", { class: "sbg-toolbar-row" }, [folderNav, kindGroup, sortSel, diagBtn]),
+    h("div", { class: "sbg-toolbar-row" }, [folderNav, kindGroup, starFilterBtn, sortSel, diagBtn]),
     progressWrap,
   ]);
 
@@ -697,6 +712,31 @@ export function initGallery(mountEl, config) {
     return parts.join("\n");
   }
 
+  function _setCardStar(card, starred) {
+    const btn = card && card.querySelector(".sbg-card__star");
+    if (!btn) return;
+    btn.classList.toggle("sbg-card__star--on", !!starred);
+    btn.title = starred ? "Unstar" : "Star";
+  }
+
+  function _syncVisibleStars() {
+    for (const [, card] of _cardMap) {
+      const rp = card.dataset.relpath;
+      if (rp != null) _setCardStar(card, favIsStarred(state.rootId, rp));
+    }
+  }
+
+  function _syncStarFilterBtn() {
+    starFilterBtn.classList.toggle("sbg-star-filter--active", !!state.starredOnly);
+  }
+
+  function _loadFavoritesForCurrentRoot() {
+    favEnsure(state.rootId).then(() => {
+      if (state.starredOnly) refilter();
+      else _syncVisibleStars();
+    }).catch(() => { });
+  }
+
   /**
    * Always builds a fresh card; reusing unmounted card elements would need
    * careful src/event cleanup. Cards are positioned absolutely for the
@@ -765,6 +805,21 @@ export function initGallery(mountEl, config) {
     } else if (isAudio(it)) {
       thumbWrap.appendChild(h("span", { class: "sbg-card__video-badge", text: (it.ext || "").replace(".", "").toUpperCase() }));
     }
+
+    const _starred = favIsStarred(it.root_id, it.relpath);
+    const starBtn = h("button", {
+      class: `sbg-card__star${_starred ? " sbg-card__star--on" : ""}`,
+      html: STAR_SVG,
+      title: _starred ? "Unstar" : "Star",
+      draggable: "false",
+      onmousedown: (e) => { e.preventDefault(); e.stopPropagation(); },
+      onclick: async (e) => {
+        e.preventDefault();
+        e.stopPropagation();
+        _setCardStar(card, await favToggle(it));
+      },
+    });
+    thumbWrap.appendChild(starBtn);
 
     const card = h("div", {
       class: "sbg-card sbg-card--virtual",
@@ -933,9 +988,10 @@ export function initGallery(mountEl, config) {
     if (!_metrics || state.filteredItems.length === 0) {
       spacer.style.height = "0px";
       if (state.filteredItems.length === 0) {
+        const _starredEmpty = state.starredOnly && state.allItems.length > 0;
         _emptyMsg = h("div", { class: "sbg-empty", style: "grid-column:1/-1" }, [
-          h("div", { class: "sbg-empty__icon", text: "📂" }),
-          h("div", { text: "No media found" }),
+          h("div", { class: "sbg-empty__icon", html: _starredEmpty ? STAR_SVG : "📂" }),
+          h("div", { text: _starredEmpty ? "No starred items yet" : "No media found" }),
         ]);
         grid.appendChild(_emptyMsg);
       }
@@ -1098,6 +1154,7 @@ export function initGallery(mountEl, config) {
     if (newRootId === state.rootId) return;
     state.rootId = newRootId;
     _dataCache.lastRootId = newRootId;
+    _loadFavoritesForCurrentRoot();
     state.subfolder = "";
     _dataCache.lastSubfolder = "";
     // An active search's match set is keyed by the OLD root's relpaths; drop
@@ -1410,6 +1467,13 @@ export function initGallery(mountEl, config) {
           eager ? { root_id: rid, eager: "1" } : { root_id: rid });
         if (p.reindexing) return; // full rebuild churning versions; the timer retries
         _checkMetaEpoch(p.meta_epoch);
+        if (favApplyVersion(p.favorites_version)) {
+          await favLoad(rid);
+          if (rid === state.rootId) {
+            if (state.starredOnly) refilter();
+            else _syncVisibleStars();
+          }
+        }
         const haveCount = (_dataCache.items[rid] || []).length;
         const countMismatch = typeof p.count === "number" && p.count !== haveCount;
         if (known == null) {
@@ -1912,6 +1976,17 @@ export function initGallery(mountEl, config) {
 
   /* Init */
 
+  window._sbgFavUnsub = favSubscribe(({ rootId, relpath, starred }) => {
+    if (rootId !== state.rootId) return;
+    if (state.starredOnly) {
+      refilter();
+    } else {
+      for (const [, card] of _cardMap) {
+        if (card.dataset.relpath === relpath) _setCardStar(card, starred);
+      }
+    }
+  });
+
   _dataCache._mountEl = mountEl;
   _dataCache._fetchAllItems = fetchAllItems;
   _dataCache._fetchNewItems = fetchNewItems;
@@ -1937,12 +2012,16 @@ export function initGallery(mountEl, config) {
   (async () => {
     try {
       const hasCachedItems = _dataCache.items[state.rootId];
+      state.starredOnly = !!_dataCache.lastStarredOnly;
+      _syncStarFilterBtn();
+      _loadFavoritesForCurrentRoot();
       const hasCachedRoots = _dataCache.roots;
       const hasCachedSubs = _dataCache.subfolders[state.rootId];
 
       if (hasCachedRoots && hasCachedItems && hasCachedSubs) {
         state.roots = _dataCache.roots;
         state.rootId = _dataCache.lastRootId;
+        _loadFavoritesForCurrentRoot();
         state.subfolder = _dataCache.lastSubfolder;
         state.kind = _dataCache.lastKind;
         state.sort = _dataCache.lastSort || defaultSort;

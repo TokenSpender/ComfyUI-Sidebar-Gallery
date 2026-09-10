@@ -11,6 +11,7 @@
   --sbg-accent-glow: rgba(124, 106, 239, 0.3);
   --sbg-text: var(--input-text, var(--fg-color, #e0e0e0));
   --sbg-text-dim: var(--descrip-text, rgba(224, 224, 224, 0.5));
+  --sbg-star: #facc15;
   --sbg-radius: 8px;
   --sbg-radius-sm: 5px;
   --sbg-transition: 0.18s cubic-bezier(0.4, 0, 0.2, 1);
@@ -566,6 +567,28 @@
   filter: brightness(1.1);
 }
 
+.sbg-star-filter svg {
+  display: block;
+}
+
+.sbg-star-filter:hover svg {
+  color: var(--sbg-star);
+}
+
+.sbg-star-filter--active {
+  background: var(--sbg-accent);
+  color: #fff;
+}
+
+.sbg-star-filter--active:hover {
+  background: var(--sbg-accent);
+  filter: brightness(1.1);
+}
+
+.sbg-star-filter--active svg {
+  fill: currentColor;
+}
+
 /* Progress Bar */
 
 .sbg-progress-wrap {
@@ -1054,6 +1077,45 @@
   opacity: 1;
 }
 
+.sbg-card__star {
+  position: absolute;
+  top: 4px;
+  left: 4px;
+  width: 22px;
+  height: 22px;
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  padding: 0;
+  border: none;
+  border-radius: 4px;
+  background: rgba(0, 0, 0, 0.55);
+  color: var(--sbg-text-dim);
+  cursor: pointer;
+  opacity: 0;
+  z-index: 3;
+  line-height: 0;
+  transition: opacity var(--sbg-transition), color var(--sbg-transition), transform var(--sbg-transition);
+}
+
+.sbg-card:hover .sbg-card__star {
+  opacity: 1;
+}
+
+.sbg-card__star:hover {
+  color: var(--sbg-star);
+  transform: scale(1.1);
+}
+
+.sbg-card__star--on {
+  opacity: 1;
+  color: var(--sbg-star);
+}
+
+.sbg-card__star--on svg {
+  fill: currentColor;
+}
+
 .sbg-card__placeholder {
   font-size: 10px;
   text-transform: uppercase;
@@ -1152,6 +1214,11 @@
 .sbg-empty__icon {
   font-size: 28px;
   opacity: 0.3;
+}
+
+.sbg-empty__icon svg {
+  width: 28px;
+  height: 28px;
 }
 
 /* Toast */
@@ -1474,6 +1541,12 @@
   display: flex;
   gap: 5px;
   flex-shrink: 0;
+}
+
+.sbg-lb__star--on {
+  color: var(--sbg-star);
+  border-color: var(--sbg-star);
+  background: rgba(250, 204, 21, 0.16);
 }
 
 /* Metadata Panel */
