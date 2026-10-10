@@ -1,6 +1,5 @@
-// Curated default layout, shown on a fresh install before any customisation.
-// A hand-maintained snapshot of a layout-editor profile, so edit it directly.
-// Sections tied to specific custom nodes auto-hide when their data is absent.
+// The metadata panel a fresh profile starts from, one layout per media kind.
+// A param hidden in the Metadata tab keeps the style it had in `_prevStyle`, so showing it again restores that style.
 export const DEFAULT_IMAGE_LAYOUT = [
   {
     "id": "file_info",
@@ -199,7 +198,6 @@ export const DEFAULT_IMAGE_LAYOUT = [
         "path": "loras.strength_model",
         "label": "Strength",
         "style": "detail",
-        "format": "Strength: {v}",
         "color": {
           "text": "rgba(254, 196, 62, 1)"
         }
@@ -453,21 +451,20 @@ export const DEFAULT_IMAGE_LAYOUT = [
     "tabs": [
       {
         "id": "tab_mpxw5c4m_1",
-        "label": "LLava",
+        "label": "LLaVA",
         "style": "flat",
         "params": [
           {
             "path": "workflow_nodes.LLava Loader Simple.ckpt_name",
             "label": "Model",
             "style": "title",
-            "format": "{v}",
             "color": {
               "text": "rgba(254, 196, 62, 1)"
             }
           },
           {
             "path": "workflow_nodes.LLavaOptionalMemoryFreeAdvanced.ckpt_name",
-            "label": "Ckpt Name",
+            "label": "Checkpoint",
             "style": "detail"
           },
           {
@@ -580,7 +577,7 @@ export const DEFAULT_IMAGE_LAYOUT = [
           },
           {
             "path": "workflow_nodes.LLavaSamplerAdvanced.system_msg",
-            "label": "System Msg",
+            "label": "System Message",
             "style": "text",
             "color": {
               "bg": "rgba(255, 255, 255, 0.25)"
@@ -694,13 +691,7 @@ export const DEFAULT_IMAGE_LAYOUT = [
           },
           {
             "path": "workflow_nodes.ShowText|pysssss.text_0",
-            "label": "Text 0",
-            "style": "hidden",
-            "_prevStyle": "kv"
-          },
-          {
-            "path": "workflow_nodes.ShowText|pysssss.text_undefined",
-            "label": "Text Undefined",
+            "label": "Shown Text",
             "style": "hidden",
             "_prevStyle": "kv"
           },
@@ -832,12 +823,12 @@ export const DEFAULT_IMAGE_LAYOUT = [
       },
       {
         "id": "tab_mqm0aaft_0",
-        "label": "TextGenerate",
+        "label": "Text Generate",
         "style": "flat",
         "params": [
           {
             "path": "clip_models",
-            "label": "Clip Models",
+            "label": "CLIP Models",
             "style": "title",
             "color": {
               "text": "rgba(254, 196, 62, 1)"
@@ -1295,7 +1286,6 @@ export const DEFAULT_AUDIO_LAYOUT = [
         "path": "loras.strength_model",
         "label": "Strength",
         "style": "detail",
-        "format": "Strength: {v}",
         "color": {
           "text": "rgba(254, 196, 62, 1)"
         }
@@ -1338,12 +1328,11 @@ export const DEFAULT_AUDIO_LAYOUT = [
       {
         "path": "workflow_nodes.TextEncodeAceStepAudio1.5.language",
         "label": "Language",
-        "style": "detail",
-        "format": "Language: {v}"
+        "style": "detail"
       },
       {
         "path": "workflow_nodes.TextEncodeAceStepAudio1.5.cfg_scale",
-        "label": "Cfg Scale",
+        "label": "CFG Scale",
         "style": "pill",
         "format": "CFG Scale: {v}"
       },
@@ -1784,7 +1773,6 @@ export const DEFAULT_VIDEO_LAYOUT = [
         "path": "loras.strength_model",
         "label": "Strength",
         "style": "detail",
-        "format": "Strength: {v}",
         "color": {
           "text": "rgba(254, 196, 62, 1)"
         }
@@ -1821,7 +1809,7 @@ export const DEFAULT_VIDEO_LAYOUT = [
           },
           {
             "path": "mmaudio.cfg",
-            "label": "Cfg",
+            "label": "CFG",
             "style": "pill",
             "format": "CFG: {v}",
             "color": {
@@ -2014,21 +2002,20 @@ export const DEFAULT_VIDEO_LAYOUT = [
     "tabs": [
       {
         "id": "tab_ms62waap_5",
-        "label": "LLava",
+        "label": "LLaVA",
         "style": "flat",
         "params": [
           {
             "path": "workflow_nodes.LLava Loader Simple.ckpt_name",
             "label": "Model",
             "style": "title",
-            "format": "{v}",
             "color": {
               "text": "rgba(254, 196, 62, 1)"
             }
           },
           {
             "path": "workflow_nodes.LLavaOptionalMemoryFreeAdvanced.ckpt_name",
-            "label": "Ckpt Name",
+            "label": "Checkpoint",
             "style": "detail"
           },
           {
@@ -2141,7 +2128,7 @@ export const DEFAULT_VIDEO_LAYOUT = [
           },
           {
             "path": "workflow_nodes.LLavaSamplerAdvanced.system_msg",
-            "label": "System Msg",
+            "label": "System Message",
             "style": "text",
             "color": {
               "bg": "rgba(255, 255, 255, 0.25)"
@@ -2255,13 +2242,7 @@ export const DEFAULT_VIDEO_LAYOUT = [
           },
           {
             "path": "workflow_nodes.ShowText|pysssss.text_0",
-            "label": "Text 0",
-            "style": "hidden",
-            "_prevStyle": "kv"
-          },
-          {
-            "path": "workflow_nodes.ShowText|pysssss.text_undefined",
-            "label": "Text Undefined",
+            "label": "Shown Text",
             "style": "hidden",
             "_prevStyle": "kv"
           },
@@ -2393,12 +2374,12 @@ export const DEFAULT_VIDEO_LAYOUT = [
       },
       {
         "id": "tab_ms62waap_9",
-        "label": "TextGenerate",
+        "label": "Text Generate",
         "style": "flat",
         "params": [
           {
             "path": "clip_models",
-            "label": "Clip Models",
+            "label": "CLIP Models",
             "style": "title",
             "color": {
               "text": "rgba(254, 196, 62, 1)"
