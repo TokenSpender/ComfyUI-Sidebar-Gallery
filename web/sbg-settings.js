@@ -1,1220 +1,331 @@
-/**
- * sbg-settings.js: Gallery Settings overlay
- *
- * Contains the full settings panel: Layout Editor, Appearance,
- * Keybindings, Settings, Presets, and Diagnostics tabs.
- */
-
+import { h, lsGet, lsSet } from "./sbg-core.js";
+import { attachOverlayThumb } from "./sbg-overlay-thumb.js";
 import {
-  h, api, showToast,
-  getSetting, saveSetting, fmtBytes, applyCustomThemeVars, confirmClick,
-  parseColor, formatColor, formatRgba, checkerBg,
-  _metaCache, _metaCacheAPI, _resetIdb,
-  _thumbCacheAPI, _thumbMemCache, resetFailedThumbs,
-  S, APP_REGISTRY,
-  progressPoller, formatProgress,
-} from "./sbg-core.js";
+  GEAR_ICON, SEARCH_ICON, CLOSE_ICON, sizedIcon,
+  TAB_APPEARANCE_ICON, TAB_DIAGNOSTICS_ICON, TAB_KEYBINDINGS_ICON,
+  TAB_HELP_ICON, TAB_LAYOUT_ICON, TAB_PRESETS_ICON, TAB_SETTINGS_ICON, TAB_THEME_ICON,
+} from "./sbg-icons.js";
+import { trapFocus, wireTablistKeys, setSelectedTab } from "./sbg-a11y.js";
+import { attachSplitter } from "./sbg-splitter.js";
+import { B } from "./sbg-settings-store.js";
 
-import { renderLayout, clearSwatchCache } from "./sbg-layout-editor.js";
-import { createColorPicker } from "./sbg-color-picker.js";
-import { replaceElementColor } from "./sbg-translation-layer.js";
-import { itemKey } from "./sbg-compare-utils.js";
+import { renderLayout } from "./sbg-layout-editor.js";
+import { renderKeybindings } from "./sbg-settings-tab-keybindings.js";
+import { renderDiagnosticsTab } from "./sbg-settings-tab-diagnostics.js";
+import { renderPresets } from "./sbg-settings-tab-presets.js";
+import { renderTheme } from "./sbg-settings-tab-theme.js";
+import { renderAppearance } from "./sbg-settings-tab-appearance.js";
+import { renderSettings } from "./sbg-settings-tab-settings.js";
+import { renderHelp } from "./sbg-settings-tab-help.js";
 
-/**
- * Keybinding capture and apply for presets, kept as one pair so the two halves
- * cannot drift apart. An untouched binding is stored as null, and apply treats
- * null and "" alike as "not set here": a stored "" parses to zero chunks and
- * matches no key, so honouring it would silently disable every action the
- * preset author left alone, Escape included. Older presets and the shipped
- * themes hold "" for untouched bindings, so the empty check protects them.
- */
-export function _capturePresetKeys() {
-  const keys = {};
-  for (const [k, id] of Object.entries(S)) {
-    if (k.startsWith("KEY_")) keys[id] = getSetting(id, null);
+const TABS = [
+  { id: "layout", label: "Metadata", icon: TAB_LAYOUT_ICON, searchable: false, render: (c) => renderLayout(c.content, c.galleryCtx, c.closeGS, c.visitCleanups) },
+  { id: "theme", label: "Theme", icon: TAB_THEME_ICON, render: renderTheme },
+  { id: "appearance", label: "Appearance", icon: TAB_APPEARANCE_ICON, render: renderAppearance },
+  { id: "presets", label: "Presets", icon: TAB_PRESETS_ICON, render: renderPresets },
+  { id: "keybindings", label: "Keybindings", icon: TAB_KEYBINDINGS_ICON, render: renderKeybindings },
+  { id: "settings", label: "General", icon: TAB_SETTINGS_ICON, render: renderSettings },
+  { id: "diagnostics", label: "Diagnostics", icon: TAB_DIAGNOSTICS_ICON, render: renderDiagnosticsTab },
+  { id: "help", label: "Help", icon: TAB_HELP_ICON, render: renderHelp },
+];
+
+// So an unmount of the gallery closes the settings panel with its full cleanup, since
+// a tab mounts popovers on the body that would otherwise be left behind.
+let _activeCloseGS = null;
+
+// Outlives the settings panel, so a tab reopens where it was left after a close too.
+const _tabScroll = new Map();
+
+export function closeGallerySettings() {
+  if (_activeCloseGS) _activeCloseGS();
+}
+
+// Leaves out buttons, since + Add, Reset and Cancel stand on many rows and
+// name none of them.
+function _rowText(node) {
+  if (node.nodeType === 3) return node.textContent;
+  if (node.nodeType !== 1 || node.tagName === "BUTTON") return "";
+  return node.childNodes.length ? [...node.childNodes].map(_rowText).join(" ") : node.textContent;
+}
+
+function _haystack(el) {
+  const text = el.classList.contains("sbg-gs-row") ? _rowText(el) : el.textContent;
+  return ((text || "") + " " + (el.getAttribute("title") || "")).toLowerCase();
+}
+
+function _sections(form) {
+  const sections = [{ heading: null, rows: [], descs: [] }];
+  for (const el of form.children) {
+    if (el.classList.contains("sbg-gs-section-title")) sections.push({ heading: el, rows: [], descs: [] });
+    else if (el.classList.contains("sbg-gs-desc")) sections[sections.length - 1].descs.push(el);
+    else sections[sections.length - 1].rows.push(el);
   }
-  return keys;
+  return sections;
 }
 
-export function _applyPresetKeys(keys) {
-  for (const [id, val] of Object.entries(keys || {})) {
-    if (val !== null && val !== "") saveSetting(id, val);
+// The open tab and the off-screen render of the other tabs both count here, so
+// a badge keeps its number when its tab opens unless a fetch then shows a row,
+// such as Diagnostics' Missing.
+function _match(sections, q, mark) {
+  let total = 0;
+  for (const sec of sections) {
+    const headHit = !!sec.heading && _haystack(sec.heading).includes(q);
+    let hits = 0;
+    for (const el of sec.rows) {
+      const hit = !el.classList.contains("sbg-hidden") && el.hasChildNodes() && (headHit || _haystack(el).includes(q));
+      if (hit) hits++;
+      if (mark) mark(el, hit);
+    }
+    if (mark) {
+      for (const el of sec.descs) mark(el, headHit);
+      if (sec.heading) mark(sec.heading, headHit || hits > 0);
+    }
+    total += hits + (headHit ? 1 : 0);
   }
+  return total;
 }
 
-export function openGallerySettings(galleryCtx, defaultTab = "layout") {
-const gsOverlay = h("div", { class: "sbg-gs-overlay" });
-const gsPanel = h("div", { class: "sbg-gs-panel" });
+export function openGallerySettings(galleryCtx, defaultTab = null) {
+  const gsOverlay = h("div", { class: "sbg-gs-overlay" });
 
-// Header
-const gsClose = h("button", { class: "sbg-gs-close", text: "✕", title: "Close" });
-const gsHeader = h("div", { class: "sbg-gs-header" }, [
-  h("span", { class: "sbg-gs-title", text: "⚙ Gallery Settings" }),
-  gsClose,
-]);
-
-// Tab bar
-const TAB_NAMES = ["Layout", "Appearance", "Keybindings", "Settings", "Presets", "Diagnostics"];
-const tabBtns = TAB_NAMES.map(name =>
-  h("button", { class: "sbg-gs-tab", text: name, "data-tab": name.toLowerCase() })
-);
-const tabBar = h("div", { class: "sbg-gs-tabs" }, tabBtns);
-const content = h("div", { class: "sbg-gs-content" });
-
-gsPanel.appendChild(gsHeader);
-gsPanel.appendChild(tabBar);
-gsPanel.appendChild(content);
-gsOverlay.appendChild(gsPanel);
-
-// Appending to sbg-root when present makes the panel inherit the native themes.
-const sbgRoot = document.querySelector(".sbg-root");
-if (sbgRoot) {
-  sbgRoot.appendChild(gsOverlay);
-} else {
-  document.body.appendChild(gsOverlay);
-}
-
-// Cleanup callbacks run when the settings panel closes. Color-input popovers
-// append panels and global listeners to the document; these must be removed to
-// avoid leaking DOM each time settings is opened.
-const _gsCleanups = [];
-function closeGS() {
-  for (const fn of _gsCleanups.splice(0)) { try { fn(); } catch { } }
-  document.removeEventListener("keydown", _gsKey);
-  gsOverlay.remove();
-}
-function _gsKey(e) { if (e.key === "Escape") closeGS(); }
-gsClose.addEventListener("click", closeGS);
-gsOverlay.addEventListener("click", (e) => { if (e.target === gsOverlay) closeGS(); });
-document.addEventListener("keydown", _gsKey);
-
-function _fmtCacheSize(bytes) {
-  return !bytes || bytes <= 0 ? "—" : fmtBytes(bytes);
-}
-
-async function refreshDiagStats(diagStatsContainer) {
-  try {
-    const st = await api("/sidebar_gallery/status");
-    diagStatsContainer.innerHTML = "";
-
-    const indexInfo = st.index || {};
-    const counts = indexInfo.counts || st.index || {};
-    const indexTitle = h("div", { class: "sbg-diag-section__title", text: "SQLite Index", title: "Server-side SQLite database that stores the file listing and parsed metadata summaries for fast gallery loading without disk scanning" });
-    diagStatsContainer.appendChild(indexTitle);
-
-    const countsObj = typeof counts === "object" && !Array.isArray(counts) ? counts : {};
-    for (const [rid, count] of Object.entries(countsObj)) {
-      if (rid === "db_path" || rid === "db_size_mb" || rid === "counts") continue;
-      diagStatsContainer.appendChild(h("div", { class: "sbg-diag-stat" }, [
-        h("span", { class: "sbg-diag-stat__label", text: rid }),
-        h("span", { class: "sbg-diag-stat__value", text: Number(count).toLocaleString() + " files" }),
-      ]));
-    }
-
-    if (indexInfo.db_path) {
-      diagStatsContainer.appendChild(h("div", { class: "sbg-diag-stat", title: "Full filesystem path of the SQLite database file" }, [
-        h("span", { class: "sbg-diag-stat__label", text: "DB Path" }),
-        h("span", { class: "sbg-diag-stat__value sbg-diag-stat__value--path", text: indexInfo.db_path }),
-      ]));
-    }
-    if (indexInfo.db_size_mb !== undefined) {
-      diagStatsContainer.appendChild(h("div", { class: "sbg-diag-stat", title: "Size of the SQLite database file on disk" }, [
-        h("span", { class: "sbg-diag-stat__label", text: "DB Size" }),
-        h("span", { class: "sbg-diag-stat__value", text: `${indexInfo.db_size_mb} MB` }),
-      ]));
-    }
-
-    try {
-      // Keyed shape: {running:<full>, full:{...}|null, roots:{rid:{...}}}.
-      // Show the full rebuild if one runs, else any root's first index.
-      const prog = await fetch("/sidebar_gallery/reindex_progress").then(r => r.json());
-      const entry = (prog.full && prog.full.running)
-        ? prog.full
-        : Object.values(prog.roots || {}).find(e => e && e.running) || null;
-      if (entry) {
-        const f = formatProgress(entry);
-        diagStatsContainer.appendChild(h("div", { class: "sbg-diag-stat", style: "margin-top:6px;color:var(--sbg-accent)" }, [
-          h("span", { class: "sbg-diag-stat__label", text: `${entry.phase || "Indexing"}…` }),
-          h("span", { class: "sbg-diag-stat__value", text: f.text }),
-        ]));
-      }
-    } catch { }
-
-    diagStatsContainer.appendChild(h("div", { class: "sbg-diag-section__title", text: "Server Thumbnails", title: "JPEG thumbnails generated and stored on the server in the .thumbs folder. Shared across all browsers/clients. No in-memory cache. Served directly from disk on each request.", style: "margin-top:10px" }));
-    diagStatsContainer.appendChild(h("div", { class: "sbg-diag-stat" }, [h("span", { class: "sbg-diag-stat__label", text: "Count" }), h("span", { class: "sbg-diag-stat__value", text: (st.thumbnails?.count || 0).toLocaleString() })]));
-    diagStatsContainer.appendChild(h("div", { class: "sbg-diag-stat" }, [h("span", { class: "sbg-diag-stat__label", text: "Size" }), h("span", { class: "sbg-diag-stat__value", text: `${st.thumbnails?.size_mb || 0} MB` })]));
-
-    diagStatsContainer.appendChild(h("div", { class: "sbg-diag-section__title", text: "Browser Thumb Cache", title: "Thumbnails cached in this browser's IndexedDB for instant loading without server requests.", style: "margin-top:10px" }));
-    const _tcCountEl = h("span", { class: "sbg-diag-stat__value", text: "…" });
-    const _tcSizeEl = h("span", { class: "sbg-diag-stat__value", text: "…" });
-    diagStatsContainer.appendChild(h("div", { class: "sbg-diag-stat" }, [h("span", { class: "sbg-diag-stat__label", text: "Cached" }), _tcCountEl]));
-    diagStatsContainer.appendChild(h("div", { class: "sbg-diag-stat" }, [h("span", { class: "sbg-diag-stat__label", text: "Size" }), _tcSizeEl]));
-
-    diagStatsContainer.appendChild(h("div", { class: "sbg-diag-section__title", text: "Browser Meta Cache", title: "Parsed metadata summaries cached in IndexedDB and in-memory.", style: "margin-top:10px" }));
-    const _mcCountEl = h("span", { class: "sbg-diag-stat__value", text: "…" });
-    const _mcSizeEl = h("span", { class: "sbg-diag-stat__value", text: "…" });
-    const _mcMemEl = h("span", { class: "sbg-diag-stat__value", text: `${_metaCache.size} entries` });
-    diagStatsContainer.appendChild(h("div", { class: "sbg-diag-stat" }, [h("span", { class: "sbg-diag-stat__label", text: "IndexedDB" }), _mcCountEl]));
-    diagStatsContainer.appendChild(h("div", { class: "sbg-diag-stat" }, [h("span", { class: "sbg-diag-stat__label", text: "Size" }), _mcSizeEl]));
-    diagStatsContainer.appendChild(h("div", { class: "sbg-diag-stat", title: "Metadata entries in JS memory for this session" }, [h("span", { class: "sbg-diag-stat__label", text: "In-memory" }), _mcMemEl]));
-
-    Promise.all([_thumbCacheAPI.getStats(), _metaCacheAPI.getStats()]).then(([ts, ms]) => {
-      _tcCountEl.textContent = `${ts.count.toLocaleString()} thumbs`;
-      _tcSizeEl.textContent = _fmtCacheSize(ts.totalSizeBytes);
-      _mcCountEl.textContent = `${ms.count.toLocaleString()} entries`;
-      _mcSizeEl.textContent = _fmtCacheSize(ms.totalSizeBytes);
-    }).catch(() => { });
-  } catch (e) {
-    diagStatsContainer.innerHTML = `<div style="padding:8px;color:var(--sbg-text-dim)">Error: ${e?.message || e}</div>`;
-  }
-}
-
-function _settingRow(label, input, tooltip) {
-  const row = h("div", { class: "sbg-gs-row", title: tooltip || "" });
-  row.appendChild(h("label", { class: "sbg-gs-label", text: label }));
-  row.appendChild(input);
-  return row;
-}
-
-function _toggle(id, fallback, label, tooltip) {
-  const val = getSetting(id, fallback);
-  const cb = h("input", { type: "checkbox" });
-  cb.checked = !!val;
-  cb.addEventListener("change", () => saveSetting(id, cb.checked));
-  return _settingRow(label, cb, tooltip);
-}
-
-function _textInput(id, fallback, label, tooltip) {
-  const val = getSetting(id, fallback);
-  const inp = h("input", { type: "text", class: "sbg-gs-input", value: String(val || "") });
-  inp.addEventListener("change", () => saveSetting(id, inp.value));
-  return _settingRow(label, inp, tooltip);
-}
-
-// Resolve the live accent to a concrete rgb() string, read the same way the CSS
-// resolves it: through a hidden probe on the gallery root. The accent is declared as
-// var(--p-primary-color, ...), so reading the property value directly returns that
-// unresolved var() text. Falls back to the historic accent when the root is absent.
-function _resolveAccent() {
-  const root = document.querySelector(".sbg-root");
-  if (!root) return "#7c6aef";
-  const probe = h("span", { style: "display:none;color:var(--sbg-accent,#7c6aef)" });
-  root.appendChild(probe);
-  const c = getComputedStyle(probe).color;
-  probe.remove();
-  return c || "#7c6aef";
-}
-
-function _colorInput(id, fallback, label, tooltip, callback, replaceChannel) {
-  const val = getSetting(id, fallback);
-  const wrap = h("div", { class: "sbg-gs-color-wrap", style: "position:relative" });
-
-  // displayColor: what the swatch, text field and picker show. Stored colours are
-  // always rgba, and older saved hex still parses. When nothing is stored and no
-  // fallback is given (the lightbox buttons, which mean "follow the accent"), show
-  // the live accent so the swatch and picker match the button. Unparseable values
-  // such as "var(--sbg-accent)" are shown verbatim.
-  let displayColor = val || fallback || _resolveAccent();
-  // The text field always reads as rgba(...), matching the colour picker, even
-  // at full opacity.
-  const _toRgba = (c) => { const pc = parseColor(c); return pc ? formatRgba(pc.r, pc.g, pc.b, pc.a) : c; };
-
-  // Pill colour rows only: debounced find-and-replace of matching per-element pill
-  // colours. The baseline is the colour before the current edit burst, so dragging
-  // the picker (which fires applyColor continuously) commits one old-to-new replace at
-  // the end rather than chasing every intermediate value.
-  let _replBaseline = displayColor, _replTimer = null;
-
-  function applyColor(color) {
-    const prev = displayColor;
-    displayColor = color;
-    swatch.style.background = checkerBg(color);
-    text.value = _toRgba(color);
-    saveSetting(id, color);
-    if (callback) callback(color);
-    // A global colour changed, so drop the layout editor's cached swatch defaults
-    // so its param/tab/section colour pickers re-read the new value.
-    clearSwatchCache();
-    if (replaceChannel) {
-      if (_replTimer === null) _replBaseline = prev; // first change of a burst
-      clearTimeout(_replTimer);
-      _replTimer = setTimeout(() => { _replTimer = null; replaceElementColor(replaceChannel, _replBaseline, displayColor); }, 400);
-    }
-  }
-
-  const swatch = h("div", {
-    class: "sbg-color-swatch",
-    style: "width:28px;height:28px;border-radius:6px;border:2px solid var(--sbg-border);cursor:pointer;flex-shrink:0;transition:box-shadow 0.15s;"
-  });
-  swatch.style.background = checkerBg(displayColor);
-  swatch.addEventListener("mouseenter", () => { swatch.style.boxShadow = "0 0 0 2px var(--sbg-accent)"; });
-  swatch.addEventListener("mouseleave", () => { swatch.style.boxShadow = ""; });
-
-  // Accepts hex or rgba. Wide enough for a full rgba(r, g, b, a) value.
-  const text = h("input", { type: "text", class: "sbg-gs-input sbg-gs-input--sm", style: "min-width:26ch", value: _toRgba(displayColor) });
-  text.addEventListener("change", () => {
-    const v = text.value.trim();
-    const pc = parseColor(v);
-    if (pc) { applyColor(formatColor(pc.r, pc.g, pc.b, pc.a)); if (picker) { picker.destroy(); panel.removeChild(picker.panel); picker = null; } }
-    else { displayColor = v; swatch.style.background = checkerBg(v); saveSetting(id, v); if (callback) callback(v); }
+  const gsPanel = h("div", {
+    class: "sbg-gs-panel",
+    role: "dialog",
+    "aria-modal": "true",
+    "aria-labelledby": "sbg-gs-title",
   });
 
-  const panel = h("div", { class: "sbg-color-panel", style: "display:none;position:fixed;z-index:9999;background:var(--sbg-surface,#1e1e1e);border:1px solid var(--sbg-border);border-radius:10px;padding:12px;box-shadow:0 12px 40px rgba(0,0,0,0.6);width:max-content;min-width:220px;" });
-  let picker = null;
-  function ensurePicker() {
-    if (picker) return;
-    picker = createColorPicker({ initialColor: displayColor, onChange: applyColor });
-    panel.appendChild(picker.panel);
-    picker.init();
-  }
-  function positionPanel() {
-    const swatchRect = swatch.getBoundingClientRect();
-    const panelH = panel.offsetHeight || 360, panelW = panel.offsetWidth || 220;
-    let left = swatchRect.left;
-    if (left + panelW > window.innerWidth - 8) left = window.innerWidth - panelW - 8;
-    if (left < 8) left = 8;
-    let top = swatchRect.top - panelH - 4;
-    if (top < 8) top = swatchRect.bottom + 4;
-    panel.style.left = left + "px";
-    panel.style.top = top + "px";
-  }
-
-  swatch.addEventListener("click", (e) => {
-    e.stopPropagation();
-    const isOpen = panel.style.display !== "none";
-    document.querySelectorAll(".sbg-color-panel").forEach(p => { p.style.display = "none"; });
-    if (!isOpen) {
-      ensurePicker();
-      panel.style.display = "block";
-      requestAnimationFrame(positionPanel);
-    }
+  const gsClose = h("button", {
+    class: "sbg-gs-close", html: sizedIcon(CLOSE_ICON, 18), title: "Close", "aria-label": "Close settings",
   });
-  panel.addEventListener("click", (e) => e.stopPropagation());
-  const _docClick = () => { panel.style.display = "none"; };
-  document.addEventListener("click", _docClick);
+  const tabBtns = TABS.map(tab =>
+    h("button", {
+      class: "sbg-gs-navitem", "data-tab": tab.id,
+      role: "tab", "aria-selected": "false", tabindex: "-1",
+      "aria-controls": "sbg-gs-content",
+    }, [
+      h("span", { class: "sbg-gs-navicon", html: tab.icon, "aria-hidden": "true" }),
+      h("span", { class: "sbg-gs-navlabel", text: tab.label }),
+      h("span", { class: "sbg-gs-navbadge sbg-hidden", "aria-hidden": "true" }),
+    ])
+  );
 
-  wrap.appendChild(swatch);
-  wrap.appendChild(text);
-  document.body.appendChild(panel);
-  // Remove the body-level panel and global listener when settings closes,
-  // otherwise every settings open leaks another panel into the page.
-  _gsCleanups.push(() => {
-    document.removeEventListener("click", _docClick);
-    if (picker) { try { picker.destroy(); } catch { } }
-    panel.remove();
+  const tabBar = h("div", {
+    class: "sbg-gs-nav", role: "tablist",
+    "aria-label": "Settings sections", "aria-orientation": "vertical",
+  }, tabBtns);
+
+  const searchInput = h("input", {
+    type: "search", class: "sbg-gs-searchinput", placeholder: "Search settings…",
+    "aria-label": "Search settings",
   });
-  return _settingRow(label, wrap, tooltip);
-}
+  const searchBox = h("div", { class: "sbg-gs-search" }, [
+    h("span", { class: "sbg-gs-searchicon", html: SEARCH_ICON, "aria-hidden": "true" }),
+    searchInput,
+  ]);
 
-function _comboInput(id, fallback, options, label, tooltip, callback) {
-  const val = getSetting(id, fallback);
-  const sel = h("select", { class: "sbg-gs-select" }, options.map(o => h("option", { value: o, text: o })));
-  sel.value = val;
-  sel.addEventListener("change", () => { saveSetting(id, sel.value); if (callback) callback(sel.value); });
-  return _settingRow(label, sel, tooltip);
-}
+  const rail = h("div", { class: "sbg-gs-rail" }, [
+    h("div", { class: "sbg-gs-railhead" }, [
+      h("span", { class: "sbg-gs-railicon", html: GEAR_ICON, "aria-hidden": "true" }),
+      h("h2", { class: "sbg-gs-title", id: "sbg-gs-title", text: "Sidebar Gallery" }),
+    ]),
+    searchBox,
+    tabBar,
+  ]);
 
-function _numberInput(id, fallback, label, tooltip) {
-  const val = getSetting(id, fallback);
-  const inp = h("input", { type: "number", class: "sbg-gs-input sbg-gs-input--sm", value: String(val || fallback) });
-  inp.addEventListener("change", () => saveSetting(id, Number(inp.value)));
-  return _settingRow(label, inp, tooltip);
-}
+  // Focusable from script, so a tab whose closed row took the focus with it can
+  // hand it here and the next Tab stays in the panel.
+  const content = h("div", { class: "sbg-gs-content", id: "sbg-gs-content", role: "tabpanel", tabindex: "-1" });
+  attachOverlayThumb(content);
 
-// Tab Renderers
+  // Outside `content`, since a tab's render clears that, and a message written
+  // into it would wake the MutationObserver below and run the filter again.
+  const noResults = h("div", { class: "sbg-gs-noresults sbg-gs-desc sbg-hidden" });
+  const main = h("div", { class: "sbg-gs-main" }, [
+    h("div", { class: "sbg-gs-contenthead" }, [gsClose]),
+    content,
+    noResults,
+  ]);
 
+  gsPanel.appendChild(rail);
+  gsPanel.appendChild(main);
+  gsOverlay.appendChild(gsPanel);
 
-/* Layout Editor, rendered by sbg-layout-editor.js */
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-function renderAppearance() {
-  // The colour rows attach their panels and document listeners to the body,
-  // and a re-visit rebuilds every row, so the previous visit's set is flushed
-  // here (closeGS still covers the final set).
-  for (const fn of _gsCleanups.splice(0)) { try { fn(); } catch { } }
-  content.innerHTML = "";
-  const wrap = h("div", { class: "sbg-gs-form" });
-  function _badgePreview(text, color) {
-    return h("span", { text, style: `display:inline-block;padding:2px 6px;border-radius:4px;font-size:10px;font-weight:600;color:#fff;background:${color};margin-right:4px;` });
-  }
-
-  // One builder for the colour rows: the preview chip sits in the label slot
-  // (with optional text around it) and re-colours through onColor as the
-  // input changes. onColor receives the raw picked value ("" = default).
-  function _chipRow(id, fallback, chip, opts) {
-    const row = _colorInput(id, fallback, "", opts.tooltip || "", opts.onColor);
-    const label = row.querySelector(".sbg-gs-label");
-    if (label) {
-      label.innerHTML = "";
-      if (opts.prefix) label.appendChild(document.createTextNode(opts.prefix));
-      label.appendChild(chip);
-      if (opts.caption) label.appendChild(document.createTextNode(opts.caption));
-    }
-    wrap.appendChild(row);
-  }
-
-  wrap.appendChild(h("div", { class: "sbg-gs-section-title", text: "Badge Colors" }));
-
-  for (const [key, def, text, caption, tip] of [
-    [S.BADGE_HIGH_COLOR, "#f87171", "HIGH", " Badge", "Color for HIGH/base KSampler and model badges"],
-    [S.BADGE_LOW_COLOR, "#60a5fa", "LOW", " Badge", "Color for LOW/refine KSampler and model badges"],
-    [S.VIDEO_BADGE_COLOR, "#facc15", "MP4", " Badge", "Color for the format badge on video and audio thumbnails"],
-    [S.SEARCH_TAG_COLOR, "#6495ed", "search", " Search Badge", "Color for search tag badges in the search bar"],
-    [S.SEARCH_TAG_NEG_COLOR, "#ef4444", "\u2212exclude", " Exclude Badge", "Color for negative/exclude search tag badges"],
-  ]) {
-    const chip = _badgePreview(text, getSetting(key, def) || def);
-    if (key === S.VIDEO_BADGE_COLOR) chip.style.color = "#000";
-    _chipRow(key, def, chip, { caption, tooltip: tip, onColor: (c) => { chip.style.background = c; } });
-  }
-
-  wrap.appendChild(h("div", { class: "sbg-gs-section-title", text: "Highlight Color", style: "margin-top:16px" }));
-  const hlColor = localStorage.getItem("SBG.GS.HighlightBg") || "rgba(250, 204, 21, 0.35)";
-  const hlSample = h("span", { text: "Highlight", style: `background:${hlColor};padding:1px 4px;border-radius:2px;` });
-  _chipRow("HighlightBg", "rgba(250, 204, 21, 0.35)", hlSample, {
-    prefix: "Search ",
-    tooltip: "Background color for search match highlighting in metadata panel",
-    onColor: (c) => {
-      localStorage.setItem("SBG.GS.HighlightBg", c);
-      document.documentElement.style.setProperty("--sbg-highlight-bg", c);
-      hlSample.style.background = c || "rgba(250, 204, 21, 0.35)";
-    },
+  const railHandle = h("div", { class: "sbg-gs-railresize" });
+  rail.appendChild(railHandle);
+  const _applyRailWidth = (w) => { gsPanel.style.gridTemplateColumns = w + "px minmax(0, 1fr)"; };
+  const savedRailWidth = parseInt(lsGet(B.SETTINGS_RAIL_WIDTH), 10);
+  if (savedRailWidth >= 170 && savedRailWidth <= 420) _applyRailWidth(savedRailWidth);
+  attachSplitter(railHandle, {
+    min: 170, max: 420,
+    size: () => rail.offsetWidth,
+    apply: _applyRailWidth,
+    done: (w) => lsSet(B.SETTINGS_RAIL_WIDTH, String(w)),
   });
 
-  wrap.appendChild(h("div", { class: "sbg-gs-section-title", text: "Theme", style: "margin-top:16px" }));
+  document.querySelector(".sbg-root").appendChild(gsOverlay);
 
-  const customWrap = h("div", { class: "sbg-gs-form sbg-gs-custom-theme", style: getSetting(S.THEME, "comfyui") === "custom" ? "display:block; margin-top:10px; padding:10px; background:rgba(0,0,0,0.15); border-radius:5px; border:1px solid var(--sbg-border)" : "display:none" });
+  const _gsCleanups = [];
+  const _visitCleanups = [];
+  function closeGS() {
+    _activeCloseGS = null;
+    _rememberScroll();
+    for (const fn of _visitCleanups.splice(0)) { try { fn(); } catch { } }
+    for (const fn of _gsCleanups.splice(0)) { try { fn(); } catch { } }
+    document.removeEventListener("keydown", _gsKey);
+    gsOverlay.remove();
+    galleryCtx?.closed?.();
+  }
+  _activeCloseGS = closeGS;
+  // A repeat is ignored, since holding Escape cancels a key recording and its
+  // repeats would then close the panel too.
+  function _gsKey(e) { if (e.key === "Escape" && !e.repeat) closeGS(); }
+  gsClose.addEventListener("click", closeGS);
+  gsOverlay.addEventListener("click", (e) => { if (e.target === gsOverlay) closeGS(); });
+  document.addEventListener("keydown", _gsKey);
 
-  wrap.appendChild(_comboInput(S.THEME, "comfyui", ["comfyui", "dark", "blue", "midnight", "synthwave", "retro", "custom"], "Gallery Theme", "Color theme for the gallery sidebar", (val) => {
-    const rootEl = document.querySelector(".sbg-root");
-    if (rootEl) {
-      if (val !== "comfyui") rootEl.setAttribute("data-theme", val);
-      else rootEl.removeAttribute("data-theme");
-      applyCustomThemeVars(rootEl, val);
-    }
-    customWrap.style.display = val === "custom" ? "block" : "none";
-  }));
+  const _releaseTrap = trapFocus(gsPanel, { initialFocus: gsPanel });
+  _gsCleanups.push(_releaseTrap);
 
-  customWrap.appendChild(h("div", { class: "sbg-gs-desc", text: "Configure your own custom UI colors." }));
-  const applyVar = (v, c) => { if (getSetting(S.THEME, "comfyui") === "custom") document.querySelector(".sbg-root")?.style.setProperty(v, c); };
-  customWrap.appendChild(_colorInput("CUSTOM_BG", "#1a1a1a", "Background", "Base background color", (c) => applyVar("--sbg-bg", c)));
-  customWrap.appendChild(_colorInput("CUSTOM_SURFACE", "#222222", "Surface", "Surface background color", (c) => applyVar("--sbg-surface", c)));
-  customWrap.appendChild(_colorInput("CUSTOM_BORDER", "#444444", "Border elements", "Borders and dividers", (c) => applyVar("--sbg-border", c)));
-  customWrap.appendChild(_colorInput("CUSTOM_TEXT", "#e0e0e0", "Text", "Main text color", (c) => applyVar("--sbg-text", c)));
-  customWrap.appendChild(_colorInput("CUSTOM_ACCENT", "#7c6aef", "Accent", "Primary accent color", (c) => applyVar("--sbg-accent", c)));
-  wrap.appendChild(customWrap);
+  const tabCtx = { content, galleryCtx, closeGS, tabs: TABS, visitCleanups: _visitCleanups };
+  let _activeTabId = null;
+  function _rememberScroll() {
+    if (_activeTabId) _tabScroll.set(_activeTabId, content.scrollTop || 0);
+  }
+  function selectTab(btn) {
+    for (const fn of _visitCleanups.splice(0)) { try { fn(); } catch { } }
+    _rememberScroll();
+    _activeTabId = btn.dataset.tab;
+    lsSet(B.SETTINGS_LAST_TAB, _activeTabId);
+    tabBtns.forEach(b => b.classList.remove("sbg-gs-navitem--active"));
+    btn.classList.add("sbg-gs-navitem--active");
+    setSelectedTab(tabBtns, btn);
+    TABS.find(t => t.id === _activeTabId).render(tabCtx);
+    applyFilter();
 
-  wrap.appendChild(h("div", { class: "sbg-gs-section-title", text: "Lightbox Button Colors", style: "margin-top:16px" }));
-  wrap.appendChild(h("div", { class: "sbg-gs-desc", text: "Leave blank for default colors." }));
-
-  const _ACCENT = "var(--sbg-accent,#7c6aef)";
-  function _btnPreview(text, color) {
-    return h("span", { text, style: `display:inline-block;padding:3px 8px;border-radius:6px;font-size:10px;font-weight:500;color:#fff;background:${color || _ACCENT};cursor:default;` });
+    const top = _tabScroll.get(_activeTabId) || 0;
+    content.scrollTop = top;
+    if (top) requestAnimationFrame(() => { if (_activeTabId === btn.dataset.tab) content.scrollTop = top; });
   }
 
-  for (const [key, text, tip] of [
-    [S.LB_COLOR_DOWNLOAD, "Download", "Background color for download button"],
-    [S.LB_COLOR_COPY_PROMPT, "Copy Prompt", "Background color for copy prompt button"],
-    [S.LB_COLOR_COPY_WF, "Copy WF", "Background color for copy workflow button"],
-    [S.LB_COLOR_LOAD_WF, "Load Workflow", "Background color for load workflow button"],
-    [S.LB_COLOR_COMPARE, "Compare", "Background color for compare button"],
-  ]) {
-    const chip = _btnPreview(text, getSetting(key, ""));
-    _chipRow(key, "", chip, { tooltip: tip, onColor: (c) => { chip.style.background = c || _ACCENT; } });
-  }
-
-  wrap.appendChild(h("div", { class: "sbg-gs-section-title", text: "App Badge Colors", style: "margin-top:16px" }));
-  wrap.appendChild(h("div", { class: "sbg-gs-desc", text: "Customize the color of each source application badge. Leave blank for defaults." }));
-
-  // Rows derive from the single app registry in sbg-core.js, so the preview
-  // here, the boot-time CSS vars, and the lightbox badge read the same defaults.
-  for (const a of APP_REGISTRY) {
-    const chip = _badgePreview(a.label, getSetting(a.settingKey, "") || a.defaultColor);
-    _chipRow(a.settingKey, a.defaultColor, chip, {
-      tooltip: `Color for ${a.label} source badge`,
-      onColor: (c) => {
-        const color = c || a.defaultColor;
-        chip.style.background = color;
-        document.documentElement.style.setProperty(a.cssVar, color);
-      },
-    });
-    const saved = getSetting(a.settingKey, "");
-    if (saved) document.documentElement.style.setProperty(a.cssVar, saved);
-  }
-
-  wrap.appendChild(h("div", { class: "sbg-gs-section-title", text: "Initial Image Tab", style: "margin-top:16px" }));
-  const initTabBadge = _badgePreview("Initial Image", getSetting(S.INITIAL_IMAGE_TAB_COLOR, "") || "#94a3b8");
-  _chipRow(S.INITIAL_IMAGE_TAB_COLOR, "#94a3b8", initTabBadge, {
-    tooltip: "Color for the Initial Image tab button in the lightbox metadata panel",
-    onColor: (c) => { initTabBadge.style.background = c || "#94a3b8"; },
-  });
-
-  wrap.appendChild(h("div", { class: "sbg-gs-section-title", text: "Default Pill Colors", style: "margin-top:16px" }));
-  wrap.appendChild(h("div", { class: "sbg-gs-desc", text: "The default background, text and border for values shown as pills, used for any field you have not given its own colour. Leave a box empty for the theme default." }));
-  const pillPreview = _badgePreview("Example Pill", getSetting(S.PILL_BG_COLOR, "") || "rgba(255,255,255,0.06)");
-  pillPreview.style.color = getSetting(S.PILL_TEXT_COLOR, "") || "rgba(255,255,255,0.8)";
-  pillPreview.style.border = `1px solid ${getSetting(S.PILL_BORDER_COLOR, "") || "rgba(255,255,255,0.08)"}`;
-  const pillBgRow = _colorInput(S.PILL_BG_COLOR, "rgba(255,255,255,0.06)", "Background", "Pill background color", (c) => {
-    pillPreview.style.background = c || "rgba(255,255,255,0.06)";
-    if (c) document.documentElement.style.setProperty("--sbg-pill-bg", c);
-    else document.documentElement.style.removeProperty("--sbg-pill-bg");
-  }, "bg");
-  const pillTextRow = _colorInput(S.PILL_TEXT_COLOR, "rgba(255,255,255,0.8)", "Text", "Pill text color", (c) => {
-    pillPreview.style.color = c || "rgba(255,255,255,0.8)";
-    if (c) document.documentElement.style.setProperty("--sbg-pill-text", c);
-    else document.documentElement.style.removeProperty("--sbg-pill-text");
-  }, "text");
-  const pillBorderRow = _colorInput(S.PILL_BORDER_COLOR, "rgba(255,255,255,0.08)", "Border", "Pill border color", (c) => {
-    pillPreview.style.border = `1px solid ${c || "rgba(255,255,255,0.08)"}`;
-    if (c) document.documentElement.style.setProperty("--sbg-pill-border", c);
-    else document.documentElement.style.removeProperty("--sbg-pill-border");
-  }, "border");
-  const pillPreviewRow = h("div", { style: "display:flex;align-items:center;gap:8px;margin-bottom:8px" });
-  pillPreviewRow.appendChild(h("span", { class: "sbg-gs-label", text: "Preview:", style: "font-size:11px;opacity:0.6" }));
-  pillPreviewRow.appendChild(pillPreview);
-  wrap.appendChild(pillPreviewRow);
-  wrap.appendChild(pillBgRow);
-  wrap.appendChild(pillTextRow);
-  wrap.appendChild(pillBorderRow);
-
-  content.appendChild(wrap);
-}
-
-function renderKeybindings() {
-  content.innerHTML = "";
-  const wrap = h("div", { class: "sbg-gs-form" });
-  wrap.appendChild(h("div", { class: "sbg-gs-section-title", text: "Keyboard Shortcuts" }));
-  wrap.appendChild(h("div", { class: "sbg-gs-desc", text: "Comma-separated key names. Example: ArrowLeft,a. Combos join modifiers with a plus sign, like Shift+ArrowLeft or Ctrl+d. Mouse buttons can be named too: MiddleClick, Mouse4, Mouse5. The comma key is written Comma and the plus key Plus." }));
-  wrap.appendChild(_textInput(S.KEY_PREV, "ArrowLeft,a,j", "Previous Image", "Keys for previous image in lightbox"));
-  wrap.appendChild(_textInput(S.KEY_NEXT, "ArrowRight,d,l", "Next Image", "Keys for next image in lightbox"));
-  wrap.appendChild(_textInput(S.KEY_CLOSE, "Escape,q,z,0", "Close Lightbox", "Keys to close lightbox"));
-  wrap.appendChild(_textInput(S.KEY_TOGGLE, "z,0", "Toggle Gallery", "Keys to open/close the gallery sidebar"));
-  wrap.appendChild(_textInput(S.KEY_REFRESH, "", "Refresh Gallery", "Key to refresh gallery (leave empty to disable)"));
-
-  wrap.appendChild(h("div", { class: "sbg-gs-section-title", text: "Lightbox Actions", style: "margin-top:16px" }));
-  wrap.appendChild(_textInput(S.KEY_FULLSCREEN, "f", "Fullscreen", "Toggle fullscreen in lightbox"));
-  wrap.appendChild(_textInput(S.KEY_DOWNLOAD, "", "Download", "Download current file (leave empty to disable)"));
-  wrap.appendChild(_textInput(S.KEY_COPY_PROMPT, "", "Copy Prompt", "Copy positive prompt (leave empty to disable)"));
-  wrap.appendChild(_textInput(S.KEY_COPY_WF, "", "Copy Workflow", "Copy workflow JSON (leave empty to disable)"));
-  wrap.appendChild(_textInput(S.KEY_LOAD_WF, "", "Load Workflow", "Load workflow into ComfyUI (leave empty to disable)"));
-  wrap.appendChild(_textInput(S.KEY_COMPARE, "c", "Compare Mode", "Toggle compare mode in lightbox"));
-  wrap.appendChild(_textInput(S.KEY_RESET_ZOOM, "MiddleClick,r", "Reset Zoom", "Return the image to fit. In independent compare zoom this targets the pane under the cursor, then the leftmost zoomed pane."));
-  wrap.appendChild(_textInput(S.KEY_ZOOM_IN, "=,+", "Zoom In", "Zoom in one step per press; hold to keep zooming. Follows the Zoom Sensitivity and Zoom Direction settings."));
-  wrap.appendChild(_textInput(S.KEY_ZOOM_OUT, "-", "Zoom Out", "Zoom out one step per press; hold to keep zooming."));
-
-  wrap.appendChild(h("div", { class: "sbg-gs-section-title", text: "Video", style: "margin-top:16px" }));
-  wrap.appendChild(_textInput(S.KEY_MUTE, "m", "Mute", "Mute or unmute the current video"));
-  wrap.appendChild(_textInput(S.KEY_FRAME_PREV, "Comma", "Frame Back", "Pause the video and step one frame back"));
-  wrap.appendChild(_textInput(S.KEY_FRAME_NEXT, ".", "Frame Forward", "Pause the video and step one frame forward"));
-
-  wrap.appendChild(h("div", { class: "sbg-gs-section-title", text: "Compare Mode", style: "margin-top:16px" }));
-  wrap.appendChild(h("div", { class: "sbg-gs-desc", text: "Plain navigation keys change the compared image on the right. These change the current image on the left." }));
-  wrap.appendChild(_textInput(S.KEY_CMP_CUR_PREV, "Shift+ArrowLeft,Shift+a", "Current Image Previous", "Previous current image while compare mode is open"));
-  wrap.appendChild(_textInput(S.KEY_CMP_CUR_NEXT, "Shift+ArrowRight,Shift+d", "Current Image Next", "Next current image while compare mode is open"));
-
-  wrap.appendChild(h("div", { class: "sbg-gs-desc", text: "Note: Arrows seek video in fullscreen. A/D always navigate." }));
-  content.appendChild(wrap);
-}
-
-function renderSettings() {
-  content.innerHTML = "";
-  const wrap = h("div", { class: "sbg-gs-form" });
-
-  wrap.appendChild(h("div", { class: "sbg-gs-section-title", text: "Gallery" }));
-  wrap.appendChild(_numberInput(S.THUMB_SIZE, 110, "Thumbnail Size (px)", "Size of thumbnail grid cells (64-256). Only used when Items Per Row is 'auto' - it decides how many columns fit."));
-  wrap.appendChild(_comboInput(S.THUMB_PER_ROW, "auto", ["auto", "1", "2", "3", "4", "5", "6", "8", "10"], "Items Per Row", "auto = fit as many as the Thumbnail Size allows. A number = ALWAYS that many per row; thumbnails are sized to fill the row based on their aspect ratios. Reopen the gallery to apply."));
-  wrap.appendChild(_comboInput(S.THUMB_SHAPE, "square", ["square", "ar"], "Thumbnail Shape", "Square crops; AR preserves aspect ratio"));
-  // Normalize a legacy stored sort value so the combo shows the right selection.
-  {
-    const _sortAlias = { newest: "created_desc", oldest: "created_asc" };
-    const _cur = getSetting(S.SORT, "created_desc");
-    if (_sortAlias[_cur]) saveSetting(S.SORT, _sortAlias[_cur]);
-  }
-  wrap.appendChild(_comboInput(S.SORT, "created_desc",
-    ["created_desc", "created_asc", "modified_desc", "modified_asc", "name_asc", "name_desc", "size_desc", "size_asc"],
-    "Default Sort", "Default sort order for gallery items (matches the gallery's sort menu)"));
-  wrap.appendChild(_numberInput(S.VSCROLL_BUFFER, 8, "Scroll Buffer (rows)", "Extra rows pre-rendered above/below viewport (2-30). Higher = less blank space on fast scroll, but more DOM nodes."));
-
-  // Shared config helpers, defined before the first server-backed row so it can
-  // call them directly. _postConfig checks the response, so a failed save
-  // surfaces as an error toast instead of a false "saved" message.
-  async function _postConfig(patch) {
-    const r = await fetch("/sidebar_gallery/config", {
-      method: "POST",
-      headers: { "Content-Type": "application/json" },
-      body: JSON.stringify(patch),
-    });
-    if (!r.ok) throw new Error("Save failed (HTTP " + r.status + ")");
-    return r.json();
-  }
-  const _loadCfg = () => fetch("/sidebar_gallery/config").then(r => r.json());
-
-  // Auto-refresh interval lives in server config (auto_refresh_interval_s)
-  // rather than localStorage, so it POSTs to /config instead of using _numberInput.
-  // The server clamps to 0 or >=5s; the input and toast echo the effective
-  // value from the response.
-  {
-    let arBusy = false;
-    const arInput = h("input", { type: "number", class: "sbg-gs-input sbg-gs-input--sm", min: "0", step: "5", value: "15" });
-    _loadCfg().then((cfg) => {
-      if (cfg && typeof cfg.auto_refresh_interval_s === "number") arInput.value = String(cfg.auto_refresh_interval_s);
-    }).catch(() => { });
-    arInput.addEventListener("change", async () => {
-      if (arBusy) return;
-      arBusy = true;
-      const n = Math.max(0, Math.floor(Number(arInput.value) || 0));
+  let _tabIndex = null;
+  // Each tab renders once into a detached element, so the badges can count
+  // matches on tabs that are not open.
+  function _buildTabIndex() {
+    if (_tabIndex) return _tabIndex;
+    _tabIndex = new Map();
+    for (const tab of TABS) {
+      if (tab.searchable === false) continue;
+      const scratchCleanups = [];
+      const scratchContent = h("div");
+      // A tab that cannot render off screen adds nothing to the search.
       try {
-        const cfg = await _postConfig({ auto_refresh_interval_s: n });
-        const eff = (cfg && typeof cfg.auto_refresh_interval_s === "number") ? cfg.auto_refresh_interval_s : n;
-        arInput.value = String(eff);
-        if (eff <= 0) showToast("Auto-refresh timer off (still checks when you return)");
-        else if (eff !== n) showToast(`Auto-refresh every ${eff}s (5s minimum)`);
-        else showToast(`Auto-refresh every ${eff}s`);
-        if (galleryCtx.refreshConfig) await galleryCtx.refreshConfig();
-      } catch (e) {
-        arInput.value = String(n);
-        showToast("Failed to update: " + (e?.message || e));
-      }
-      finally { arBusy = false; }
-    });
-    wrap.appendChild(_settingRow("Auto-refresh interval", arInput,
-      "How often the open gallery checks for files added, removed, or renamed on disk (minimum 5s). 0 turns off the background timer; the gallery still checks once when you come back to it. Applies right away."));
-  }
-
-  wrap.appendChild(h("div", { class: "sbg-gs-section-title", text: "Tooltips", style: "margin-top:16px" }));
-  wrap.appendChild(_toggle(S.TOOLTIP_NAME, true, "Show Filename", "Show filename in card tooltip"));
-  wrap.appendChild(_toggle(S.TOOLTIP_SIZE, true, "Show File Size", "Show file size in card tooltip"));
-  wrap.appendChild(_toggle(S.TOOLTIP_DATE, true, "Show Date", "Show date in card tooltip"));
-
-  wrap.appendChild(h("div", { class: "sbg-gs-section-title", text: "Lightbox Buttons", style: "margin-top:16px" }));
-  wrap.appendChild(h("div", { class: "sbg-gs-desc", text: "Show or hide individual buttons in the lightbox toolbar." }));
-  wrap.appendChild(_toggle(S.LB_SHOW_DOWNLOAD, true, "Download Button", "Show download button in lightbox"));
-  wrap.appendChild(_toggle(S.LB_SHOW_COPY_PROMPT, true, "Copy Prompt Button", "Show copy prompt button in lightbox"));
-  wrap.appendChild(_toggle(S.LB_SHOW_COPY_WF, true, "Copy WF Button", "Show copy workflow button in lightbox"));
-  wrap.appendChild(_toggle(S.LB_SHOW_LOAD_WF, true, "Load Workflow Button", "Show load workflow button in lightbox"));
-  wrap.appendChild(_toggle(S.LB_SHOW_COMPARE, true, "Compare Button", "Show compare button in lightbox"));
-
-  wrap.appendChild(h("div", { class: "sbg-gs-section-title", text: "Lightbox Zoom", style: "margin-top:16px" }));
-  wrap.appendChild(h("div", { class: "sbg-gs-desc", text: "Zoom and pan on the image or video in the lightbox. Pinch always zooms; drag pans when zoomed in." }));
-  wrap.appendChild(_comboInput(S.LB_ZOOM_SCROLL_MODE, "mouse", ["mouse", "touchpad", "auto"], "Scroll Input",
-    "What plain scrolling over the image does. Mouse: scroll zooms. Touchpad: two-finger scroll pans when zoomed (pinch always zooms). Auto: detect the device from the scroll events."));
-  wrap.appendChild(_comboInput(S.LB_ZOOM_ANCHOR, "cursor", ["cursor", "center"], "Zoom Direction",
-    "Zoom toward the mouse cursor or toward the center of the view."));
-  wrap.appendChild(_numberInput(S.LB_ZOOM_SENSITIVITY, 1, "Zoom Sensitivity",
-    "Zoom speed multiplier, 0.1 to 5. 1 = default; higher zooms faster per scroll."));
-  wrap.appendChild(_comboInput(S.LB_COMPARE_ZOOM, "independent", ["independent", "synced"], "Compare Zoom",
-    "In compare mode: zoom/pan only the side under the cursor, or keep both sides at the same zoom and relative position."));
-  wrap.appendChild(_toggle(S.LB_ZOOM_KEEP_ON_NAV, false, "Keep Zoom While Browsing",
-    "Keep the current zoom level and position when moving to the next or previous image or video. Off: every navigation resets to fit-to-screen."));
-
-  wrap.appendChild(h("div", { class: "sbg-gs-section-title", text: "Metadata", style: "margin-top:16px" }));
-  wrap.appendChild(_comboInput(S.PROMPT_VIEW, "remember", ["enhanced", "initial", "remember"], "Default Tab View", "Which tab opens first in tabbed sections. For prompt sections this picks Enhanced or Initial, while 'Remember' keeps your last-opened tab on every tabbed section."));
-  wrap.appendChild(_comboInput(S.PROMPT_PADDING, "6", ["0", "1", "2", "3", "4", "5", "6", "8", "10", "12"], "Prompt Padding", "Horizontal padding inside prompt text boxes (in px); top/bottom run 2px tighter.", (v) => {
-    document.documentElement.style.setProperty("--sbg-prompt-padding", v + "px");
-  }));
-  wrap.appendChild(_comboInput(S.FILENAME_STYLE, "basename", ["basename", "relpath"], "Filename Display", "Show just the filename or the full relative path in File Info."));
-  wrap.appendChild(_comboInput(S.MODEL_NAME_STYLE, "basename", ["basename", "relpath"], "Model Display", "Show model and LoRA names as just the filename (basename) or the full relative path."));
-  wrap.appendChild(_toggle(S.META_TAB_PERSIST, false, "Remember Metadata Tab", "Keep the active metadata tab (Generated/Initial Image) when navigating between images."));
-
-  wrap.appendChild(h("div", { class: "sbg-gs-section-title", text: "Folders", style: "margin-top:16px" }));
-  wrap.appendChild(h("div", { class: "sbg-gs-desc", text: "Extra folders to browse and index alongside ComfyUI's output folder. Paths are on the machine running ComfyUI." }));
-  const foldersList = h("div", {});
-  wrap.appendChild(foldersList);
-
-  const _postRoots = (extraRoots) => _postConfig({ extra_roots: extraRoots });
-
-  async function _renderFolders(cfg) {
-    foldersList.innerHTML = "";
-    if (!cfg) { try { cfg = await _loadCfg(); } catch { cfg = { extra_roots: [], roots: [] }; } }
-    const row = (label, sub, removeRaw) => {
-      const el = h("div", { class: "sbg-gs-row", style: "align-items:center" });
-      el.appendChild(h("span", { class: "sbg-gs-label", text: label, title: sub || "" }));
-      if (sub) el.appendChild(h("span", { style: "opacity:.55;font-size:11px;overflow:hidden;text-overflow:ellipsis;white-space:nowrap;max-width:50%", text: sub }));
-      if (removeRaw != null) {
-        const del = h("button", { class: "sbg-iconbtn sbg-iconbtn--danger", text: "🗑", title: "Remove this folder from the gallery (files on disk are not touched)" });
-        del.addEventListener("click", async () => {
-          try {
-            await _postRoots((cfg.extra_roots || []).filter(p => p !== removeRaw));
-            showToast("Folder removed");
-            if (galleryCtx.refreshConfig) await galleryCtx.refreshConfig();
-            _renderFolders();
-          } catch (e) { showToast("Failed to remove folder: " + (e?.message || e)); }
+        tab.render({
+          ...tabCtx,
+          content: scratchContent,
+          visitCleanups: scratchCleanups,
+          indexOnly: true,
         });
-        el.appendChild(del);
+      } catch { }
+      const form = scratchContent.querySelector(".sbg-gs-form");
+      _tabIndex.set(tab.id, form ? _sections(form) : []);
+      for (const fn of scratchCleanups.splice(0)) { try { fn(); } catch { } }
+    }
+    return _tabIndex;
+  }
+  function _indexCount(tabId, q) {
+    const sections = _buildTabIndex().get(tabId);
+    return sections ? _match(sections, q) : 0;
+  }
+  function _updateBadges(q, activeId, activeTotal) {
+    for (let i = 0; i < TABS.length; i++) {
+      const badge = tabBtns[i].querySelector(".sbg-gs-navbadge");
+      if (!badge) continue;
+      if (!q) { badge.classList.add("sbg-hidden"); continue; }
+      const n = TABS[i].id === activeId ? activeTotal : _indexCount(TABS[i].id, q);
+      badge.textContent = String(n);
+      badge.classList.toggle("sbg-hidden", n === 0);
+    }
+  }
+  function _otherTabHits(q, activeId) {
+    const out = [];
+    for (const tab of TABS) {
+      if (tab.id === activeId || tab.searchable === false) continue;
+      if (_indexCount(tab.id, q) > 0) out.push(tab.label);
+    }
+    return out;
+  }
+
+  function applyFilter() {
+    const form = content.querySelector(".sbg-gs-form");
+
+    if (!form) {
+      const qRaw = searchInput.value.trim();
+      const formLessId = tabBar.querySelector(".sbg-gs-navitem--active")?.dataset.tab;
+      _updateBadges(qRaw.toLowerCase(), formLessId, 0);
+      if (qRaw) {
+        const hits = _otherTabHits(qRaw.toLowerCase(), formLessId);
+        noResults.textContent = "Search does not cover this tab."
+          + (hits.length ? " Matches found in " + hits.join(", ") + "." : "");
+        noResults.classList.remove("sbg-hidden");
       } else {
-        el.appendChild(h("span", { style: "opacity:.4;font-size:11px", text: "built-in" }));
+        noResults.classList.add("sbg-hidden");
       }
-      return el;
-    };
-    foldersList.appendChild(row("Output", "ComfyUI's output folder", null));
-    for (const p of cfg.extra_roots || []) foldersList.appendChild(row(p.split(/[\\/]/).pop() || p, p, p));
-
-    const addHint = h("div", { class: "sbg-gs-desc", style: "margin-top:8px" });
-    addHint.appendChild(document.createTextNode(
-      "To add a folder, open sidebar_gallery_config.json and put the path in its extra_roots list, for example "));
-    addHint.appendChild(h("code", { text: '{"extra_roots": ["C:/Renders"]}' }));
-    addHint.appendChild(document.createTextNode(". The gallery picks the change up within a few seconds."));
-    foldersList.appendChild(addHint);
-    if (cfg.config_path) {
-      foldersList.appendChild(h("div", { class: "sbg-gs-desc", style: "font-family:monospace;overflow-wrap:anywhere;user-select:text", text: cfg.config_path, title: cfg.config_path }));
-    }
-  }
-
-  wrap.appendChild(h("div", { class: "sbg-gs-section-title", text: "Excluded folders", style: "margin-top:16px" }));
-  wrap.appendChild(h("div", { class: "sbg-gs-desc", text: "Folder names to skip while scanning (e.g. thumbnails, backup). Matching is by folder name rather than full path, and ignores case. Changes take effect on the next scan." }));
-  const excludedList = h("div", {});
-  wrap.appendChild(excludedList);
-
-  // Serialises edits in this section so two fast clicks can't race on a stale
-  // snapshot and lose an update.
-  let excludedBusy = false;
-
-  const _postExcluded = (excludedDirs) => _postConfig({ excluded_dirs: excludedDirs });
-
-  async function _renderExcluded(cfg) {
-    excludedList.innerHTML = "";
-    if (!cfg) { try { cfg = await _loadCfg(); } catch { cfg = { excluded_dirs: [] }; } }
-    const current = cfg.excluded_dirs || [];
-
-    const hiddenChk = h("input", { type: "checkbox" });
-    hiddenChk.checked = !!cfg.index_hidden_dirs;
-    hiddenChk.addEventListener("change", async () => {
-      if (excludedBusy) { hiddenChk.checked = !hiddenChk.checked; return; }
-      excludedBusy = true;
-      try {
-        await _postConfig({ index_hidden_dirs: hiddenChk.checked });
-        showToast(hiddenChk.checked
-          ? "Hidden folders will be scanned on the next scan"
-          : "Hidden folders will be skipped on the next scan");
-        if (galleryCtx.refreshConfig) await galleryCtx.refreshConfig();
-      } catch (e) {
-        hiddenChk.checked = !hiddenChk.checked;
-        showToast("Failed to update: " + (e?.message || e));
-      } finally { excludedBusy = false; }
-    });
-    excludedList.appendChild(_settingRow("Include hidden folders", hiddenChk,
-      "Also scan folders whose names start with a dot (e.g. .thumbs). Off by default - hidden folders are skipped."));
-
-    const row = (name) => {
-      const el = h("div", { class: "sbg-gs-row", style: "align-items:center" });
-      el.appendChild(h("span", { class: "sbg-gs-label", text: name }));
-      const del = h("button", { class: "sbg-iconbtn sbg-iconbtn--danger", text: "🗑", title: "Stop excluding this folder (its files reappear on the next scan)" });
-      del.addEventListener("click", async () => {
-        if (excludedBusy) return;
-        excludedBusy = true;
-        try {
-          await _postExcluded(current.filter(d => d !== name));
-          showToast("Folder no longer excluded - it will be re-indexed on the next scan");
-          if (galleryCtx.refreshConfig) await galleryCtx.refreshConfig();
-          _renderExcluded();
-        } catch (e) { showToast("Failed to update: " + (e?.message || e)); }
-        finally { excludedBusy = false; }
-      });
-      el.appendChild(del);
-      return el;
-    };
-    if (current.length === 0) {
-      excludedList.appendChild(h("div", { class: "sbg-gs-row", style: "opacity:.5;font-size:11px", text: "No extra folders excluded." }));
-    } else {
-      for (const name of current) excludedList.appendChild(row(name));
-    }
-
-    const addWrap = h("div", { class: "sbg-gs-row", style: "align-items:center;gap:6px" });
-    const inp = h("input", { type: "text", class: "sbg-gs-input", placeholder: "thumbnails", style: "flex:1" });
-    const addBtn = h("button", { class: "sbg-btn sbg-btn--accent", text: "+ Add" });
-    const doAdd = async () => {
-      if (excludedBusy) return;
-      // Accept a plain name or a pasted path; keep just the last real path segment.
-      const name = (inp.value.split(/[\\/]/).filter(Boolean).pop() || "").trim().toLowerCase();
-      if (!name || name === "." || name === "..") { showToast("Enter a folder name to exclude"); return; }
-      if (current.includes(name)) { showToast("Already excluded"); inp.value = ""; return; }
-      excludedBusy = true;
-      try {
-        await _postExcluded([...current, name]);
-        showToast("Folder excluded - it will be skipped on the next scan");
-        inp.value = "";
-        if (galleryCtx.refreshConfig) await galleryCtx.refreshConfig();
-        _renderExcluded();
-      } catch (e) { showToast("Failed to add: " + (e?.message || e)); }
-      finally { excludedBusy = false; }
-    };
-    addBtn.addEventListener("click", doAdd);
-    inp.addEventListener("keydown", (ev) => { if (ev.key === "Enter") doAdd(); });
-    addWrap.appendChild(inp);
-    addWrap.appendChild(addBtn);
-    excludedList.appendChild(addWrap);
-  }
-
-  // Initial render: a single config fetch shared by both sections.
-  (async () => {
-    let cfg;
-    try { cfg = await _loadCfg(); } catch { }
-    _renderFolders(cfg);
-    _renderExcluded(cfg);
-  })();
-
-  content.appendChild(wrap);
-}
-
-function renderPresets() {
-  content.innerHTML = "";
-  const wrap = h("div", { class: "sbg-gs-form" });
-  wrap.appendChild(h("div", { class: "sbg-gs-section-title", text: "Presets" }));
-  wrap.appendChild(h("div", { class: "sbg-gs-desc", text: "Save and load gallery configuration presets." }));
-
-  const PRESETS_KEY = "SBG.Presets";
-  let presets = [];
-  try { presets = JSON.parse(localStorage.getItem(PRESETS_KEY)) || []; } catch { }
-
-  const saveChecks = h("div", { class: "sbg-gs-preset-checks" });
-  const incLayout = h("input", { type: "checkbox" }); incLayout.checked = true;
-  const incColors = h("input", { type: "checkbox" }); incColors.checked = true;
-  const incSettings = h("input", { type: "checkbox" }); incSettings.checked = true;
-  const incKeys = h("input", { type: "checkbox" }); incKeys.checked = true;
-  saveChecks.appendChild(h("label", {}, [incLayout, document.createTextNode(" Layout")]));
-  saveChecks.appendChild(h("label", {}, [incColors, document.createTextNode(" Colors")]));
-  saveChecks.appendChild(h("label", {}, [incSettings, document.createTextNode(" Settings")]));
-  saveChecks.appendChild(h("label", {}, [incKeys, document.createTextNode(" Keybindings")]));
-  wrap.appendChild(saveChecks);
-
-  // Every colour the Appearance tab manages, as setting ids: the S entries
-  // whose names carry COLOR, the custom theme variables, the per-app badge
-  // keys, and the highlight background's settings copy.
-  function _appearanceColorIds() {
-    const ids = [];
-    for (const [k, id] of Object.entries(S)) if (k.includes("COLOR")) ids.push(id);
-    ids.push("CUSTOM_BG", "CUSTOM_SURFACE", "CUSTOM_BORDER", "CUSTOM_TEXT", "CUSTOM_ACCENT");
-    for (const a of APP_REGISTRY) ids.push(a.settingKey);
-    ids.push("HighlightBg");
-    return ids;
-  }
-
-  // The one capture and the one apply, shared by the local preset buttons and
-  // the server theme buttons, so the call sites cannot drift on what a
-  // preset contains or how it lands.
-  function capturePreset(name) {
-    const preset = { name, created: Date.now() };
-    if (incLayout.checked) {
-      // The per-app x per-media section profiles ("SBG.Layouts", translation layer).
-      preset.layouts = getSetting("SBG.Layouts", null);
-    }
-    if (incColors.checked) {
-      // The legacy four keys stay, so exports keep loading in older builds.
-      preset.colors = {
-        high: getSetting(S.BADGE_HIGH_COLOR, "#f87171"),
-        low: getSetting(S.BADGE_LOW_COLOR, "#60a5fa"),
-        video: getSetting(S.VIDEO_BADGE_COLOR, "#facc15"),
-        highlight: localStorage.getItem("SBG.GS.HighlightBg") || "",
-        all: {},
-      };
-      for (const id of _appearanceColorIds()) {
-        const v = getSetting(id, null);
-        // null means never set, while an empty string is a deliberate clear
-        // and must load as one.
-        if (v !== null) preset.colors.all[id] = v;
-      }
-    }
-    if (incSettings.checked) {
-      preset.settings = {};
-      for (const [k, id] of Object.entries(S)) {
-        if (k.startsWith("KEY_")) continue; // keybindings saved separately
-        preset.settings[id] = getSetting(id, null);
-      }
-    }
-    if (incKeys.checked) preset.keys = _capturePresetKeys();
-    return preset;
-  }
-
-  function applyPreset(p) {
-    if (p.layouts) {
-      saveSetting("SBG.Layouts", p.layouts);
-      document.dispatchEvent(new CustomEvent("sbg-layout-changed"));
-    }
-    if (p.colors) {
-      saveSetting(S.BADGE_HIGH_COLOR, p.colors.high);
-      saveSetting(S.BADGE_LOW_COLOR, p.colors.low);
-      saveSetting(S.VIDEO_BADGE_COLOR, p.colors.video);
-      if (p.colors.highlight) {
-        localStorage.setItem("SBG.GS.HighlightBg", p.colors.highlight);
-        saveSetting("HighlightBg", p.colors.highlight);
-      }
-      for (const [id, v] of Object.entries(p.colors.all || {})) {
-        saveSetting(id, v);
-        // HighlightBg is dual-copy and the render path reads the localStorage
-        // side, so a carried clear must land there too.
-        if (id === "HighlightBg") localStorage.setItem("SBG.GS.HighlightBg", v);
-      }
-    }
-    if (p.settings) {
-      for (const [id, val] of Object.entries(p.settings)) {
-        if (val !== null) saveSetting(id, val);
-      }
-    }
-    if (p.keys) _applyPresetKeys(p.keys);
-  }
-
-  const nameInput = h("input", { type: "text", class: "sbg-gs-input", placeholder: "Preset name" });
-  const saveBtn = h("button", { class: "sbg-btn sbg-btn--accent", text: "💾 Save Preset" });
-  saveBtn.addEventListener("click", () => {
-    const name = nameInput.value.trim();
-    if (!name) { showToast("Enter a preset name"); return; }
-    const preset = capturePreset(name);
-    presets = presets.filter(p => p.name !== name);
-    presets.unshift(preset);
-    localStorage.setItem(PRESETS_KEY, JSON.stringify(presets));
-    showToast(`Preset "${name}" saved`);
-    renderPresets();
-  });
-  const saveRow = h("div", { class: "sbg-gs-preset-save" }, [nameInput, saveBtn]);
-  wrap.appendChild(saveRow);
-
-  if (presets.length > 0) {
-    wrap.appendChild(h("div", { class: "sbg-gs-section-title", text: "Saved Presets", style: "margin-top:16px" }));
-    for (const p of presets) {
-      const row = h("div", { class: "sbg-gs-preset-item" });
-      row.appendChild(h("span", { class: "sbg-gs-preset-name", text: p.name }));
-      const loadBtn = h("button", { class: "sbg-btn sbg-btn--accent sbg-btn--sm", text: "Load" });
-      confirmClick(loadBtn, () => {
-        applyPreset(p);
-        showToast(`Preset "${p.name}" loaded. Refresh gallery to apply.`);
-      }, { background: "var(--sbg-danger)" });
-      const delBtn = h("button", { class: "sbg-btn sbg-btn--danger sbg-btn--sm", text: "✕" });
-      confirmClick(delBtn, () => {
-        presets = presets.filter(x => x.name !== p.name);
-        localStorage.setItem(PRESETS_KEY, JSON.stringify(presets));
-        renderPresets();
-      });
-      const expBtn = h("button", { class: "sbg-btn sbg-btn--sm", text: "📤" });
-      expBtn.addEventListener("click", () => {
-        const blob = new Blob([JSON.stringify(p, null, 2)], { type: "application/json" });
-        const url = URL.createObjectURL(blob);
-        const a = h("a", { href: url, download: `${p.name}.json` });
-        a.click();
-        URL.revokeObjectURL(url);
-      });
-      row.appendChild(loadBtn);
-      row.appendChild(expBtn);
-      row.appendChild(delBtn);
-      wrap.appendChild(row);
-    }
-  }
-
-  wrap.appendChild(h("div", { class: "sbg-gs-section-title", text: "Import", style: "margin-top:16px" }));
-  const importBtn = h("button", { class: "sbg-btn", text: "📥 Import Preset" });
-  importBtn.addEventListener("click", () => {
-    const fi = h("input", { type: "file", accept: ".json" });
-    fi.addEventListener("change", async () => {
-      if (!fi.files.length) return;
-      try {
-        const text = await fi.files[0].text();
-        const p = JSON.parse(text);
-        if (!p.name) { showToast("Invalid preset file"); return; }
-        presets = presets.filter(x => x.name !== p.name);
-        presets.unshift(p);
-        localStorage.setItem(PRESETS_KEY, JSON.stringify(presets));
-        showToast(`Preset "${p.name}" imported`);
-        renderPresets();
-      } catch (e) { showToast(`Import error: ${e.message}`); }
-    });
-    fi.click();
-  });
-  wrap.appendChild(importBtn);
-
-  wrap.appendChild(h("div", { class: "sbg-gs-section-title", text: "Server Themes", style: "margin-top:16px" }));
-  wrap.appendChild(h("div", { class: "sbg-gs-desc", text: "Presets stored in the extension's themes/ folder. Persist across reinstalls." }));
-  const serverList = h("div", { class: "sbg-gs-preset-list" });
-  serverList.textContent = "Loading...";
-  wrap.appendChild(serverList);
-
-  fetch("/sidebar_gallery/presets").then(r => r.json()).then(data => {
-    serverList.innerHTML = "";
-    if (!data.presets || data.presets.length === 0) {
-      serverList.textContent = "No server themes found.";
       return;
     }
-    for (const sp of data.presets) {
-      const row = h("div", { class: "sbg-gs-preset-item" });
-      row.appendChild(h("span", { class: "sbg-gs-preset-name", text: sp.name }));
-      const loadBtn = h("button", { class: "sbg-btn sbg-btn--accent sbg-btn--sm", text: "Load" });
-      confirmClick(loadBtn, async () => {
-        try {
-          const resp = await fetch(`/sidebar_gallery/preset?filename=${encodeURIComponent(sp.filename)}`);
-          if (!resp.ok) throw new Error(`HTTP ${resp.status}`);
-          const p = await resp.json();
-          applyPreset(p);
-          showToast(`Server theme "${sp.name}" loaded. Refresh gallery to apply.`);
-        } catch (e) { showToast("Error loading theme: " + e.message); }
-      }, { background: "var(--sbg-danger)" });
-      const delBtn = h("button", { class: "sbg-btn sbg-btn--danger sbg-btn--sm", text: "\u2715" });
-      confirmClick(delBtn, async () => {
-        try {
-          const r = await fetch("/sidebar_gallery/presets", {
-            method: "POST",
-            headers: { "Content-Type": "application/json" },
-            body: JSON.stringify({ action: "delete", name: sp.name }),
-          });
-          if (!r.ok) throw new Error(`HTTP ${r.status}`);
-        } catch (e) { showToast("Error deleting theme: " + e.message); }
-        renderPresets();
-      });
-      row.appendChild(loadBtn);
-      row.appendChild(delBtn);
-      serverList.appendChild(row);
-    }
-  }).catch(() => { serverList.textContent = "Could not load server themes."; });
-
-  const saveServerBtn = h("button", { class: "sbg-btn", text: "💾 Save to Server", style: "margin-top:8px" });
-  saveServerBtn.addEventListener("click", async () => {
-    const name = nameInput.value.trim();
-    if (!name) { showToast("Enter a preset name first"); return; }
-    const preset = capturePreset(name);
-    try {
-      const r = await fetch("/sidebar_gallery/presets", {
-        method: "POST",
-        headers: { "Content-Type": "application/json" },
-        body: JSON.stringify({ action: "save", name, data: preset }),
-      });
-      if (!r.ok) throw new Error(`HTTP ${r.status}`);
-      showToast(`Theme "${name}" saved to server`);
-      renderPresets();
-    } catch (e) { showToast("Error saving to server: " + e.message); }
-  });
-  wrap.appendChild(saveServerBtn);
-
-  content.appendChild(wrap);
-}
-
-function renderDiagnosticsTab() {
-  content.innerHTML = "";
-  const wrap = h("div", { class: "sbg-gs-form" });
-  wrap.appendChild(h("div", { class: "sbg-gs-section-title", text: "Diagnostics & Tools" }));
-
-  const actionRow = h("div", { style: "display:flex;gap:8px;margin-bottom:16px;flex-wrap:wrap" });
-
-  const diagGalleryRefreshBtn = h("button", { class: "sbg-btn sbg-btn--accent", text: "🔃 Refresh", title: "Re-fetch all items from the server and refresh the gallery view" });
-  diagGalleryRefreshBtn.addEventListener("click", async () => {
-    diagGalleryRefreshBtn.disabled = true;
-    diagGalleryRefreshBtn.textContent = "Refreshing…";
-    try {
-      await galleryCtx.fetchAllItems({ rescan: true });
-      showToast("Gallery refreshed");
-      await refreshDiagStats(diagStatsContainer);
-    } catch (e) {
-      showToast(`Error: ${e?.message || e}`);
-    } finally {
-      diagGalleryRefreshBtn.disabled = false;
-      diagGalleryRefreshBtn.textContent = "🔃 Refresh";
-    }
-  });
-
-  const diagRefreshBtn = h("button", { class: "sbg-btn sbg-btn--accent", text: "🔄 Rebuild DB Index", title: "Rescan all roots and rebuild metadata/tag index on server" });
-  confirmClick(diagRefreshBtn, async () => {
-    diagRefreshBtn.disabled = true;
-    diagRefreshBtn.textContent = "🔄 Rebuilding DB... (0%)";
-    try {
-      await fetch("/sidebar_gallery/rebuild_index", { method: "POST" });
-    } catch { }
-
-    // Shared progress poller (same formatter as the status bar / modal).
-    // Wait for `settled` (2+ idle ticks) rather than a single !running read, so
-    // the between-roots gap of a multi-root rebuild can't end this early. A
-    // refused start (another scan already running) recovers the button instead
-    // of sitting at 0% forever.
-    let sawRunning = false;
-    let active = true;
-    const unsub = progressPoller.subscribe((data, meta) => {
-      if (!active || !data) return;
-      const e = data.full;
-      if (data.running) sawRunning = true;
-      if (e && data.running) {
-        const f = formatProgress(e);
-        diagRefreshBtn.textContent = f.pct >= 0
-          ? `🔄 Rebuilding DB... (${f.pct}%)`
-          : `🔄 Rebuilding DB... (${f.text})`;
-      }
-      if (meta.settled) {
-        active = false;
-        unsub();
-        diagRefreshBtn.textContent = sawRunning
-          ? "🔄 DB Indexed Successfully!"
-          : "Couldn't start. Another scan is running";
-        setTimeout(() => {
-          diagRefreshBtn.disabled = false;
-          diagRefreshBtn.textContent = "🔄 Rebuild DB Index";
-        }, 3000);
-        if (sawRunning) {
-          galleryCtx.fetchAllItems({ rescan: true });
-          refreshDiagStats(diagStatsContainer);
-        }
-      }
-    });
-  }, { background: "#f59e0b", color: "#000" });
-
-  const diagCacheMetaBtn = h("button", { class: "sbg-btn", text: "📦 Cache All Metadata", title: "Fetch and cache metadata summaries for all files to IndexedDB" });
-  diagCacheMetaBtn.addEventListener("click", async () => {
-    diagCacheMetaBtn.disabled = true;
-    diagCacheMetaBtn.textContent = "Caching…";
-    try {
-      const items = galleryCtx.allItems || [];
-      let cached = 0;
-      const batch = [];
-      for (const it of items) {
-        const key = itemKey(it);
-        if (_metaCache.has(key)) { cached++; continue; }
-        try {
-          const m = await api("/sidebar_gallery/metadata", { root_id: it.root_id, relpath: it.relpath, summary_only: "1" });
-          _metaCache.set(key, m);
-          batch.push({ key, value: m });
-          cached++;
-          if (cached % 50 === 0) {
-            diagCacheMetaBtn.textContent = `Caching… ${cached}/${items.length}`;
-            if (batch.length >= 50) { await _metaCacheAPI.putBatch(batch.splice(0)); }
-          }
-        } catch { cached++; }
-      }
-      if (batch.length) await _metaCacheAPI.putBatch(batch);
-      diagCacheMetaBtn.textContent = "📦 Cache All Metadata";
-      diagCacheMetaBtn.disabled = false;
-      showToast(`Metadata cached: ${cached} items`);
-      await refreshDiagStats(diagStatsContainer);
-    } catch (e) {
-      diagCacheMetaBtn.textContent = "📦 Cache All Metadata";
-      diagCacheMetaBtn.disabled = false;
-      showToast(`Error: ${e?.message || e}`);
-    }
-  });
-
-  const diagCacheThumbBtn = h("button", { class: "sbg-btn", text: "🖼️ Cache Thumbnails", title: "Cache all lazy-load thumbnails into the local browser IndexedDB" });
-  diagCacheThumbBtn.addEventListener("click", async () => {
-    diagCacheThumbBtn.disabled = true;
-    diagCacheThumbBtn.textContent = "Caching…";
-    try {
-      const items = galleryCtx.allItems || [];
-      let cached = 0;
-      let skipped = 0;
-      for (const it of items) {
-        if (!it.thumb_url) continue;
-        // Already cached: count it and move on. The returned object URL is the
-        // LIVE memory-cache entry that visible cards share; revoking it here
-        // broke every mounted card using it and left the dead URL being served
-        // for the rest of the session.
-        const existing = await _thumbCacheAPI.tryGet(it.thumb_url);
-        if (existing) { cached++; continue; }
-        try {
-          // A raw-URL result is the server's 404 (no thumbnail exists), and
-          // rejections are transient failures. Neither counts as cached.
-          const got = await _thumbCacheAPI.getOrFetch(it.thumb_url);
-          if (got !== it.thumb_url) cached++;
-          else skipped++;
-          if ((cached + skipped) % 20 === 0) {
-            diagCacheThumbBtn.textContent = `Caching… ${cached}/${items.length}`;
-          }
-        } catch { skipped++; }
-      }
-      diagCacheThumbBtn.textContent = "🖼️ Cache Thumbnails";
-      diagCacheThumbBtn.disabled = false;
-      showToast(skipped
-        ? `Thumbnails cached: ${cached} items (${skipped} unavailable)`
-        : `Thumbnails cached: ${cached} items`);
-      await refreshDiagStats(diagStatsContainer);
-    } catch (e) {
-      diagCacheThumbBtn.textContent = "🖼️ Cache Thumbnails";
-      diagCacheThumbBtn.disabled = false;
-      showToast(`Error: ${e?.message || e}`);
-    }
-  });
-
-  const diagClearMetaBtn = h("button", { class: "sbg-btn sbg-btn--danger", text: "🗑️ Clear Meta Cache", title: "Clear browser IndexedDB metadata cache" });
-  confirmClick(diagClearMetaBtn, async () => {
-    try {
-      const ok = await _metaCacheAPI.clear();
-      _metaCache.clear();
-      showToast(ok ? "Metadata cache cleared" : "Could not clear the meta cache (browser storage unavailable)");
-      await refreshDiagStats(diagStatsContainer);
-    } catch (e) { showToast("Error clearing meta cache: " + e.message); }
-  }, { background: "#f59e0b", color: "#000" });
-
-  const diagClearThumbBtn = h("button", { class: "sbg-btn sbg-btn--danger", text: "🗑️ Clear Thumb Cache", title: "Clear browser IndexedDB thumbnails cache" });
-  confirmClick(diagClearThumbBtn, async () => {
-    try {
-      const ok = await _thumbCacheAPI.clear();
-      // Also drop the in-memory blob cache and the failed-URL blacklist, so
-      // thumbnails that failed to load (e.g. requests that timed out during a
-      // DB rebuild) can be retried after the cache is cleared.
-      for (const [url, blobUrl] of [..._thumbMemCache]) {
-        // Don't revoke blobs still shown by a visible card.
-        try {
-          if (!document.querySelector(`img.sbg-card__thumb[src="${blobUrl}"]`)) URL.revokeObjectURL(blobUrl);
-        } catch { }
-        _thumbMemCache.delete(url);
-      }
-      resetFailedThumbs();
-      showToast(ok ? "Thumbnails cache cleared" : "Could not clear the thumbnail cache (browser storage unavailable)");
-      await refreshDiagStats(diagStatsContainer);
-    } catch (e) { showToast("Error clearing thumb cache: " + e.message); }
-  }, { background: "#f59e0b", color: "#000" });
-
-  const diagNukeBtn = h("button", { class: "sbg-btn sbg-btn--danger", text: "💣 Nuclear Clear All", title: "Delete ALL browser cache databases (including legacy), reset version tracking, clean up old settings keys, and reload. Fixes any corruption." });
-  confirmClick(diagNukeBtn, () => {
-    // Nuke IDB: current + legacy databases
-    try { _resetIdb(); } catch (e) { /* ignore */ }
-    try { indexedDB.deleteDatabase("sbg-cache"); } catch (e) { /* ignore */ }
-    try { indexedDB.deleteDatabase("sbg-gallery-cache"); } catch (e) { /* ignore */ }
-
-    localStorage.removeItem("SBG._dbVersion");
-    localStorage.removeItem("SBG._cacheEpoch");
-    // Retired keys that aren't read anymore.
-    for (const k of ["SBG.Layout", "SBG.LayoutRenames", "SBG.MetaSectionOrder", "SBG.GS.HiddenSections"]) {
-      localStorage.removeItem(k);
+    const q = searchInput.value.trim().toLowerCase();
+    let total = 0;
+    // The filter hides with a class of its own, since a tab hides some rows
+    // with sbg-hidden and clearing the query must not show those.
+    if (!q) {
+      for (const el of form.children) el.classList.remove("sbg-gs-filtered");
+    } else {
+      total = _match(_sections(form), q, (el, shown) => el.classList.toggle("sbg-gs-filtered", !shown));
     }
 
-    _metaCache.clear();
-    showToast("All caches cleared. Reloading…");
-    setTimeout(() => location.reload(true), 500);
-  }, { label: "⚠️ Sure? This will reload the page", armMs: 3000, background: "#ef4444", color: "#fff" });
+    const activeId = tabBar.querySelector(".sbg-gs-navitem--active")?.dataset.tab;
+    _updateBadges(q, activeId, total);
+    if (q && total === 0) {
+      const hits = _otherTabHits(q, activeId);
+      const shown = searchInput.value.trim();
+      noResults.textContent = hits.length
+        ? `Nothing in this tab matches "${shown}". Matches found in ${hits.join(", ")}.`
+        : `Nothing matches "${shown}".`;
+      noResults.classList.remove("sbg-hidden");
+    } else {
+      noResults.classList.add("sbg-hidden");
+    }
+  }
 
-  actionRow.appendChild(diagGalleryRefreshBtn);
-  actionRow.appendChild(diagRefreshBtn);
-  actionRow.appendChild(diagCacheMetaBtn);
-  actionRow.appendChild(diagCacheThumbBtn);
-  actionRow.appendChild(diagClearThumbBtn);
-  actionRow.appendChild(diagClearMetaBtn);
-  actionRow.appendChild(diagNukeBtn);
-  wrap.appendChild(actionRow);
-
-  const diagStatsContainer = h("div", { class: "sbg-diag-stats" });
-  wrap.appendChild(diagStatsContainer);
-  content.appendChild(wrap);
-
-  refreshDiagStats(diagStatsContainer);
-}
-
-// Tab switching
-const TAB_RENDERERS = { layout: () => renderLayout(content, galleryCtx, closeGS), appearance: renderAppearance, keybindings: renderKeybindings, settings: renderSettings, presets: renderPresets, diagnostics: renderDiagnosticsTab };
-for (const btn of tabBtns) {
-  btn.addEventListener("click", () => {
-    tabBtns.forEach(b => b.classList.remove("sbg-gs-tab--active"));
-    btn.classList.add("sbg-gs-tab--active");
-    TAB_RENDERERS[btn.dataset.tab]?.();
+  let _filterFrame = 0;
+  // A row a fetch adds or fills after its tab renders would otherwise land
+  // unfiltered under a live query. The filter only toggles classes, which
+  // childList does not see, so it cannot wake itself.
+  const _filterObserver = new MutationObserver(() => {
+    if (_filterFrame) return;
+    _filterFrame = requestAnimationFrame(() => { _filterFrame = 0; applyFilter(); });
   });
-}
-const defaultBtn = [...tabBtns].find(b => b.dataset.tab === defaultTab) || tabBtns[0];
-defaultBtn.classList.add("sbg-gs-tab--active");
-if (TAB_RENDERERS[defaultTab]) {
-  TAB_RENDERERS[defaultTab]();
-} else {
-  renderLayout(content, galleryCtx, closeGS);
-}
+  _filterObserver.observe(content, { childList: true, subtree: true });
+  _gsCleanups.push(() => {
+    _filterObserver.disconnect();
+    if (_filterFrame) cancelAnimationFrame(_filterFrame);
+  });
+
+  searchInput.addEventListener("input", applyFilter);
+
+  searchInput.addEventListener("keydown", (e) => {
+    if (e.key !== "Escape" || !searchInput.value) return;
+    e.stopPropagation();
+    searchInput.value = "";
+    applyFilter();
+  });
+  for (const btn of tabBtns) {
+    btn.addEventListener("click", () => selectTab(btn));
+  }
+
+  const detachTabKeys = wireTablistKeys(tabBtns, selectTab);
+  _gsCleanups.push(() => detachTabKeys());
+
+  const openOn = defaultTab || lsGet(B.SETTINGS_LAST_TAB) || "layout";
+  selectTab(tabBtns.find(b => b.dataset.tab === openOn) || tabBtns.find(b => b.dataset.tab === "layout"));
 }

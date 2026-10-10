@@ -1,26 +1,3 @@
-"""ComfyUI node-signature registry, structural classification, and the
-pure-value link resolver.
-
-Node roles come from ComfyUI's own knowledge of every installed node (input
-names and types, output names and types, category) instead of name patterns.
-
-- NodeRegistry: live mode reads ComfyUI's NODE_CLASS_MAPPINGS in-process;
-  snapshot mode loads an /object_info-shaped JSON snapshot so everything
-  works without a live ComfyUI. Unknown classes
-  return None and callers fall back to the legacy name heuristics.
-
-- classify(): structural role of a node (sampler / text_encode / loader /
-  lora / image_resize / latent_resize / interpolation / display / switch /
-  zero_conditioning) derived from its I/O types instead of its name.
-
-- resolve_link(): follow a [node_id, slot] reference to a concrete value.
-  A value is only trusted if its producer is a PURE VALUE node, meaning all
-  of its own connected inputs are scalars (recursively). Output slots are
-  matched by their declared names (GetImageSize width/height, mxSlider2D X/Y,
-  JPS width/height from a "WxH" combo string). Runtime-measured values (an
-  IMAGE-fed producer) always yield UNRESOLVED rather than an unrelated
-  upstream literal.
-"""
 from __future__ import annotations
 
 import json
@@ -29,35 +6,24 @@ import os
 import re
 from typing import Any
 
-# Scalar type names. A node with a CONNECTED input of any OTHER kind computes
-# its output at run time, so that value is not stored in the file.
 _SCALAR_TYPE_NAMES = {"INT", "FLOAT", "STRING", "BOOLEAN", "NUMBER", "COMBO"}
 
+# Matches the size inside a resolution preset widget's text.
 _DIM_STRING_RE = re.compile(r"(\d{2,5})\s*[x×]\s*(\d{2,5})")
 
-# Sentinel: the chain crossed a node we have no signature for, so the caller
-# should fall back to the legacy resolver (which handles unknown packs).
+# The node class is absent from the registry, so nothing can be said about it.
 UNKNOWN = object()
 
-# A link that provably carries NOTHING at run time: a context field with no
-# override and no base to inherit from, or a reference to a node absent from
-# the executed prompt. Distinct from UNRESOLVED, where a value flowed through
-# the link but the file just does not store it. The split matters at
-# switches: a NO_VALUE branch is skipped in favour of later ones, while an
-# UNRESOLVED branch may have been the one that actually ran.
+# The links were followed to their end and no value was set anywhere along them.
 NO_VALUE = object()
-# Sentinel: provably unresolvable from the file (runtime-measured / ambiguous).
+# A value the prompt cannot pin down, as when the producer computes it at run
+# time or two branches give different answers.
 UNRESOLVED = object()
 
-
 class NodeRegistry:
-    """Signature lookup per class_type. sig() returns a dict:
-    {category, output_names, output_types, output_node, inputs: {name: kind}}
-    where kind is the raw type string ("INT", "IMAGE", …) or "COMBO" for
-    enum widgets; or None for unknown classes."""
 
     def __init__(self, table: dict[str, dict] | None = None):
-        self._table = table  # snapshot mode when not None
+        self._table = table
         self._cache: dict[str, dict | None] = {}
 
     @staticmethod
@@ -66,6 +32,8 @@ class NodeRegistry:
             raw = json.load(f)
         table = {}
         for ct, info in raw.items():
+            # In an /object_info reply a dropdown input or output carries the
+            # list of its choices where a type name would otherwise be.
             inputs = {}
             for src in ("input_required", "input_optional"):
                 for k, t in (info.get(src) or {}).items():
@@ -90,18 +58,16 @@ class NodeRegistry:
             out = self._table.get(class_type)
         else:
             out = self._live_sig(class_type)
-        # Only memoize HITS. Caching a miss would pin a class as "unknown" for
-        # the whole process, so a node pack installed mid-session (live mode
-        # hot-reloads NODE_CLASS_MAPPINGS) would never be picked up. Re-resolving
-        # an unknown class is just a cheap dict miss with no INPUT_TYPES() call.
         if out is not None:
+            # A cached miss would pin a class as unknown for the life of the
+            # process, so a pack loaded later would never be seen.
             self._cache[class_type] = out
         return out
 
     @staticmethod
     def _live_sig(class_type: str) -> dict | None:
         try:
-            import nodes as comfy_nodes  # ComfyUI's module; we run in-process
+            import nodes as comfy_nodes
             cls = comfy_nodes.NODE_CLASS_MAPPINGS.get(class_type)
             if cls is None:
                 return None
@@ -124,57 +90,47 @@ class NodeRegistry:
         except Exception:
             return None
 
-
 _live_registry: NodeRegistry | None = None
 
-
 def get_registry() -> NodeRegistry:
-    """The process-wide registry: live inside ComfyUI, otherwise a snapshot
-    (named by the SBG_OBJECT_INFO_SNAPSHOT env var, with a local fixture
-    fallback)."""
+    # A snapshot named in the environment wins over the live node table, which
+    # is what lets the parser run outside a ComfyUI process.
     global _live_registry
     if _live_registry is not None:
         return _live_registry
     snap = os.environ.get("SBG_OBJECT_INFO_SNAPSHOT")
     if not snap:
         try:
-            import nodes  # noqa: F401 (running inside ComfyUI)
+            # Imported for the exception alone, to settle whether ComfyUI is
+            # in the process.
+            import nodes
             _live_registry = NodeRegistry(None)
             return _live_registry
         except Exception:
             cand = os.path.join(os.path.dirname(os.path.dirname(os.path.abspath(__file__))),
-                                "tests", "fixtures", "object_info_snapshot.json")
+                                "object_info_snapshot.json")
             snap = cand if os.path.isfile(cand) else None
     if snap and os.path.isfile(snap):
         _live_registry = NodeRegistry.from_snapshot(snap)
     else:
-        _live_registry = NodeRegistry({})  # nothing known: callers use legacy paths
+        _live_registry = NodeRegistry({})
     return _live_registry
-
 
 def _is_scalar_kind(kind: str) -> bool:
     return kind in _SCALAR_TYPE_NAMES
 
-
-# Structural classification
-
 _SAMPLER_PARAM_NAMES = {"steps", "cfg", "seed", "noise_seed", "denoise", "sampler_name"}
 
-# Name-only sampler test for UNKNOWN (uninstalled-pack) classes. This is the
-# single source of truth shared by find_generation_resolution and metadata.py's
-# extractor so the two can't drift. Excludes selectors, parameter packers and
-# audio/LLM "samplers" that aren't diffusion samplers.
+# Names that carry the word sampler while not being the sampler that made the
+# image: a picker, a carrier of settings, and audio or language model nodes.
 _NOT_A_SAMPLER_NAME = ("select", "mmaudio", "parameter", "packer",
                        "llava", "llama", "llm", "vlm")
-
 
 def name_says_sampler(class_type: str) -> bool:
     ct = str(class_type).lower()
     return "sampler" in ct and not any(x in ct for x in _NOT_A_SAMPLER_NAME)
 
-
 def classify(class_type: str, sig: dict | None) -> str | None:
-    """Structural role, or None when the class is unknown (legacy fallback)."""
     if not sig:
         return None
     inputs: dict[str, str] = sig["inputs"]
@@ -182,20 +138,14 @@ def classify(class_type: str, sig: dict | None) -> str | None:
     in_types = set(inputs.values())
     ctl = class_type.lower()
 
-    # rgthree Context / Context Big (and similar pipe bundles) carry a CONTEXT
-    # object on output slot 0 and expose seed/steps/cfg as PASSTHROUGH fields.
-    # They are carriers rather than samplers, and must be classified as such
-    # BEFORE the sampler test, which would otherwise fire on their LATENT output
-    # + seed/steps/cfg inputs and yield a phantom sampler. resolve_link already treats CONTEXT
-    # slots as passthrough; this keeps classify() consistent with it.
+    # A node whose first output is named CONTEXT carries a bundle of named
+    # fields instead of one value.
     out_names = sig["output_names"] or []
     if out_names and str(out_names[0]).upper() == "CONTEXT":
         return "context"
 
     if "zeroout" in ctl and "CONDITIONING" in out_types:
         return "zero_conditioning"
-    # Samplers: produce a LATENT and take denoising parameters, or are the
-    # custom-sampling executor (NOISE/GUIDER/SIGMAS plumbing).
     if "LATENT" in out_types:
         if _SAMPLER_PARAM_NAMES & set(inputs):
             return "sampler"
@@ -203,8 +153,6 @@ def classify(class_type: str, sig: dict | None) -> str | None:
             return "sampler"
     if "CONDITIONING" in out_types and "CLIP" in in_types:
         return "text_encode"
-    # Image-space resize/upscale: IMAGE in and out, with a size-ish parameter
-    # or an upscaling category/model input.
     if "IMAGE" in out_types and "IMAGE" in in_types:
         if {"source_fps", "target_fps", "multiplier"} & set(inputs):
             return "interpolation"
@@ -218,14 +166,11 @@ def classify(class_type: str, sig: dict | None) -> str | None:
     if "LATENT" in out_types and "LATENT" in in_types and (
             {"upscale_method", "scale_by", "width", "height"} & set(inputs)):
         return "latent_resize"
-    # Loaders: no tensor inputs, produce model-ish objects.
     tensorish_in = {t for t in in_types if not _is_scalar_kind(t) and t != "*"}
     if not tensorish_in and ({"MODEL", "CLIP", "VAE", "UPSCALE_MODEL", "CONTROL_NET"} & out_types):
         return "loader"
-    # A LoRA loader must have an input that SELECTS a LoRA (lora_name, lora,
-    # or numbered lora_1/lora_01 slots). lora_strength / lora_stack / lora_list
-    # alone must not qualify: IPAdapter FaceID loaders and stack appliers
-    # carry those without being LoRA loaders themselves.
+    # Only an input that names a LoRA counts, since a node carrying no more than
+    # a lora_strength or lora_stack input loads none of its own.
     if "MODEL" in out_types and "MODEL" in in_types and any(
             k in ("lora_name", "lora") or (k.startswith("lora_") and k[5:].isdigit())
             for k in inputs):
@@ -237,44 +182,30 @@ def classify(class_type: str, sig: dict | None) -> str | None:
         return "switch"
     return "other"
 
-
-# Pure-value link resolution
-
-# Crystools pipe nodes bundle arbitrary values: "Pipe to/edit any" packs
-# any_1..any_N into a CPipeAny, and "Pipe from any" unpacks it, with output
-# slot 0 the pipe itself and slot k carrying any_k. A ref into a pipe slot is
-# demuxed to the bundled source ref before resolution, so every walk built
-# on resolve_link sees through pipes identically.
+# A pipe node is recognised by these words inside its lowercased class name. It
+# names the pipe it continues CPipeAny and the values it carries any_1 upwards,
+# and its output slot 0 is the pipe itself while slot k carries any_k.
 PIPE_FROM_PATTERN = "pipe from any"
 PIPE_TO_PATTERN = "pipe to/edit any"
 
-
-# A pipe slot proven to carry nothing: the packer chain ends without ever
-# packing it, the unpacker has no bundle, or the bundle's source was pruned
-# from the executed prompt. Distinct from an inconclusive walk (unknown
-# carrier class, a cycle, the hop cap), which stays fail-open.
+# Separates a chain that ended with the slot never filled from a reference that
+# was never part of a pipe.
 SLOT_EMPTY = object()
 
-
 def pipe_slot_source(prompt: dict, pipe_ref: Any, slot: int, max_hops: int = 12) -> Any:
-    """Walk a CPipeAny chain upstream to the nearest to/edit pipe that
-    connects any_<slot>, and return that bundled ref. Edit pipes override
-    slots selectively, so the walk continues through CPipeAny while the slot
-    is absent. Returns SLOT_EMPTY when the chain provably never packs the
-    slot, and None when the walk is inconclusive."""
     key = f"any_{slot}"
     ref = pipe_ref
     seen: set[str] = set()
     for _ in range(max_hops):
         if not (isinstance(ref, list) and len(ref) >= 1):
-            return SLOT_EMPTY  # chain ended without packing the slot
+            return SLOT_EMPTY
         nid = str(ref[0])
         if nid in seen:
             return None
         seen.add(nid)
         node = prompt.get(nid)
         if not isinstance(node, dict):
-            return SLOT_EMPTY  # bundle source pruned from the executed prompt
+            return SLOT_EMPTY
         inputs = node.get("inputs")
         if not isinstance(inputs, dict):
             return SLOT_EMPTY
@@ -287,16 +218,10 @@ def pipe_slot_source(prompt: dict, pipe_ref: Any, slot: int, max_hops: int = 12)
         elif PIPE_FROM_PATTERN in ct_l:
             ref = inputs.get("CPipeAny")
         else:
-            return None  # bundle from a class this walk cannot see through
+            return None
     return None
 
-
 def demux_pipe_ref(prompt: dict, ref: Any, max_hops: int = 8) -> Any:
-    """Resolve a ref pointing into a "Pipe from any" output slot to the
-    bundled source ref, repeating while the result is itself a pipe slot.
-    Returns NO_VALUE for a slot the chain provably never packs. Refs that do
-    not point into a pipe unpacker, and inconclusive walks, come back
-    unchanged so callers stay fail-open."""
     for _ in range(max_hops):
         if not (isinstance(ref, list) and len(ref) >= 2):
             return ref
@@ -322,34 +247,25 @@ def demux_pipe_ref(prompt: dict, ref: Any, max_hops: int = 8) -> Any:
         ref = got
     return ref
 
-
 def _resolve_context_field(prompt: dict, node_id: str, field_name: str,
                            registry: NodeRegistry, depth: int, visited: set):
-    """Resolve a named field out of an rgthree Context bundle.
-
-    The field is set on this Context node directly (an override input) or
-    inherited from the base context it extends (follow base_ctx upward).
-    Returns the scalar value, NO_VALUE when the field is provably unset (no
-    override and no base to inherit from), or UNRESOLVED when unprovable.
+    """A context node sets a field from its own input of the same name and
+    inherits every field it does not set from the context it was built on.
     """
     if depth > 12:
         return UNRESOLVED
     node = prompt.get(str(node_id))
     if not isinstance(node, dict):
-        return NO_VALUE  # the carrier is absent from the executed prompt
+        return NO_VALUE
     inputs = node.get("inputs", {})
     if not isinstance(inputs, dict):
         return NO_VALUE
     fl = field_name.lower()
-    # Direct override on this context node.
     if fl in inputs:
         v = inputs[fl]
         if isinstance(v, list):
             return resolve_link(prompt, v, registry, depth + 1, visited)
         return v
-    # Otherwise inherit from the base context. If the base is produced by a
-    # class the registry doesn't know, return UNKNOWN rather than UNRESOLVED so
-    # the caller falls back to the legacy resolver instead of silently giving up.
     for bk in ("base_ctx", "ctx", "context"):
         bv = inputs.get(bk)
         if isinstance(bv, list) and len(bv) >= 1:
@@ -357,9 +273,6 @@ def _resolve_context_field(prompt: dict, node_id: str, field_name: str,
             if isinstance(base_node, dict) and registry.sig(base_node.get("class_type", "")) is None:
                 return UNKNOWN
             return _resolve_context_field(prompt, bv[0], field_name, registry, depth + 1, visited)
-    # Context Switch and Context Merge carry candidate bundles on dynamic
-    # ctx_NN inputs instead of a single base, and each kind decides its
-    # winner differently at run time, so the field resolves per kind below.
     cands = [v for k, v in inputs.items()
              if k.lower().startswith("ctx") and isinstance(v, list) and len(v) >= 1]
     if cands:
@@ -374,39 +287,29 @@ def _resolve_context_field(prompt: dict, node_id: str, field_name: str,
             return UNKNOWN
         ct_kind = str(node.get("class_type", "")).lower()
         if "merge" in ct_kind:
-            # A merge lets later bundles override earlier ones per field, so
-            # the last candidate carrying the field wins outright.
+            # A merge lays its later context over the earlier one, so the last
+            # branch that holds the field wins.
             for r in reversed(results):
                 if r is not NO_VALUE:
                     return r
             return NO_VALUE
         if "switch" in ct_kind:
-            # A switch forwards its first non-empty BUNDLE, emitting its
-            # field even when unset. A candidate whose field resolves proves
-            # its bundle non-empty and wins; one preceded by a field-empty
-            # candidate is unknowable, since that earlier bundle may carry
-            # other fields.
+            # Which branch a switch selected is not known here, so only a value
+            # on the first branch can be reported.
             for i, r in enumerate(results):
                 if r is not NO_VALUE:
                     if any(x is NO_VALUE for x in results[:i]):
                         return UNRESOLVED
                     return r
             return NO_VALUE
-        # A carrier matching neither kind: settle only when every carrying
-        # candidate agrees on one value.
         vals = [r for r in results if r is not NO_VALUE]
         if not vals:
-            return NO_VALUE  # no candidate ever packs the field
+            return NO_VALUE
         if any(r is UNRESOLVED for r in vals):
             return UNRESOLVED
         if all(v == vals[0] for v in vals[1:]):
             return vals[0]
-        return UNRESOLVED  # the candidates disagree, so the winner is unknowable
-    # A node that is not itself a context carrier can still relay the
-    # bundle: a switch forwards its taken input, a passthrough its only
-    # connection. NO_VALUE below is reserved for genuine carriers only, since
-    # on any other class it would misread "unknown node" as proven emptiness
-    # and make an enclosing switch skip the taken branch.
+        return UNRESOLVED
     ct = str(node.get("class_type", ""))
     sig = registry.sig(ct)
     out_names = (sig or {}).get("output_names") or []
@@ -424,9 +327,7 @@ def _resolve_context_field(prompt: dict, node_id: str, field_name: str,
                 return UNKNOWN
             return _resolve_context_field(prompt, follow[0], field_name, registry, depth + 1, visited)
         return UNRESOLVED
-    # No override and no base context connected: the field is None at run time.
     return NO_VALUE
-
 
 def _node_of(prompt: dict, ref: Any) -> tuple[dict | None, str, int]:
     if not (isinstance(ref, list) and len(ref) >= 1):
@@ -436,13 +337,7 @@ def _node_of(prompt: dict, ref: Any) -> tuple[dict | None, str, int]:
     node = prompt.get(nid)
     return (node if isinstance(node, dict) else None), nid, slot
 
-
 def _selector_switch_parts(sig: dict | None):
-    """(selector_input, [branch_inputs]) when the signature shapes a
-    selector-driven switch: a single output, exactly one BOOLEAN or INT
-    input (the selector), and at least two branch inputs carrying the
-    output's type. Returns None for every other shape, including the
-    selector-less any-switches that pick by liveness."""
     if not sig or len(sig.get("output_types") or []) != 1:
         return None
     out_t = sig["output_types"][0]
@@ -453,21 +348,9 @@ def _selector_switch_parts(sig: dict | None):
         return None
     return sels[0], branches
 
-
 def _selector_switch_choice(prompt: dict, node: dict, sig: dict | None,
                             registry: NodeRegistry, _depth: int = 0,
                             _visited: set | None = None):
-    """Decide a selector-driven switch's taken branch from the graph.
-
-    Resolves the selector and maps it to the branch it names: boolean to the
-    true/false branch, integer to the branch whose numeric suffix matches.
-    Gated to switch-named classes so a node merely combining a flag with two
-    same-typed inputs (a blend) is never treated as routing.
-
-    Returns None when not a decidable selector switch (caller keeps its
-    existing behavior). Otherwise a pair: ("ref", link) for a connected
-    branch, ("value", literal) for a widget branch, or ("sentinel",
-    UNRESOLVED | UNKNOWN | NO_VALUE) when undecidable or provably empty."""
     ct_l = str(node.get("class_type", "")).lower()
     if "switch" not in ct_l and "ifelse" not in ct_l and "if_else" not in ct_l:
         return None
@@ -476,9 +359,6 @@ def _selector_switch_choice(prompt: dict, node: dict, sig: dict | None,
         return None
     parts = _selector_switch_parts(sig)
     if parts is None:
-        # parts is None both for known shapes the gate rejects (a trailing
-        # help/debug output, an extra mode flag) and for unsignatured
-        # classes; the numeric-suffix select widget still applies either way.
         sel = inputs.get("select")
         if isinstance(sel, (int, float)) and not isinstance(sel, bool):
             numbered = False
@@ -491,25 +371,18 @@ def _selector_switch_choice(prompt: dict, node: dict, sig: dict | None,
                     if isinstance(v, list) and len(v) >= 1:
                         return ("ref", v)
                     if v is None:
-                        return ("sentinel", NO_VALUE)  # chosen slot unconnected
+                        return ("sentinel", NO_VALUE)
                     return ("value", v)
             if numbered:
-                # Numbered branches exist but none carries the selected
-                # number: the taken branch is unknowable from here.
                 return ("sentinel", UNRESOLVED)
         return None
     sel_name, branch_names = parts
     sv = inputs.get(sel_name)
     if isinstance(sv, list):
-        # The selector walks with its own copy of the visited set so its
-        # path never makes the chosen branch's walk trip the cycle guard.
         sv = resolve_link(prompt, sv, registry, _depth + 1, set(_visited or ()))
         if sv is UNKNOWN:
             return ("sentinel", UNKNOWN)
         if sv is UNRESOLVED or sv is NO_VALUE:
-            # The selection itself is not stored in the file (or the selector
-            # link provably carries nothing); guessing a branch would report
-            # a value the run may never have used.
             return ("sentinel", UNRESOLVED)
     if isinstance(sv, bool):
         token = "true" if sv else "false"
@@ -523,35 +396,26 @@ def _selector_switch_choice(prompt: dict, node: dict, sig: dict | None,
     else:
         return None
     if len(want) != 1:
-        return None  # names do not disambiguate this selector value
+        return None
     bv = inputs.get(want[0])
     if isinstance(bv, list):
         return ("ref", bv)
     if bv is None:
-        return ("sentinel", NO_VALUE)  # chosen branch unconnected: nothing flows
+        return ("sentinel", NO_VALUE)
     return ("value", bv)
-
 
 def resolve_link(prompt: dict, ref: Any, registry: NodeRegistry,
                  _depth: int = 0, _visited: set | None = None):
-    """Resolve [node_id, slot] to a scalar value, NO_VALUE, UNRESOLVED, or
-    UNKNOWN.
-
-    UNKNOWN means the chain crossed a class the registry doesn't know, and
-    the caller should use the legacy resolver for this link. NO_VALUE means
-    the link provably carries nothing at run time (see the sentinel's note);
-    callers treating the result as a scalar handle it like UNRESOLVED.
-    """
     if _depth > 10:
         return UNRESOLVED
     ref = demux_pipe_ref(prompt, ref)
     if ref is NO_VALUE:
-        return NO_VALUE  # a pipe slot the chain provably never packs
+        return NO_VALUE
     node, nid, slot = _node_of(prompt, ref)
     if node is None:
-        # Node absent from the executed prompt: pruned before execution, so it produced nothing.
         return NO_VALUE
     _visited = _visited or set()
+    # Keyed by slot as well, since two outputs of one node resolve separately.
     vkey = f"{nid}:{slot}"
     if vkey in _visited:
         return UNRESOLVED
@@ -568,79 +432,60 @@ def resolve_link(prompt: dict, ref: Any, registry: NodeRegistry,
     out_names_all = sig["output_names"] or []
     out_name = str(out_names_all[slot]) if slot < len(out_names_all) else ""
 
-    # Context bundles (rgthree Context / Context Big) are passthrough carriers
-    # with no runtime computation. Output slot N carries a named field (SEED,
-    # STEPS, STEP_REFINER, CFG…); resolve that field through this node's own
-    # input or, if absent, the base context it extends. Must run BEFORE the
-    # purity gate (the base_ctx input is a non-scalar bundle type).
+    # A context read and a decided switch both run before the tensor check below,
+    # since the inputs they follow are non-scalar by design.
     if (out_names_all and str(out_names_all[0]).upper() == "CONTEXT"
             and slot > 0 and out_name):
         return _resolve_context_field(prompt, nid, out_name, registry, _depth + 1, _visited)
 
-    # Selector-driven switches (an if/else or index switch): the selector
-    # value designates the taken branch outright, so only it gets resolved.
-    # Must run BEFORE the purity gate, since branch inputs carry non-scalar
-    # types by design.
     choice = _selector_switch_choice(prompt, node, sig, registry, _depth, _visited)
     if choice is not None:
         ckind, cval = choice
         if ckind == "ref":
             return resolve_link(prompt, cval, registry, _depth + 1, _visited)
-        return cval  # a widget literal on the chosen branch, or a sentinel
+        return cval
 
-    # Purity: every CONNECTED input must be scalar-typed (or itself pure).
-    # An IMAGE/LATENT/... input means the output is computed at runtime.
+    # A node fed a tensor produces its output at run time, so no widget value on
+    # it can stand for what it sent. A wildcard input says nothing about what it
+    # carries and is left out of the check.
     tensor_connected = any(
         isinstance(v, list) and not _is_scalar_kind(in_kinds.get(k, "*")) and in_kinds.get(k, "*") != "*"
         for k, v in inputs.items()
     )
     if tensor_connected:
-        return UNRESOLVED  # runtime-measured (GetImageSize and friends)
+        return UNRESOLVED
 
     role = classify(ct, sig)
 
-    # Switches (rgthree Any Switch and friends): at run time the FIRST input
-    # that carries a value wins; literal widget fallbacks are ignored. Skip
-    # NO_VALUE branches and settle on the first live one, even if that leaves
-    # the switch UNRESOLVED, rather than checking a later branch the run
-    # never took. An unknown-class branch defers to the legacy resolver
-    # unless a later live branch settles the value first.
     if role == "switch":
         saw_unknown = saw_connected = False
         for k, v in inputs.items():
             if isinstance(v, list):
                 saw_connected = True
-                # Each branch walks with its own copy of the visited set:
-                # sibling branches converging on one upstream slot would
-                # otherwise trip the cycle guard and read as live.
+                # Each branch walks with its own copy of the visited set, since
+                # two branches meeting one upstream slot would read as a cycle.
                 r = resolve_link(prompt, v, registry, _depth + 1, set(_visited))
                 if r is NO_VALUE:
-                    continue  # provably empty branch: the switch skips it
+                    continue
                 if r is UNKNOWN:
                     saw_unknown = True
                     continue
                 if r is not UNRESOLVED and r is not None:
                     return r
-                # Live branch's value isn't in the file. An earlier
-                # unknown-pack branch may still be the taken one, so deferring
-                # to the legacy resolver beats a blank answer.
                 return UNKNOWN if saw_unknown else UNRESOLVED
         if saw_unknown:
-            return UNKNOWN  # a branch crossed an unknown pack, so let legacy resolve
-        # Every connected branch was provably empty, so the switch emits
-        # nothing, but a lone literal widget still counts as its fallback
-        # value. Exclude bools: a fallback carries a value rather than a
-        # control flag, and a stray bool here would be wrong for a numeric
-        # param.
+            return UNKNOWN
         lits = [v for v in inputs.values()
                 if isinstance(v, (int, float, str)) and not isinstance(v, bool)]
         if len(lits) == 1:
             return lits[0]
         return NO_VALUE if saw_connected else UNRESOLVED
 
-    # Math-expression nodes: their computed result IS the value.
-    from . import metadata as _md  # late import to avoid a cycle
+    # Imported here because metadata imports this module at load time.
+    from . import metadata as _md
     if _md._is_math_node(ct):
+        # A math node's output is computed from its own inputs, so evaluating it
+        # gives the value and the walk stops there.
         res = _md._eval_math_node(prompt, node)
         return res if res is not None else UNRESOLVED
 
@@ -650,11 +495,6 @@ def resolve_link(prompt: dict, ref: Any, registry: NodeRegistry,
             return resolve_link(prompt, v, registry, _depth + 1, _visited)
         return v
 
-    # 1) input named like the output slot (GetImageSize-style): exact match
-    # first, else case-insensitive. The named input is authoritative for this
-    # slot, so return its value or propagate the UNRESOLVED/UNKNOWN sentinel
-    # (both are real answers; falling through to a later strategy would risk
-    # returning an unrelated input's value).
     lower_map = {k.lower(): k for k in inputs}
     match_key = None
     if out_name:
@@ -663,19 +503,21 @@ def resolve_link(prompt: dict, ref: Any, registry: NodeRegistry,
         elif out_name.lower() in lower_map:
             match_key = lower_map[out_name.lower()]
     if match_key is not None:
+        # An input named like the output is the answer, so even a sentinel from
+        # it is returned instead of falling through to a looser match.
         v = _value_of(match_key)
         if v is not None:
             return v
 
-    # 2) prefixed inputs (mxSlider2D: output "X" is fed by inputs Xi/Xf + isfloatX).
-    # Require the match to be the output name plus a SHORT suffix (≤2 chars, the
-    # i/f of Xi/Xf) so an unrelated input that merely shares a leading letter
-    # (e.g. "weight" for output "W") can't masquerade as the value.
     if out_name:
+        # Capped at the output name plus two characters, or an input sharing
+        # only a first letter could pose as the value.
         pref = [k for k in inputs if k.lower().startswith(out_name.lower())
                 and not k.lower().startswith("isfloat")
                 and len(k) - len(out_name) <= 2]
         if pref:
+            # A node offering both an integer and a float widget for one output
+            # names the choice isfloat<output> and suffixes each widget i or f.
             flag = inputs.get(f"isfloat{out_name}")
             chosen = None
             if flag is not None and len(pref) > 1:
@@ -690,7 +532,6 @@ def resolve_link(prompt: dict, ref: Any, registry: NodeRegistry,
             if v not in (None, UNRESOLVED, UNKNOWN, NO_VALUE):
                 return v
 
-    # 3) "WxH" combo string for width/height-named outputs (JPS, CR Aspect…).
     if out_name.lower() in ("width", "height", "w", "h"):
         for v in inputs.values():
             if isinstance(v, str):
@@ -698,10 +539,8 @@ def resolve_link(prompt: dict, ref: Any, registry: NodeRegistry,
                 if m:
                     return int(m.group(1 if out_name.lower() in ("width", "w") else 2))
 
-    # 4) a lone scalar widget is taken as the value (Primitive*, sliders, Seed…).
     scalars = [(k, v) for k, v in inputs.items()
                if isinstance(v, (int, float, str, bool)) and not isinstance(v, dict)]
-    # Ignore obvious control widgets that never carry the value.
     scalars = [(k, v) for k, v in scalars
                if k.lower() not in ("control_after_generate", "autorefresh", "is_changed")]
     if len(scalars) == 1:
@@ -712,29 +551,21 @@ def resolve_link(prompt: dict, ref: Any, registry: NodeRegistry,
                 return int(m.group(1 if out_name.lower() in ("width", "w") else 2))
         return v
 
-    # 5) single connected scalar link.
     links = [v for k, v in inputs.items() if isinstance(v, list)]
     if len(links) == 1 and not scalars:
         return resolve_link(prompt, links[0], registry, _depth + 1, _visited)
 
     return UNRESOLVED
 
-
 def live_switch_branch(prompt: dict, node: Any, registry: NodeRegistry):
-    """The switch input link the run actually forwarded, or None.
-
-    Any branch except one that provably carries nothing (NO_VALUE) counts as
-    live; the first live branch wins. Falls back to the first connected
-    input when every branch is empty, keeping callers fail-open. Single
-    source of truth for switch branch selection, so other walks cannot drift
-    from resolve_link's behaviour."""
+    # Every walk that meets a switch settles it here, so two walks over one
+    # prompt cannot pick different branches.
     if not isinstance(node, dict) or not isinstance(node.get("inputs"), dict):
         return None
     sig = registry.sig(str(node.get("class_type", "")))
     choice = _selector_switch_choice(prompt, node, sig, registry)
     if choice is not None:
         ckind, cval = choice
-        # A widget-literal branch, or an undecidable selector, leaves nothing to follow.
         return cval if ckind == "ref" else None
     first = None
     for v in node["inputs"].values():
@@ -744,10 +575,6 @@ def live_switch_branch(prompt: dict, node: Any, registry: NodeRegistry):
             if resolve_link(prompt, v, registry) is not NO_VALUE:
                 return v
     return first
-
-
-# Pipeline model: generation resolution from the active sampler chain
-
 
 def _build_consumers(prompt: dict) -> dict[str, list[str]]:
     out: dict[str, list[str]] = {}
@@ -759,50 +586,32 @@ def _build_consumers(prompt: dict) -> dict[str, list[str]]:
                 out.setdefault(str(v[0]), []).append(str(nid))
     return out
 
-
 def _is_output_like(class_type: str, sig: dict | None) -> bool:
-    """Output/save/display node? Uses ComfyUI's OUTPUT_NODE flag when the class
-    is known; for unknown classes a tight name match that excludes parameter
-    packers / selectors / loaders (which can carry a saver-suite tag in their
-    name, e.g. 'Sampler Parameters (ImageSaver)')."""
     if sig is not None:
         return bool(sig["output_node"])
+    # With no signature the class name is the only evidence.
     return bool(re.search(r"save|videocombine|preview", class_type, re.I)
                 and not re.search(r"parameter|packer|unpacker|selector|loader|"
                                   r"generator|bridge|reroute|switch",
                                   class_type, re.I))
 
-
+# A text display node writes no file, and whatever feeds it is live all the same.
 def _is_display_node(class_type: str) -> bool:
-    """Terminal show/display node (ShowText/DisplayAny/…) the user placed to view
-    a value. dead_node_ids keeps it (and its upstream) alive so its shown text is
-    captured. It is still NOT a save output, so find_generation_resolution must not
-    treat a sampler that only feeds a display as 'active' (which would change or
-    null the reported generation resolution)."""
     return bool(re.search(r"showtext|showany|showstring|displaytext|displayany|showlabel",
                           class_type, re.I))
 
-
 def _reaches_output_node(prompt: dict, nid: str, consumers: dict[str, list[str]],
                          registry: NodeRegistry) -> tuple[bool, bool]:
-    """(reaches_output, via_ambiguous_switch): does this node's output flow
-    into a save node, and does the path cross a runtime switch that also has
-    OTHER connected branches (so which branch produced the saved pixels is
-    not knowable from the file)?
-
-    The `seen` set alone bounds the walk; there is deliberately NO depth cap,
-    because one would falsely report a node many hops upstream of the save node
-    as not reaching it, silently dropping its metadata on deep (video/upscale)
-    graphs.
-    """
+    """Whether this node's output reaches an output node, and whether it got
+    there through a switch that could route around it."""
     queue = [(nid, False)]
-    seen: set[str] = set()
+    seen: set[tuple[str, bool]] = set()
     found = ambiguous = False
     while queue:
         cur, amb = queue.pop(0)
-        if cur in seen:
+        if (cur, amb) in seen:
             continue
-        seen.add(cur)
+        seen.add((cur, amb))
         node = prompt.get(cur)
         node_amb = amb
         if isinstance(node, dict):
@@ -822,11 +631,7 @@ def _reaches_output_node(prompt: dict, nid: str, consumers: dict[str, list[str]]
             queue.append((nxt, node_amb))
     return found, ambiguous
 
-
 def _originates_from(prompt: dict, ref: Any, target_id: str) -> bool:
-    # The `seen` set bounds the upstream walk; no depth cap (a cap could falsely
-    # report a branch as NOT originating from the start node, over-flagging a
-    # switch as ambiguous on deep graphs).
     queue = [ref]
     seen: set[str] = set()
     while queue:
@@ -846,18 +651,9 @@ def _originates_from(prompt: dict, ref: Any, target_id: str) -> bool:
                     queue.append(v)
     return False
 
-
 def _aspect_combo_size_node(node: Any) -> tuple[int, int] | None:
-    """Dimensions stated by a size-selector node's own widgets.
-
-    Two dialects. A combo spells the size out as text
-    ("832 x 1216 (portrait)"), so the text is parsed, honouring a
-    swap_dimensions widget. A FluxResolutionNode style selector states a
-    megapixel area, an "A:B" ratio, and a rounding unit; each side is the
-    square root of the area times its ratio share, rounded to the unit, which
-    reproduces the node's own arithmetic. Both compute at runtime, so the
-    link stays UNRESOLVED under pure-value rules even though the choice is
-    written in the file."""
+    """Read the size a selector node states in its own widgets, either as a
+    WxH string or as megapixels with a ratio."""
     if not isinstance(node, dict):
         return None
     ct = str(node.get("class_type", "")).lower().replace(" ", "").replace("_", "")
@@ -885,6 +681,8 @@ def _aspect_combo_size_node(node: Any) -> tuple[int, int] | None:
                 pass
             break
     ratio = None
+    # Such a node carries a preset ratio and a custom one at once, and the
+    # custom flag says which of the two is live.
     _custom = str(inputs.get("custom_ratio", "")).strip().lower() in ("true", "on", "yes")
     for k, v in inputs.items():
         if not isinstance(v, str) or "ratio" not in k.lower():
@@ -912,22 +710,12 @@ def _aspect_combo_size_node(node: Any) -> tuple[int, int] | None:
         return (w, h)
     return None
 
-
 def _aspect_combo_size(prompt: dict, ref: Any) -> tuple[int, int] | None:
     node, _nid, _slot = _node_of(prompt, ref)
     return _aspect_combo_size_node(node)
 
-
 def find_generation_resolution(prompt: dict, registry: NodeRegistry,
                                legacy_dim_fn=None) -> tuple[int, int] | None:
-    """The latent size entering the FIRST active sampler.
-
-    Walks each sampler's latent chain upstream to its source (EmptyLatent*-
-    style node or an image-to-video conditioner with width/height). Samplers
-    whose output never reaches a save node are editing leftovers and are
-    ignored. img2img sources (VAEEncode) and runtime-measured sizes yield
-    None rather than a guess.
-    """
     consumers = _build_consumers(prompt)
     sampler_ids: list[str] = []
     for nid, nd in prompt.items():
@@ -944,7 +732,6 @@ def find_generation_resolution(prompt: dict, registry: NodeRegistry,
         return None
 
     def latent_source(start_nid: str, depth: int = 0, seen: set | None = None):
-        """Follow the latent input chain up to the node that CREATES the latent."""
         seen = seen or set()
         if depth > 15 or start_nid in seen:
             return None
@@ -956,7 +743,6 @@ def find_generation_resolution(prompt: dict, registry: NodeRegistry,
         if not isinstance(inputs, dict):
             return None
         sig = registry.sig(node.get("class_type", ""))
-        # Candidate latent-carrying inputs (typed LATENT when known, else by name).
         for k, v in inputs.items():
             if not isinstance(v, list):
                 continue
@@ -979,29 +765,30 @@ def find_generation_resolution(prompt: dict, registry: NodeRegistry,
                 if s_role == "sampler" or has_latent_in:
                     return latent_source(src_id, depth + 1, seen)
                 if takes_pixels and not ("width" in s_inputs or "height" in s_inputs):
-                    return "img2img"  # VAEEncode: the size is not in the file
+                    # A latent encoded from an image takes its size from that
+                    # image, so this sampler carries no generation size.
+                    return "img2img"
                 if "width" in s_inputs or "height" in s_inputs:
-                    return src_node  # EmptyLatent* / WanImageToVideo-style creator
+                    return src_node
                 if _aspect_combo_size_node(src_node):
-                    # An aspect-ratio node emitting the empty latent itself:
-                    # the size lives in its combo text rather than in inputs.
                     return src_node
                 return None
         return None
 
-    # Prefer samplers that actually flow into an output node; among them, the
-    # one whose chain ends at a latent CREATOR (the first pass). When every
-    # path to the output crosses a multi-branch runtime switch, which branch
-    # produced the saved pixels is unknowable, so claim nothing.
     reach = {s: _reaches_output_node(prompt, s, consumers, registry) for s in sampler_ids}
     unambiguous = [s for s in sampler_ids if reach[s][0] and not reach[s][1]]
     active = [s for s in sampler_ids if reach[s][0]]
     if active and not unambiguous:
+        # Every sampler reaching an output does so through a switch that could
+        # route around it, so no size is reported at all.
         return None
+    # Only the samplers that reach an output unambiguously are tried, or every
+    # sampler when none reaches one, so a workflow with no recognised output
+    # node still reports a size.
     for sid in (unambiguous or active or sampler_ids):
         src = latent_source(sid)
         if src == "img2img":
-            continue  # this pass starts from a measured image, so try other samplers
+            continue
         if isinstance(src, dict):
             inputs = src.get("inputs", {})
             wl, hl = inputs.get("width"), inputs.get("height")
@@ -1016,8 +803,6 @@ def find_generation_resolution(prompt: dict, registry: NodeRegistry,
                 except (TypeError, ValueError):
                     return False
             if not (_dim_ok(wv) and _dim_ok(hv)):
-                # Runtime-computed size: an aspect-ratio combo upstream (or the
-                # creator itself) still states the chosen dimensions verbatim.
                 combo = _aspect_combo_size_node(src)
                 if not combo:
                     for lnk in (wl, hl):
@@ -1033,19 +818,14 @@ def find_generation_resolution(prompt: dict, registry: NodeRegistry,
                     return wi, hi
             except (TypeError, ValueError):
                 pass
-            continue  # creator found but size unresolvable here, so try other samplers
+            continue
     return None
 
-
+# These node kinds can deliver a value without the prompt recording a link for it.
 _BROADCAST_PATTERNS = ("anythingeverywhere", "useeverywhere", "everywhere",
                        "setnode", "getnode")
 
-
 def has_implicit_links(prompt: dict, registry: NodeRegistry) -> bool:
-    """True if the graph uses nodes that create connections NOT present as
-    explicit input links: rgthree 'Anything Everywhere'/'Use Everywhere'
-    broadcasts and Set/Get virtual wires. When present, explicit-link
-    reachability is incomplete, so dead-node detection must stand down."""
     for nd in prompt.values():
         if not isinstance(nd, dict):
             continue
@@ -1054,32 +834,17 @@ def has_implicit_links(prompt: dict, registry: NodeRegistry) -> bool:
             return True
     return False
 
-
 def dead_node_ids(prompt: dict, registry: NodeRegistry) -> set[str]:
-    """Node ids that take no part in producing the saved output: disconnected
-    editing leftovers that should not appear in the metadata panel.
-
-    Computed ONLY for graphs without implicit-link nodes, where reachability
-    through explicit input links is exact. With broadcasts/Set-Get present the
-    set is empty (conservative: a node that looks unconnected may be broadcast
-    upstream, so keep it). A node is kept when it (transitively) feeds an
-    output/save node OR is itself one (a ShowText/Preview the user placed).
-    """
     if has_implicit_links(prompt, registry):
+        # Walking the recorded links would report live nodes as dead.
         return set()
-    # Need at least one recognizable output/save node to anchor reachability;
-    # without one (atypical graphs, odd exports) liveness can't be judged, so
-    # keep everything rather than nuke the whole graph.
     output_ids = [str(nid) for nid, nd in prompt.items()
                   if isinstance(nd, dict)
                   and (_is_output_like(nd.get("class_type", ""), registry.sig(nd.get("class_type", "")))
                        or _is_display_node(nd.get("class_type", "")))]
     if not output_ids:
+        # With nothing to anchor reachability, nothing is called dead.
         return set()
-    # A node is LIVE if it (transitively) feeds an output. ONE reverse walk from
-    # the outputs to their producers marks every such node in O(N+E), and it
-    # carries no depth cap, which would drop live nodes far upstream of the save
-    # node. Everything left over is dead.
     live: set[str] = set()
     queue = list(output_ids)
     while queue:
@@ -1098,12 +863,13 @@ def dead_node_ids(prompt: dict, registry: NodeRegistry) -> set[str]:
     return {str(nid) for nid, nd in prompt.items()
             if isinstance(nd, dict) and str(nid) not in live}
 
-
 def resolve_dimension(prompt: dict, ref: Any, axis: int, registry: NodeRegistry,
                       legacy_fn=None):
-    """Resolve a width/height link to an int. axis: 0=width, 1=height.
-    Falls back to legacy_fn(ref, axis) when the chain crosses unknown nodes."""
+    """Resolve a size link to an int, where axis 0 reads the width and 1 the
+    height."""
     r = resolve_link(prompt, ref, registry)
+    # The caller's own reader is consulted only for a class the registry does not
+    # know, since any other answer here is already final.
     if r is UNKNOWN and legacy_fn is not None:
         return legacy_fn(ref, axis)
     if r in (UNRESOLVED, UNKNOWN, NO_VALUE) or isinstance(r, bool):

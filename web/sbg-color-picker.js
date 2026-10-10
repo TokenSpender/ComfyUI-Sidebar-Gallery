@@ -1,71 +1,61 @@
-/**
- * sbg-color-picker.js: Reusable HSL + opacity color picker component
- *
- * Provides createColorPicker() with an alpha channel, shared by Appearance
- * settings and the Layout Editor so colours behave identically. Colours
- * round-trip through sbg-core's canonical model (parseColor / formatColor,
- * always rgba), so translucent values edit cleanly.
- */
+import { h } from "./sbg-core.js";
+import { parseColor, formatRgba, rgbToHsl, hslToRgb, checkerBg, getSavedColors, saveSavedColors } from "./sbg-color.js";
+import { attachOverlayThumb } from "./sbg-overlay-thumb.js";
+import { CLOSE_ICON, PLUS_ICON, sizedIcon } from "./sbg-icons.js";
+import { showFailure } from "./sbg-toast.js";
 
-import {
-  h,
-  parseColor, formatColor, formatRgba, rgbToHsl, hslToRgb, checkerBg,
-  getSavedColors, saveSavedColors,
-} from "./sbg-core.js";
+// The saved colours live in this browser's own store, which refuses a write
+// only when site data is blocked or the store is full.
+const _STORE_REFUSED = "this browser is blocking site data or its storage is full";
 
-const withChecker = checkerBg;
+const SL_W = 232, SL_H = 150, HUE_H = 14;
 
-/**
- * @param {Object} options
- * @param {string} options.initialColor - Starting colour (hex or rgba)
- * @param {Function} options.onChange - Called with the canonical colour string on every change
- */
-export function createColorPicker(options) {
-  const {
-    initialColor = "#7c6aef",
-    onChange = () => {},
-    slWidth: SL_W = 232,
-    slHeight: SL_H = 150,
-    hueHeight: HUE_H = 14,
-    showPreview = true,
-    showSaved = true,
-    savedChipSize = 26,
-  } = options;
+// Saturation across and lightness down for one hue. The hue is painted at half
+// lightness and washed to white above the middle row and to black below it.
+// Each gradient starts half a pixel in so a pixel's centre takes the colour its
+// own position names.
+export function drawSquare(ctx, hue) {
+  const across = ctx.createLinearGradient(0.5, 0, SL_W + 0.5, 0);
+  across.addColorStop(0, `hsl(${hue}, 0%, 50%)`);
+  across.addColorStop(1, `hsl(${hue}, 100%, 50%)`);
+  ctx.fillStyle = across;
+  ctx.fillRect(0, 0, SL_W, SL_H);
+  const down = ctx.createLinearGradient(0, 0.5, 0, SL_H + 0.5);
+  down.addColorStop(0, "rgba(255, 255, 255, 1)");
+  down.addColorStop(0.5, "rgba(255, 255, 255, 0)");
+  down.addColorStop(0.5, "rgba(0, 0, 0, 0)");
+  down.addColorStop(1, "rgba(0, 0, 0, 1)");
+  ctx.fillStyle = down;
+  ctx.fillRect(0, 0, SL_W, SL_H);
+}
 
+function _dragOn(canvas, pick) {
+  canvas.addEventListener("pointerdown", (e) => { canvas.setPointerCapture(e.pointerId); pick(e); });
+  canvas.addEventListener("pointermove", (e) => { if (canvas.hasPointerCapture(e.pointerId)) pick(e); });
+}
+
+export function createColorPicker({ initialColor, onChange }) {
   let cH, cS, cL, cA;
-  { const pc = parseColor(initialColor) || parseColor("#7c6aef"); [cH, cS, cL] = rgbToHsl(pc.r, pc.g, pc.b); cA = pc.a; }
-  const curStr = () => { const [r, g, b] = hslToRgb(cH, cS, cL); return formatColor(r, g, b, cA); };
-  // curStr and curRgbaStr both emit rgba(), since formatColor stores every
-  // colour as rgba, so the displayed string always matches what gets committed.
-  const curRgbaStr = () => { const [r, g, b] = hslToRgb(cH, cS, cL); return formatRgba(r, g, b, cA); };
-  let currentColor = curStr();
+  const take = (pc) => { [cH, cS, cL] = rgbToHsl(pc.r, pc.g, pc.b); cA = pc.a; };
+  take(parseColor(initialColor) || parseColor("#f2ff59"));
+  const current = () => { const [r, g, b] = hslToRgb(cH, cS, cL); return formatRgba(r, g, b, cA); };
+  let currentColor = current();
 
-  // Two columns: controls on the left, saved colours to the right of the palette.
-  const panel = h("div", { class: "sbg-color-picker", style: "display:flex;gap:10px;align-items:flex-start;" });
-  const col = h("div", { class: "sbg-cp-main", style: "display:flex;flex-direction:column;" });
+  const panel = h("div", { class: "sbg-color-picker" });
+  const col = h("div", { class: "sbg-cp-main" });
   panel.appendChild(col);
 
-  // Saturation / Lightness canvas
-  const slCanvas = document.createElement("canvas");
-  slCanvas.width = SL_W; slCanvas.height = SL_H;
-  slCanvas.style.cssText = `width:${SL_W}px;height:${SL_H}px;border-radius:6px;cursor:crosshair;display:block;margin-bottom:8px;`;
+  const slCanvas = h("canvas", { class: "sbg-cp-square", width: SL_W, height: SL_H });
   const slCtx = slCanvas.getContext("2d");
-  const slCursor = h("div", { style: "position:absolute;width:12px;height:12px;border:2px solid #fff;border-radius:50%;box-shadow:0 0 3px rgba(0,0,0,0.5);pointer-events:none;transform:translate(-6px,-6px);" });
-  const slWrap = h("div", { style: "position:relative;display:inline-block;" });
-  slWrap.appendChild(slCanvas); slWrap.appendChild(slCursor);
-  col.appendChild(slWrap);
+  const slCursor = h("div", { class: "sbg-cp-sl-cursor" });
+  col.appendChild(h("div", { class: "sbg-cp-canvas-wrap" }, [slCanvas, slCursor]));
 
   function drawSL() {
-    for (let x = 0; x < SL_W; x++) {
-      for (let y = 0; y < SL_H; y++) {
-        slCtx.fillStyle = `hsl(${cH},${(x / SL_W) * 100}%,${100 - (y / SL_H) * 100}%)`;
-        slCtx.fillRect(x, y, 1, 1);
-      }
-    }
+    drawSquare(slCtx, cH);
     slCursor.style.left = (cS / 100 * SL_W) + "px";
     slCursor.style.top = ((100 - cL) / 100 * SL_H) + "px";
   }
-  function pickSL(e) {
+  _dragOn(slCanvas, (e) => {
     const rect = slCanvas.getBoundingClientRect();
     const x = Math.max(0, Math.min(SL_W - 1, e.clientX - rect.left));
     const y = Math.max(0, Math.min(SL_H - 1, e.clientY - rect.top));
@@ -73,139 +63,99 @@ export function createColorPicker(options) {
     cL = Math.round(100 - (y / SL_H) * 100);
     slCursor.style.left = x + "px"; slCursor.style.top = y + "px";
     _apply();
-  }
-  let slDrag = false;
-  const onSlDown = (e) => { slDrag = true; pickSL(e); };
-  const onSlMove = (e) => { if (slDrag) pickSL(e); };
-  const onSlUp = () => { slDrag = false; };
-  slCanvas.addEventListener("mousedown", onSlDown);
-  document.addEventListener("mousemove", onSlMove);
-  document.addEventListener("mouseup", onSlUp);
+  });
 
-  // Hue bar
-  const HUE_W = SL_W;
-  const hueCanvas = document.createElement("canvas");
-  hueCanvas.width = HUE_W; hueCanvas.height = HUE_H;
-  hueCanvas.style.cssText = `width:${HUE_W}px;height:${HUE_H}px;border-radius:7px;cursor:crosshair;display:block;margin-bottom:8px;`;
+  const hueCanvas = h("canvas", { class: "sbg-cp-hue", width: SL_W, height: HUE_H });
   const hueCtx = hueCanvas.getContext("2d");
-  const hueCursor = h("div", { style: "position:absolute;top:-1px;width:4px;height:" + (HUE_H + 2) + "px;border:2px solid #fff;border-radius:3px;box-shadow:0 0 3px rgba(0,0,0,0.5);pointer-events:none;transform:translateX(-2px);" });
-  const hueWrap = h("div", { style: "position:relative;display:inline-block;" });
-  hueWrap.appendChild(hueCanvas); hueWrap.appendChild(hueCursor);
-  col.appendChild(hueWrap);
+  const hueCursor = h("div", { class: "sbg-cp-hue-cursor" });
+  col.appendChild(h("div", { class: "sbg-cp-canvas-wrap" }, [hueCanvas, hueCursor]));
 
   function drawHue() {
-    const grad = hueCtx.createLinearGradient(0, 0, HUE_W, 0);
+    const grad = hueCtx.createLinearGradient(0, 0, SL_W, 0);
     for (let i = 0; i <= 360; i += 30) grad.addColorStop(i / 360, `hsl(${i},100%,50%)`);
-    hueCtx.fillStyle = grad; hueCtx.fillRect(0, 0, HUE_W, HUE_H);
-    hueCursor.style.left = (cH / 360 * HUE_W) + "px";
+    hueCtx.fillStyle = grad; hueCtx.fillRect(0, 0, SL_W, HUE_H);
+    hueCursor.style.left = (cH / 360 * SL_W) + "px";
   }
-  function pickHue(e) {
+  _dragOn(hueCanvas, (e) => {
     const rect = hueCanvas.getBoundingClientRect();
-    const x = Math.max(0, Math.min(HUE_W - 1, e.clientX - rect.left));
-    cH = Math.round((x / HUE_W) * 360);
+    const x = Math.max(0, Math.min(SL_W - 1, e.clientX - rect.left));
+    cH = Math.round((x / SL_W) * 360);
     drawSL(); drawHue(); _apply();
-  }
-  let hueDrag = false;
-  const onHueDown = (e) => { hueDrag = true; pickHue(e); };
-  const onHueMove = (e) => { if (hueDrag) pickHue(e); };
-  const onHueUp = () => { hueDrag = false; };
-  hueCanvas.addEventListener("mousedown", onHueDown);
-  document.addEventListener("mousemove", onHueMove);
-  document.addEventListener("mouseup", onHueUp);
+  });
 
-  // Opacity slider
-  const opRow = h("div", { style: `display:flex;align-items:center;gap:8px;width:${SL_W}px;margin-bottom:10px;` });
-  const opRange = h("input", { type: "range", min: "0", max: "100", value: String(Math.round(cA * 100)), class: "sbg-cp-opacity", style: "flex:1;" });
-  const opVal = h("span", { style: "font-size:10px;opacity:0.7;min-width:30px;text-align:right;", text: Math.round(cA * 100) + "%" });
-  opRow.appendChild(h("span", { style: "font-size:10px;opacity:0.5;", text: "Opacity" }));
-  opRow.appendChild(opRange); opRow.appendChild(opVal);
+  const opRange = h("input", { type: "range", min: "0", max: "100", value: String(Math.round(cA * 100)), class: "sbg-cp-opacity" });
+  const opVal = h("span", { class: "sbg-cp-opval", text: Math.round(cA * 100) + "%" });
   opRange.addEventListener("input", () => { cA = (parseInt(opRange.value, 10) || 0) / 100; _apply(); });
-  col.appendChild(opRow);
+  col.appendChild(h("div", { class: "sbg-cp-oprow" }, [h("span", { class: "sbg-cp-oplabel", text: "Opacity" }), opRange, opVal]));
 
-  // Preview + colour input
-  let preview = null, colorInp = null;
-  // Commit the typed colour value. Declared at picker scope rather than only
-  // inside the showPreview block so the returned `commit` can flush a pending
-  // edit when the host tears the picker down, since layout-editor popovers
-  // leave the DOM entirely on outside-click, which can pre-empt the input's
-  // own change/blur event.
+  const preview = h("div", { class: "sbg-cp-preview" });
+  preview.style.background = checkerBg(currentColor);
+  const colorInp = h("input", { type: "text", class: "sbg-gs-input sbg-gs-input--sm sbg-cp-input", value: currentColor });
   let _colorDirty = false;
-  let commitTyped = () => {};
-  if (showPreview) {
-    const previewRow = h("div", { style: "display:flex;align-items:center;gap:8px;margin-bottom:8px;" });
-    preview = h("div", { style: "width:32px;height:32px;border-radius:6px;border:1px solid rgba(255,255,255,0.15);flex-shrink:0;" });
-    preview.style.background = withChecker(currentColor);
-    colorInp = h("input", { type: "text", class: "sbg-gs-input sbg-gs-input--sm", value: curRgbaStr(), style: "flex:1;font-family:monospace;font-size:12px;" });
-    commitTyped = () => {
-      if (!_colorDirty) return;  // nothing typed, so don't re-apply on a plain teardown
-      _colorDirty = false;
-      const pc = parseColor(colorInp.value.trim());
-      if (pc) { [cH, cS, cL] = rgbToHsl(pc.r, pc.g, pc.b); cA = pc.a; drawSL(); drawHue(); _apply(); }
-      else { colorInp.value = currentColor; }
-    };
-    colorInp.addEventListener("input", () => { _colorDirty = true; });
-    // `change` fires on blur (clicking another control or outside) and on Enter.
-    colorInp.addEventListener("change", commitTyped);
-    colorInp.addEventListener("keydown", (e) => { if (e.key === "Enter") commitTyped(); });
-    previewRow.appendChild(preview); previewRow.appendChild(colorInp);
-    col.appendChild(previewRow);
-  }
+  // Typed text is read on Enter or on leaving the field, since a half typed
+  // colour parses as something else. A caller closing the picker runs it as
+  // `commit`, because the field's change event may never fire.
+  const commitTyped = () => {
+    if (!_colorDirty) return;
+    _colorDirty = false;
+    const pc = parseColor(colorInp.value.trim());
+    if (pc) { take(pc); drawSL(); drawHue(); _apply(); }
+    else { colorInp.value = currentColor; }
+  };
+  // Cancelling clears the flag as well as skipping the commit, because focus
+  // returning to the opener fires the field's change event on the way out.
+  const discardTyped = () => {
+    _colorDirty = false;
+    colorInp.value = currentColor;
+  };
+  colorInp.addEventListener("input", () => { _colorDirty = true; });
+  colorInp.addEventListener("change", commitTyped);
+  colorInp.addEventListener("keydown", (e) => { if (e.key === "Enter") commitTyped(); });
+  col.appendChild(h("div", { class: "sbg-cp-preview-row" }, [preview, colorInp]));
 
-  // Saved colours
-  if (showSaved) {
-    const savedCol = h("div", { class: "sbg-cp-saved", style: "display:flex;flex-direction:column;align-items:center;gap:5px;max-height:230px;overflow-y:auto;overflow-x:hidden;padding:2px;" });
-    const savedLabel = h("div", { style: "font-size:10px;opacity:0.5;text-align:center;", text: "Saved" });
-    const saveBtn = h("button", { class: "sbg-btn sbg-btn--sm", text: "+", title: "Save current colour", style: "font-size:13px;line-height:1;padding:1px 7px;" });
-    const chipsWrap = h("div", { style: `display:flex;flex-direction:column;align-items:center;gap:7px;min-height:${savedChipSize}px;` });
-    function renderSaved() {
-      chipsWrap.innerHTML = "";
-      for (const sc of getSavedColors()) {
-        const chip = h("div", { style: `position:relative;width:${savedChipSize}px;height:${savedChipSize}px;border-radius:4px;background:${withChecker(sc)};cursor:pointer;border:1px solid rgba(255,255,255,0.1);flex-shrink:0;`, title: sc });
-        // The remove button sits inside the chip's top-right corner so the
-        // saved-list scrollbar and overflow can't clip or hide it.
-        const x = h("span", { text: "×", title: "Remove", style: "position:absolute;top:0;right:0;width:14px;height:14px;line-height:13px;text-align:center;font-size:12px;border-radius:0 4px 0 4px;background:rgba(0,0,0,0.65);color:#fff;cursor:pointer;opacity:0;transition:opacity 0.1s;" });
-        x.addEventListener("click", (e) => { e.stopPropagation(); saveSavedColors(getSavedColors().filter(v => v !== sc)); renderSaved(); });
-        chip.addEventListener("mouseenter", () => { x.style.opacity = "1"; });
-        chip.addEventListener("mouseleave", () => { x.style.opacity = "0"; });
-        chip.addEventListener("click", () => { const pc = parseColor(sc); if (pc) { [cH, cS, cL] = rgbToHsl(pc.r, pc.g, pc.b); cA = pc.a; drawSL(); drawHue(); } _apply(); });
-        chip.appendChild(x);
-        chipsWrap.appendChild(chip);
-      }
+  const savedCol = h("div", { class: "sbg-cp-saved" });
+  attachOverlayThumb(savedCol);
+  const saveBtn = h("button", { type: "button", class: "sbg-btn sbg-btn--sm sbg-cp-savebtn", html: PLUS_ICON, title: "Save current color", "aria-label": "Save current color" });
+  const chipsWrap = h("div", { class: "sbg-cp-chips" });
+  function renderSaved() {
+    chipsWrap.innerHTML = "";
+    for (const sc of getSavedColors()) {
+      const chip = h("button", { type: "button", class: "sbg-cp-chip", title: sc, "aria-label": `Use the saved color ${sc}` });
+      chip.style.background = checkerBg(sc);
+      chip.addEventListener("click", () => { const pc = parseColor(sc); if (pc) { take(pc); drawSL(); drawHue(); } _apply(); });
+      // Beside the chip instead of inside it, since a button cannot hold
+      // another, and inside the wrapper so the saved list cannot clip it.
+      const x = h("button", { type: "button", class: "sbg-cp-chipx", html: sizedIcon(CLOSE_ICON, 9), title: "Remove", "aria-label": `Remove the saved color ${sc}` });
+      x.addEventListener("click", (e) => {
+        e.stopPropagation();
+        if (!saveSavedColors(getSavedColors().filter(v => v !== sc))) showFailure("remove the saved color", _STORE_REFUSED);
+        renderSaved();
+      });
+      chipsWrap.appendChild(h("span", { class: "sbg-cp-chipwrap" }, [chip, x]));
     }
-    saveBtn.addEventListener("click", (e) => {
-      e.stopPropagation();
-      const arr = getSavedColors();
-      if (!arr.includes(currentColor)) { arr.unshift(currentColor); saveSavedColors(arr); renderSaved(); }
-    });
-    savedCol.appendChild(savedLabel); savedCol.appendChild(saveBtn); savedCol.appendChild(chipsWrap);
-    panel.appendChild(savedCol);
-    panel._renderSaved = renderSaved;
   }
+  saveBtn.addEventListener("click", (e) => {
+    e.stopPropagation();
+    const arr = getSavedColors();
+    if (arr.includes(currentColor)) return;
+    arr.unshift(currentColor);
+    if (!saveSavedColors(arr)) showFailure("save the color", _STORE_REFUSED);
+    renderSaved();
+  });
+  savedCol.append(h("div", { class: "sbg-cp-savedlabel", text: "Saved" }), saveBtn, chipsWrap);
+  panel.appendChild(savedCol);
 
   function _apply() {
-    currentColor = curStr();
-    if (preview) preview.style.background = withChecker(currentColor);
-    // Programmatic value set rather than a user edit, so clear the dirty flag.
-    if (colorInp) { colorInp.value = curRgbaStr(); _colorDirty = false; }
+    currentColor = current();
+    preview.style.background = checkerBg(currentColor);
+    colorInp.value = currentColor;
+    _colorDirty = false;
     opRange.value = String(Math.round(cA * 100));
     opVal.textContent = Math.round(cA * 100) + "%";
     onChange(currentColor);
   }
 
-  /** Accepts hex or rgba. */
-  function setColor(color) {
-    const pc = parseColor(color);
-    if (pc) { [cH, cS, cL] = rgbToHsl(pc.r, pc.g, pc.b); cA = pc.a; drawSL(); drawHue(); _apply(); }
-  }
-  /** Initial draw (no onChange fired). */
-  function init() { drawSL(); drawHue(); if (panel._renderSaved) panel._renderSaved(); }
-  /** Remove document-level listeners to prevent leaks. */
-  function destroy() {
-    document.removeEventListener("mousemove", onSlMove);
-    document.removeEventListener("mouseup", onSlUp);
-    document.removeEventListener("mousemove", onHueMove);
-    document.removeEventListener("mouseup", onHueUp);
-  }
+  function init() { drawSL(); drawHue(); renderSaved(); }
 
-  return { panel, destroy, setColor, init, commit: commitTyped };
+  return { panel, init, commit: commitTyped, discard: discardTyped };
 }

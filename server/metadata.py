@@ -12,25 +12,19 @@ from dataclasses import dataclass
 from typing import Any, Optional
 
 from . import comfy_graph
+from . import media_av
+from . import media_types
 from .schema import known_summary_keys
-
 
 PNG_SIGNATURE = b"\x89PNG\r\n\x1a\n"
 
-# Bump when the parser's output changes shape/coverage. Stored summaries are
-# cached in the DB; on startup a mismatch triggers a background re-extraction
-# so existing files pick up the new parser (see routes._check_parser_version).
+# Bump whenever the shape or the coverage of a summary changes. Startup compares
+# it against the stored one and re-extracts every cached summary on a mismatch.
 PARSER_VERSION = 58
 
-# Hard cap on any single captured node text/param string. "Show"/display nodes can
-# be wired to dump enormous blobs, which would bloat the DB and slow search.
-_NODE_TEXT_MAX = 4000
+_NODE_TEXT_MAX = media_types.NODE_TEXT_MAX
 
-# Hard cap on a single A1111 ControlNet field value before parsing. A genuine
-# field is a short key/value list; a value past this is not real data, and
-# parsing megabytes of it would only waste CPU.
 _CN_FIELD_MAX = 4000
-
 
 @dataclass(frozen=True)
 class MetadataResult:
@@ -40,16 +34,11 @@ class MetadataResult:
     raw_text: dict[str, str]
     summary: dict[str, Any]
 
-
-# JSON / Serialization helpers
-
-
 def _json_best_effort(s: str) -> Any:
     try:
         return json.loads(s)
     except Exception:
         return s
-
 
 def sanitize_for_json(obj: Any, _depth: int = 0) -> Any:
     if _depth > 40:
@@ -73,7 +62,6 @@ def sanitize_for_json(obj: Any, _depth: int = 0) -> Any:
         return {str(k): sanitize_for_json(v, _depth + 1) for k, v in obj.items()}
     if isinstance(obj, (list, tuple)):
         return [sanitize_for_json(v, _depth + 1) for v in obj]
-    # PIL IFDRational, numpy types, etc.
     try:
         f = float(obj)
         if math.isnan(f) or math.isinf(f):
@@ -86,10 +74,6 @@ def sanitize_for_json(obj: Any, _depth: int = 0) -> Any:
     except Exception:
         pass
     return str(obj)
-
-
-# PNG chunk reader
-
 
 def _decompress_limited(data: bytes, *, max_output_bytes: int) -> bytes:
     out = bytearray()
@@ -108,8 +92,8 @@ def _decompress_limited(data: bytes, *, max_output_bytes: int) -> bytes:
             break
     return bytes(out)
 
-
 def _decode_text_chunk_text(data: bytes) -> tuple[str | None, str | None]:
+    """A PNG tEXt chunk: a latin-1 keyword, a zero byte, then the text."""
     try:
         keyword, text = data.split(b"\x00", 1)
     except ValueError:
@@ -124,8 +108,8 @@ def _decode_text_chunk_text(data: bytes) -> tuple[str | None, str | None]:
         v = text.decode("latin-1", errors="replace")
     return k, v
 
-
 def _decode_ztxt(data: bytes, *, max_decompressed_bytes: int) -> tuple[str | None, str | None]:
+    """A PNG zTXt chunk: keyword, a zero byte, a compression method byte, zlib."""
     try:
         keyword, rest = data.split(b"\x00", 1)
         _compression_method = rest[0]
@@ -143,8 +127,11 @@ def _decode_ztxt(data: bytes, *, max_decompressed_bytes: int) -> tuple[str | Non
         return k, None
     return k, v
 
-
 def _decode_itxt(data: bytes, *, max_decompressed_bytes: int) -> tuple[str | None, str | None]:
+    """A PNG iTXt chunk: keyword, zero, compression flag, compression method,
+    language tag, zero, translated keyword, zero, then UTF-8 text that is zlib
+    compressed when the flag is 1.
+    """
     try:
         keyword, rest = data.split(b"\x00", 1)
         k = keyword.decode("latin-1", errors="replace")
@@ -166,6 +153,7 @@ def _decode_itxt(data: bytes, *, max_decompressed_bytes: int) -> tuple[str | Non
         v = None
     return k, v
 
+_PNG_MAX_TEXT_CHUNKS = 64
 
 def read_png_text_chunks(
     path: str,
@@ -174,8 +162,20 @@ def read_png_text_chunks(
     max_decompressed_text_bytes: int,
     stop_after_keys: set[str] | None = None,
 ) -> dict[str, str]:
+    """Every chunk is a four byte length, a four byte type, the data, and a four
+    byte checksum, which is what the seeks step over. Where a keyword appears
+    twice the first chunk is the one kept.
+    """
     stop_after_keys = stop_after_keys or set()
     found: dict[str, str] = {}
+    # The cap on decompressed text also bounds the total kept across chunks
+    # on purpose, so the largest honest single chunk still fits while copies
+    # of it do not. Each decoder is handed one byte more than what is left,
+    # since a chunk has to be inflated before it can be refused and one byte
+    # over is the proof it does not fit, and the chunk count bounds that work
+    # for a file holding many small ones.
+    kept_bytes = 0
+    text_chunks = 0
 
     with open(path, "rb") as f:
         sig = f.read(8)
@@ -190,22 +190,28 @@ def read_png_text_chunks(
             ctype_s = ctype.decode("ascii", errors="replace")
 
             if ctype_s in {"tEXt", "zTXt", "iTXt"}:
-                if length > max_text_chunk_bytes:
+                remaining = max_decompressed_text_bytes - kept_bytes
+                if length > max_text_chunk_bytes or remaining <= 0:
+                    f.seek(length + 4, os.SEEK_CUR)
+                    continue
+                text_chunks += 1
+                if text_chunks > _PNG_MAX_TEXT_CHUNKS:
                     f.seek(length + 4, os.SEEK_CUR)
                     continue
 
                 data = f.read(length)
-                f.seek(4, os.SEEK_CUR)  # crc
+                f.seek(4, os.SEEK_CUR)
 
                 if ctype_s == "tEXt":
-                    k, v = _decode_text_chunk_text(data)
+                    k, v = _decode_text_chunk_text(data) if length <= remaining else (None, None)
                 elif ctype_s == "zTXt":
-                    k, v = _decode_ztxt(data, max_decompressed_bytes=max_decompressed_text_bytes)
+                    k, v = _decode_ztxt(data, max_decompressed_bytes=remaining + 1)
                 else:
-                    k, v = _decode_itxt(data, max_decompressed_bytes=max_decompressed_text_bytes)
+                    k, v = _decode_itxt(data, max_decompressed_bytes=remaining + 1)
 
-                if k and v is not None:
-                    found.setdefault(k, v)
+                if k and v is not None and k not in found and len(v) <= remaining:
+                    found[k] = v
+                    kept_bytes += len(v)
 
                 if stop_after_keys and stop_after_keys.issubset(found.keys()):
                     break
@@ -217,12 +223,11 @@ def read_png_text_chunks(
 
     return found
 
-
-# Source-app detection
-
-
 def _detect_source_app(parsed: dict, prompt: Any, workflow: Any) -> str:
-    """Returns one of: 'comfyui', 'a1111', 'forge', 'sdnext', 'fooocus', 'civitai', 'unknown'."""
+    """The parameters text is checked from the most specific marker to the least,
+    since the apps that write an `App:` or a `Civitai resources` field write the
+    plainer fields as well.
+    """
     if isinstance(prompt, dict):
         for v in prompt.values():
             if isinstance(v, dict) and "class_type" in v:
@@ -235,7 +240,6 @@ def _detect_source_app(parsed: dict, prompt: Any, workflow: Any) -> str:
             params_text = pt
 
     if params_text:
-        # SD.Next embeds "App: SD.Next"
         app_match = re.search(r"\bApp:\s*([^,\n]+)", params_text)
         if app_match:
             app_name = app_match.group(1).strip().lower()
@@ -246,17 +250,14 @@ def _detect_source_app(parsed: dict, prompt: Any, workflow: Any) -> str:
             if "fooocus" in app_name:
                 return "fooocus"
 
-        # Forge has no App: field but stamps its version: classic Forge writes
-        # "Version: f2.0.1v1.10.1-…" (f-prefixed), Forge Neo "Version: neo-2.24".
         ver_match = re.search(r"\bVersion:\s*([^\s,]+)", params_text)
         if ver_match:
             ver = ver_match.group(1).strip().lower()
+            # Forge stamps its own version, which starts with an f and a digit,
+            # or with neo for the Neo line.
             if re.match(r"^f\d", ver) or ver.startswith("neo"):
                 return "forge"
 
-        # CivitAI on-site generations embed A1111-style parameters PLUS a
-        # "Civitai resources: [...]" list (and a "Created Date:"). That label is
-        # CivitAI-specific, so classify it before the generic a1111 fallback.
         if "Civitai resources" in params_text:
             return "civitai"
 
@@ -264,6 +265,8 @@ def _detect_source_app(parsed: dict, prompt: Any, workflow: Any) -> str:
             return "a1111"
 
     if isinstance(parsed, dict):
+        # Fooocus writes its own keys instead of a parameters line, either at
+        # the top level or inside a comment object.
         if "Prompt" in parsed and "Negative Prompt" in parsed:
             return "fooocus"
         comment = parsed.get("comment")
@@ -272,17 +275,33 @@ def _detect_source_app(parsed: dict, prompt: Any, workflow: Any) -> str:
 
     return "unknown"
 
+# A key is bounded so a run of ordinary text with no colon costs the scan a
+# fixed amount per position instead of the rest of the line.
+_A1111_KEY = r"[A-Za-z][A-Za-z0-9 _/\-]{0,79}?"
+_A1111_QUOTED_RE = re.compile(r'(' + _A1111_KEY + r'):\s*"((?:[^"\\]|\\.)*)"')
+_A1111_KV_RE = re.compile(
+    r"(" + _A1111_KEY + r"):\s*((?:[^,]|,(?!\s*" + _A1111_KEY + r":\s))+)")
 
-# A1111 / Forge "parameters" text parser
-
+def _take_quoted_settings(settings_str: str) -> tuple[dict[str, str], str]:
+    quoted_keys: dict[str, str] = {}
+    parts: list[str] = []
+    pos = 0
+    for m in _A1111_QUOTED_RE.finditer(settings_str):
+        key = m.group(1).strip().lower().replace(" ", "_")
+        quoted_keys[key] = m.group(2).strip()
+        parts.append(settings_str[pos:m.start()])
+        end = m.end()
+        trail = settings_str[end:].lstrip()
+        if trail.startswith(","):
+            end = len(settings_str) - len(trail) + 1
+        pos = end
+    parts.append(settings_str[pos:])
+    return quoted_keys, "".join(parts)
 
 def _parse_a1111_parameters(params_text: str) -> dict[str, Any]:
-    """Parse A1111/Forge-style 'parameters' text into a structured dict.
-
-    Handles multiple format variants:
-    - Standard A1111: positive\\nNegative prompt: negative\\nSteps: ...
-    - Separator variant: positive\\n---\\nnegative\\nSteps: ...
-    - No negative prompt: positive\\nSteps: ...
+    """The text runs positive prompt, then a `Negative prompt:` line, then one
+    settings line of `Key: value` pairs separated by commas, which starts at
+    `Steps:`. Every part after the first is optional.
     """
     result: dict[str, Any] = {}
     if not params_text or not isinstance(params_text, str):
@@ -307,6 +326,8 @@ def _parse_a1111_parameters(params_text: str) -> dict[str, Any]:
                 negative = rest.strip()
                 settings_str = ""
     else:
+        # Some writers rule off the negative prompt with a dashed line instead
+        # of naming it.
         dash_match = re.search(r"\n\s*---+\s*", params_text)
         if dash_match:
             positive = params_text[: dash_match.start()].strip()
@@ -338,43 +359,23 @@ def _parse_a1111_parameters(params_text: str) -> dict[str, Any]:
     if negative:
         result["negative_prompt"] = negative
 
-    # Parse "Key: value, Key: value" settings
     if settings_str:
-        # Pre-extract keys with quoted values (ControlNet, Lora hashes, TI, etc.)
-        # These contain inner commas and key:value pairs that would confuse the main parser
-        quoted_pattern = re.finditer(
-            r'([A-Za-z][A-Za-z0-9 _/\-]*?):\s*"((?:[^"\\]|\\.)*)"',
-            settings_str
-        )
         quoted_keys = {}
-        spans_to_remove = []
-        for m in quoted_pattern:
-            key = m.group(1).strip().lower().replace(" ", "_")
-            quoted_keys[key] = m.group(2).strip()
-            spans_to_remove.append((m.start(), m.end()))
-
-        # Remove quoted sections from settings_str to prevent inner keys from leaking
         clean_str = settings_str
-        for start, end in reversed(spans_to_remove):
-            trail = clean_str[end:].lstrip()
-            if trail.startswith(","):
-                end = end + (len(clean_str[end:]) - len(trail)) + 1
-            clean_str = clean_str[:start] + clean_str[end:]
+        # A quoted value holds commas of its own, so those pairs are taken out
+        # whole, along with the comma that followed them.
+        if '"' in settings_str:
+            quoted_keys, clean_str = _take_quoted_settings(settings_str)
 
         result.update(quoted_keys)
 
-        # Value capture stops at a following ", Key:" whose key may be of any case.
-        kv_pattern = re.findall(r"([A-Za-z][A-Za-z0-9 _/\-]*?):\s*((?:[^,]|,(?!\s*[A-Za-z][A-Za-z0-9 _/\-]*?:\s))+)", clean_str)
+        kv_pattern = _A1111_KV_RE.findall(clean_str)
         for k, v in kv_pattern:
             key = k.strip().lower().replace(" ", "_")
             val = v.strip().rstrip(",")
             result[key] = val
 
     return result
-
-
-# Normalization of flat A1111/Forge/SD.Next fields into the structured format
-
 
 def _safe_float(v: Any) -> float | None:
     if v is None:
@@ -384,22 +385,16 @@ def _safe_float(v: Any) -> float | None:
     except (ValueError, TypeError):
         return None
 
-
 def _safe_int(v: Any) -> int | None:
     if v is None:
         return None
     try:
-        return int(float(v))  # handles "29.0" etc.
+        return int(float(v))
     except (ValueError, TypeError):
         return None
 
-
 def _pop_first(d: dict[str, Any], *keys: str) -> Any:
-    """Pop ALL of the given keys from d, returning the first non-None value.
-
-    A plain `d.pop(a) or d.pop(b)` would short-circuit and leave the alias key
-    behind, where it would leak into 'extra'.
-    """
+    """Take the first of these keys that has a value, and remove all of them."""
     val = None
     for k in keys:
         v = d.pop(k, None)
@@ -407,37 +402,18 @@ def _pop_first(d: dict[str, Any], *keys: str) -> Any:
             val = v
     return val
 
-
 def _append_structured(summary: dict[str, Any], key: str, entry: dict[str, Any]) -> None:
-    """Append a structured entry under `key`, replacing any stray scalar first.
-
-    A bare enable flag ("ADetailer: on", "ControlNet: enabled") parses into
-    `summary[key]` as a string, so a later `setdefault(key, []).append(...)`
-    would return that string and raise. Coercing a non-list value to a fresh
-    list keeps the append safe and drops the meaningless flag."""
     cur = summary.get(key)
     if not isinstance(cur, list):
         cur = summary[key] = []
     cur.append(entry)
 
-
 def _normalize_a1111_to_structured(summary: dict[str, Any]) -> None:
-    """Convert flat A1111/Forge/SD.Next params into same structured format as ComfyUI.
-
-    Mutates summary in-place. After this, summary will have:
-    - samplers: list of structured sampler dicts
-    - loras: list of structured lora dicts
-    - adetailer: list of structured adetailer dicts
-    - resolution: from 'size' field
-    - extra: dict of remaining WebUI-specific fields
-
-    All raw flat keys are removed.
-    """
     if summary.get("samplers"):
-        return  # Already has structured samplers (ComfyUI path already ran)
+        return
 
     sampler_name = _pop_first(summary, "sampler_name", "sampler")
-    # Newer A1111 splits the scheduler into its own "Schedule type:" field.
+    # Newer writers put the scheduler in a `Schedule type` field of its own.
     scheduler = _pop_first(summary, "scheduler", "schedule_type")
     steps = _safe_int(summary.pop("steps", None))
     cfg = _safe_float(_pop_first(summary, "cfg", "cfg_scale"))
@@ -464,8 +440,6 @@ def _normalize_a1111_to_structured(summary: dict[str, Any]) -> None:
         if seed is not None:
             sampler_entry["seed"] = seed
         if denoise is not None:
-            # Keep denoise even at 1.0 so it shows consistently on images, the same
-            # way it already does for videos (which usually run denoise < 1.0).
             sampler_entry["denoise"] = denoise
         summary["samplers"] = [sampler_entry]
 
@@ -473,11 +447,9 @@ def _normalize_a1111_to_structured(summary: dict[str, Any]) -> None:
         summary["samplers"][0]["shift"] = shift
 
     loras = summary.get("loras")
+    # A quoted `Loras` field holds the whole list as one string of comma
+    # separated `name: weight` pairs.
     if isinstance(loras, str):
-        # A quoted "Loras:" value carries the whole list as one string of
-        # "name: weight" pairs (same shape "Lora hashes" uses). A segment
-        # whose trailing colon part is non-numeric passes through as text
-        # so the "Name (weight)" parser below still gets a chance at it.
         entries: list[Any] = []
         for seg in loras.split(","):
             seg = seg.strip()
@@ -496,7 +468,6 @@ def _normalize_a1111_to_structured(summary: dict[str, Any]) -> None:
             if isinstance(l, dict) and "name" in l:
                 structured_loras.append(l)
             elif isinstance(l, str):
-                # Parse "Name (weight)" format from A1111 extraction
                 m = re.match(r"^(.+?)\s*\(([^)]+)\)$", l)
                 if m:
                     name = m.group(1).strip()
@@ -510,7 +481,6 @@ def _normalize_a1111_to_structured(summary: dict[str, Any]) -> None:
         if structured_loras:
             summary["loras"] = structured_loras
 
-    # SD.Next format: detailer, detailer_steps, detailer_strength
     detailer_model = summary.pop("detailer", None)
     detailer_steps = _safe_int(summary.pop("detailer_steps", None))
     detailer_strength = _safe_float(summary.pop("detailer_strength", None))
@@ -522,7 +492,7 @@ def _normalize_a1111_to_structured(summary: dict[str, Any]) -> None:
             ad_entry["denoise"] = detailer_strength
         _append_structured(summary, "adetailer", ad_entry)
 
-    # A1111 format: adetailer_model, adetailer_confidence, adetailer_model_2nd, etc.
+    # A detailer pass past the first repeats its keys under these suffixes.
     _ad_suffixes = ["", "_2nd", "_3rd", "_4th"]
     for suf in _ad_suffixes:
         ad_model_key = f"adetailer_model{suf}"
@@ -542,19 +512,14 @@ def _normalize_a1111_to_structured(summary: dict[str, Any]) -> None:
                 short = fld.replace("adetailer_", "")
                 ad_entry[short] = conv(val) if conv else val
         _append_structured(summary, "adetailer", ad_entry)
-    # Clean up version/classes/prompt keys, and a bare "adetailer" enable flag
-    # left as a scalar when no structured fields followed it.
     for k in list(summary.keys()):
         if k.startswith("adetailer_"):
             summary.pop(k, None)
     if isinstance(summary.get("adetailer"), str):
         summary.pop("adetailer", None)
 
-    # Forge/Neo "Module N" fields hold the VAE and text-encoder selection
-    # (e.g. "Module 1: ae, Module 2: qwen_3_4b"). The multi-select lists them
-    # in selection order, so the VAE is not tied to one slot; classify each by
-    # name instead. module_1 was once deleted by the ControlNet sweep below,
-    # destroying the Forge VAE before the summary was built.
+    # The numbered `module_N` keys list the extra models loaded beside the
+    # checkpoint, and only the name says whether one is the VAE or an encoder.
     _module_keys = sorted((k for k in summary if re.fullmatch(r"module_\d+", k)),
                           key=lambda k: int(k.split("_")[1]))
     for _mk in _module_keys:
@@ -566,8 +531,6 @@ def _normalize_a1111_to_structured(summary: dict[str, Any]) -> None:
         if _low == "ae" or "vae" in _low:
             summary.setdefault("vae", _mv)
         else:
-            # A "Clip models:" settings line can already have stored a plain
-            # string here; fold it into the list instead of appending to it.
             _cl = summary.get("clip_models")
             if isinstance(_cl, str):
                 _cl = [p.strip() for p in _cl.split(",") if p.strip()]
@@ -577,7 +540,8 @@ def _normalize_a1111_to_structured(summary: dict[str, Any]) -> None:
             if _mv not in _cl:
                 _cl.append(_mv)
 
-    # A1111 stores ControlNet as: controlnet_0: "Module: X, Model: Y, Weight: Z, ..."
+    # Each ControlNet unit arrives as one quoted string of `Key: value` pairs
+    # under a numbered key.
     for cn_idx in range(4):
         cn_key = f"controlnet_{cn_idx}" if cn_idx > 0 else "controlnet_0"
         cn_raw = summary.pop(cn_key, None)
@@ -589,10 +553,9 @@ def _normalize_a1111_to_structured(summary: dict[str, Any]) -> None:
         raw_str = str(cn_raw).strip().strip('"')
         if len(raw_str) > _CN_FIELD_MAX:
             raw_str = raw_str[:_CN_FIELD_MAX]
-        # Split into pairs at a ", " that precedes a capitalized "Key:" token
-        # (commas inside a value do not start a new pair), then split each on
-        # its first colon. Linear, so a huge value can't stall the parser.
         cn_map: dict[str, str] = {}
+        # A value can hold commas, so the string only breaks at a comma that a
+        # capitalised key name follows.
         for seg in re.split(r',\s*(?=[A-Z][A-Za-z ]*:)', raw_str):
             key, sep, val = seg.partition(':')
             if not sep:
@@ -611,17 +574,12 @@ def _normalize_a1111_to_structured(summary: dict[str, Any]) -> None:
                 cn_entry[fld] = val
         if cn_entry:
             _append_structured(summary, 'controlnet', cn_entry)
-    # Also clean up any remaining controlnet-related flat keys from A1111.
-    # module_N keys are absent here on purpose: they are Forge's VAE and
-    # text-encoder selection, consumed into vae/clip_models above.
     for k in list(summary.keys()):
         if k.startswith('controlnet_') or k in ('control_mode', 'guidance_start', 'guidance_end',
                                                   'pixel_perfect', 'resize_mode', 'processor_res',
                                                   'threshold_a', 'threshold_b', 'weight',
                                                   'hr_option'):
             summary.pop(k, None)
-    # A bare "ControlNet" enable flag left as a scalar (no "ControlNet 0:" block
-    # followed it) is not a structured entry; drop it.
     if isinstance(summary.get('controlnet'), str):
         summary.pop('controlnet', None)
 
@@ -629,7 +587,6 @@ def _normalize_a1111_to_structured(summary: dict[str, Any]) -> None:
     if size and not summary.get("resolution"):
         if isinstance(size, str) and "x" in size.lower():
             summary["resolution"] = size.replace("x", "×").replace("X", "×")
-            # Parse width/height for AR thumbnail support
             try:
                 parts = size.lower().split("x")
                 if len(parts) == 2:
@@ -638,22 +595,12 @@ def _normalize_a1111_to_structured(summary: dict[str, Any]) -> None:
             except (ValueError, TypeError):
                 pass
 
-
-# Enhanced summary extractor
-
-
 def _extract_summary(prompt: Any, workflow: Any, parsed: dict) -> dict[str, Any]:
-    """Detect-then-normalize flow:
-
-    1. Detect source app (comfyui, a1111, forge, sdnext, fooocus, unknown)
-    2. Parse A1111-style parameters text (works for A1111/Forge/SD.Next)
-    3. Normalize flat params into structured format (samplers, loras, adetailer)
-    4. Overlay ComfyUI prompt graph data
-    5. Extract from workflow graph for any remaining fields
+    """The graph is read first and the parameters text fills what it left empty,
+    apart from the positive prompt, which the text takes.
     """
     summary: dict[str, Any] = {}
 
-    # Parse prompt/workflow JSON strings early so _detect_source_app can inspect them
     p = prompt
     if isinstance(p, str):
         try:
@@ -670,12 +617,6 @@ def _extract_summary(prompt: Any, workflow: Any, parsed: dict) -> dict[str, Any]
 
     summary["source_app"] = _detect_source_app(parsed, p, w)
 
-    # 1) Parse A1111/Forge-style "parameters" text into its OWN dict, merged
-    #    AFTER graph extraction. Many ComfyUI save nodes also embed an A1111-style
-    #    text block, and that block is flatter (single sampler, no scheduler/denoise
-    #    detail) and sometimes corrupted by saver mis-wiring. The graph is the
-    #    primary structured source; the text block stays authoritative only for the
-    #    final (wildcard-resolved) positive prompt.
     a1111: dict[str, Any] = {}
     if isinstance(parsed, dict):
         params_text = parsed.get("parameters")
@@ -701,12 +642,8 @@ def _extract_summary(prompt: Any, workflow: Any, parsed: dict) -> dict[str, Any]
                                     pass
                             loras.append(entry)
                         a1111.setdefault("loras", loras)
-                    # When the prompt is ONLY lora tags, stripping them empties it
-                    # so the graph extractor sets the real prompt. The unstripped
-                    # text is kept for the merge's corruption guard: comparing the
-                    # negative against the STRIPPED positive once made "same base
-                    # text plus loras in the positive" read as saver mis-wiring,
-                    # silently dropping a real negative prompt.
+                    # The line with its lora tags still in place, which the
+                    # merge compares against the negative word for word.
                     a1111["_positive_raw"] = pos
                     cleaned_pos = re.sub(r'<lora:[^>]+>', '', pos).strip()
                     cleaned_pos = re.sub(r',\s*,', ',', cleaned_pos).strip(' ,')
@@ -715,31 +652,24 @@ def _extract_summary(prompt: Any, workflow: Any, parsed: dict) -> dict[str, Any]
                     else:
                         a1111["positive_prompt"] = cleaned_pos
 
-    # 2) Normalize flat A1111/Forge/SD.Next params to structured format
     if a1111:
         a1111["source_app"] = summary["source_app"]
         _normalize_a1111_to_structured(a1111)
         a1111.pop("source_app", None)
 
-    # 3) ComfyUI prompt dict: the PRIMARY source when present
     if isinstance(p, dict):
         _extract_from_comfyui_prompt(p, summary)
 
-    # 3a) FALLBACK for workflow-only PNGs (no API prompt chunk): reconstruct one
-    #     from the workflow graph and run the SAME extractor on it, recovering
-    #     models/samplers/LoRAs/prompts. Runs only when the reliable path found
-    #     nothing; _workflow_to_prompt returns None rather than a bad prompt.
     if p is None and isinstance(w, dict) and "nodes" in w and not summary.get("positive_prompt"):
         _recon = _workflow_to_prompt(w, comfy_graph.get_registry())
         if _recon:
             _extract_from_comfyui_prompt(_recon, summary)
             if summary.get("source_app") in (None, "unknown"):
                 summary["source_app"] = "comfyui"
-            p = _recon                                   # let steps 3b/4 use the reconstruction
+            p = _recon
 
-    # 3b) Generation resolution from the pipeline model: the latent size
-    #     entering the first ACTIVE sampler (dangling editing leftovers and
-    #     runtime-measured sizes yield nothing instead of a wrong number).
+    # The generated size is the latent size going into the first sampler that
+    # ran.
     if isinstance(p, dict) and "resolution" not in summary:
         _gr = comfy_graph.find_generation_resolution(
             p, comfy_graph.get_registry(),
@@ -749,9 +679,9 @@ def _extract_summary(prompt: Any, workflow: Any, parsed: dict) -> dict[str, Any]
             summary.setdefault("width", _gr[0])
             summary.setdefault("height", _gr[1])
 
-    # 4) ComfyUI workflow graph: extract text prompts from CLIPTextEncode nodes.
-    #    Nodes whose width/height are LINKED in the prompt keep a stale typed-in
-    #    value in their workflow widgets, so never trust those for resolution.
+    # The workflow pass reads widget values, which are whatever was last typed
+    # into the editor. A node whose width or height came down a link ran with
+    # another number, and a node absent from the prompt did not run at all.
     linked_size_ids: set[str] = set()
     executed_ids: set[str] | None = None
     if isinstance(p, dict):
@@ -764,52 +694,35 @@ def _extract_summary(prompt: Any, workflow: Any, parsed: dict) -> dict[str, Any]
     if isinstance(w, dict) and "nodes" in w:
         _extract_from_comfyui_workflow(w, summary, linked_size_ids, executed_ids)
 
-    # 5) Merge the parameters-text data into the graph-first summary
     _merge_a1111_summary(summary, a1111)
 
-    # 5a) CivitAI on-site generations carry their checkpoint + LoRAs only in a
-    #     "Civitai resources" JSON list (no A1111 Model:/Lora hashes: fields), so
-    #     map that into model/loras before the cleanup sweeps it into extra.
     if summary.get("source_app") == "civitai":
         _apply_civitai_resources(summary)
 
-    # Set availability flags so summary_only responses can enable UI buttons
+    # A response carrying the summary alone still has to say whether the file
+    # holds a prompt and a workflow, and the lightbox turns its workflow
+    # buttons on from `has_workflow`.
     if (isinstance(p, dict) and p) or (isinstance(prompt, str) and prompt.strip()):
         summary["has_prompt"] = True
     if (isinstance(w, dict) and w) or (isinstance(workflow, str) and workflow.strip()):
         summary["has_workflow"] = True
 
-    # _node_id is kept on workflow_nodes entries: the layout editor uses it
-    # (with title/_from) to address a specific node instance.
-
     _final_summary_cleanup(summary)
 
     return summary
 
+# Read from the catalog on first use, so importing this module reads no file.
+_known_summary_keys_cache: frozenset | None = None
 
-# Keys that are allowed to remain as top-level summary fields (everything else is
-# swept into `extra`). This set is defined once in section_catalog.json and
-# derived via server/schema.py.
-_KNOWN_SUMMARY_KEYS = frozenset(known_summary_keys())
-
+def _known_summary_keys() -> frozenset:
+    global _known_summary_keys_cache
+    if _known_summary_keys_cache is None:
+        _known_summary_keys_cache = frozenset(known_summary_keys())
+    return _known_summary_keys_cache
 
 def _merge_a1111_summary(summary: dict[str, Any], a1111: dict[str, Any]) -> None:
-    """Merge A1111-parameters-text fields into the (graph-first) summary.
-
-    Per-field policy:
-    - positive_prompt: the text block WINS, since it stores the prompt after
-      wildcard/dynamic-prompt resolution, which the graph often cannot give.
-      The exception is a text block whose prompt line says the same thing as
-      its own "Negative prompt:" line (ignoring LoRA tags): a saver that could
-      not read the workflow's encoder types writes the NEGATIVE text into both,
-      so the line carries no positive prompt at all. A graph-derived positive
-      is kept in that case; with no graph value the block still fills the gap.
-    - negative_prompt: graph wins; the text block only fills a gap, and is
-      ignored when identical to the positive (a known saver mis-wiring that
-      writes the positive text into the "Negative prompt:" line).
-    - everything else (samplers, loras, model, hashes, …): graph wins, the
-      text block fills gaps. For pure A1111/Forge/SD.Next files the graph
-      contributes nothing, so the text block populates everything as before.
+    """The positive prompt is the exception and replaces the graph's, while the
+    negative prompt and every other key only fill a gap.
     """
     if not a1111:
         return
@@ -819,21 +732,14 @@ def _merge_a1111_summary(summary: dict[str, Any], a1111: dict[str, Any]) -> None
     if isinstance(pos_t, str) and pos_t.strip():
         def _core(s):
             return re.sub(r'<lora:[^>]+>', '', s or '').strip()
-        # Both known saver corruptions repeat one text on the prompt and the
-        # "Negative prompt:" line. Which text it is decides who wins: when it
-        # matches the graph's NEGATIVE the prompt line holds no positive, so
-        # the graph's positive stays; otherwise it is the resolved positive
-        # and the text block wins as usual.
+        # Where the text gives one prompt as both positive and negative and the
+        # graph holds it as the negative, the graph's positive stands.
         _repeated = bool(_core(pos_t)) and _core(pos_t) == _core(neg_t if isinstance(neg_t, str) else "")
         _is_graph_negative = (_repeated and summary.get("negative_prompt")
                               and _core(summary["negative_prompt"]) == _core(pos_t))
         if not (_is_graph_negative and summary.get("positive_prompt")):
             summary["positive_prompt"] = pos_t.strip()
     if isinstance(neg_t, str) and neg_t.strip():
-        # Mis-wiring means the block repeated one text VERBATIM on both lines,
-        # so the check runs against the prompt line as written. The stripped
-        # positive would also match a negative that merely equals the base
-        # text of a "prompt <lora:...>" line, and that negative is real.
         _pos_cmp = pos_raw if isinstance(pos_raw, str) else pos_t
         if neg_t.strip() != (_pos_cmp.strip() if isinstance(_pos_cmp, str) else summary.get("positive_prompt")):
             summary.setdefault("negative_prompt", neg_t.strip())
@@ -842,21 +748,10 @@ def _merge_a1111_summary(summary: dict[str, Any], a1111: dict[str, Any]) -> None
             continue
         summary.setdefault(k, v)
 
-
-# CivitAI resource "type" values that map to the LoRAs panel (the LoRA family).
 _CIVITAI_LORA_TYPES = frozenset({"lora", "locon", "lycoris", "dora"})
 
-
 def _apply_civitai_resources(summary: dict[str, Any]) -> None:
-    """Map CivitAI's "Civitai resources" list into `model` and `loras`.
-
-    CivitAI on-site generations do NOT emit A1111 'Model:'/'Lora hashes:' fields;
-    the checkpoint and LoRAs live only in a JSON array under 'Civitai resources'
-    (captured verbatim as a string before cleanup sweeps it into `extra`). Parse
-    it so the checkpoint fills `model` and the LoRA-family entries fill `loras`,
-    in the same {name, strength_model} shape the rest of the parser produces.
-    Only fills gaps; a real graph/text value already present always wins.
-    """
+    """Read the `Civitai resources` field, a JSON list of the models used."""
     raw = summary.get("civitai_resources")
     if isinstance(raw, str):
         try:
@@ -891,29 +786,12 @@ def _apply_civitai_resources(summary: dict[str, Any]) -> None:
     if loras and not summary.get("loras"):
         summary["loras"] = loras
 
-
 def _final_summary_cleanup(summary: dict[str, Any]) -> None:
-    """Sweep all unrecognized keys into the 'extra' dict.
-
-    This runs AFTER both A1111 normalization and ComfyUI extraction,
-    catching any stale flat keys from either path:
-    - ComfyUI backward-compat: sampler_name, steps, cfg, scheduler, seed, denoise
-    - A1111 LoRA hashes: lora_hashes, hashes, vae_hash, ti_hashes, ti
-    - A1111 LoRA name hashes: pdxl_heijun_v1, illu_kunaboto_v1, etc.
-    - schedule_type, sampler_sigma, etc.
-    """
-    # An "original" prompt identical to the final positive adds nothing.
     if summary.get("initial_prompt") and summary.get("initial_prompt") == summary.get("positive_prompt"):
         del summary["initial_prompt"]
 
-    # A VAE the stage scoping attributed to a moved upscale pass can reappear
-    # from a saver-written parameters chunk (the saver records whatever VAE
-    # reaches it, the moved pass's there). The upscaling entry owns that fact,
-    # so the duplicate is dropped ONLY when the summary value did not come from
-    # the graph's own main-VAE resolution: one loader feeding both the decode
-    # and an upscaler legitimately puts the same file in both places, and that
-    # summary value must survive. When the chunk value is dropped and the graph
-    # resolved a different main VAE, the graph value takes its place.
+    # A VAE that only an upscale pass loaded is that pass's, so it is dropped
+    # from the top of the summary unless the graph named one for the generation.
     _graph_vae = summary.pop("_vae_graph", None)
     _ups = summary.get("upscaling")
     if summary.get("vae") and summary["vae"] != _graph_vae and isinstance(_ups, list) and any(
@@ -928,7 +806,7 @@ def _final_summary_cleanup(summary: dict[str, Any]) -> None:
         extra = {}
 
     for k in list(summary.keys()):
-        if k not in _KNOWN_SUMMARY_KEYS:
+        if k not in _known_summary_keys():
             extra[k] = summary.pop(k)
 
     if extra:
@@ -936,32 +814,23 @@ def _final_summary_cleanup(summary: dict[str, Any]) -> None:
     elif "extra" in summary:
         del summary["extra"]
 
-
-
 def _resolve_ref(prompt: dict, ref: Any) -> dict | None:
-    """Follow a ComfyUI node reference like ["7", 0] to the source node data."""
+    """An input in the prompt is either a literal or a link, and a link is the two
+    element list of the source node's id and its output slot.
+    """
     if isinstance(ref, list) and len(ref) >= 1:
         node_id = str(ref[0])
         return prompt.get(node_id)
     return None
 
-
-# Crystools pipe nodes bundle arbitrary values: "Pipe to/edit any" packs
-# any_1..any_N into a CPipeAny, and "Pipe from any" unpacks it with output
-# slot 0 carrying the pipe itself and slot k carrying any_k. Walkers that
-# treat a ref as opaque dead-end on the unpacker, so refs into pipe slots
-# are demuxed back to the bundled source ref before following them.
-# Pipe bundle traversal lives in comfy_graph (shared with resolve_link, so
-# both demux identically); these names alias it for this module's call sites.
+# A pipe node bundles several values into one link and another unpacks them.
+# The graph module owns that demux.
 _PIPE_FROM_PATTERN = comfy_graph.PIPE_FROM_PATTERN
 _PIPE_TO_PATTERN = comfy_graph.PIPE_TO_PATTERN
 _demux_pipe_ref = comfy_graph.demux_pipe_ref
 
-
 def _guider_model_src(prompt: dict, g: Any) -> Any:
-    """The model ref a guider link leads to, or None. Demuxes pipe slots and
-    follows switches, since otherwise a routed guider would read as having
-    no model and MoE role detection would discard every role."""
+    """The model a guider was built from, for a sampler that takes no model."""
     for _ in range(8):
         g = _demux_pipe_ref(prompt, g)
         if not isinstance(g, list):
@@ -980,18 +849,10 @@ def _guider_model_src(prompt: dict, g: Any) -> Any:
         return (gn.get("inputs") or {}).get("model")
     return None
 
-
 def _trace_model_shift(prompt: dict, model_ref: Any) -> float | None:
-    """Walk a sampler's MODEL input chain to the nearest ModelSampling* node and
-    return its `shift`, resolving a linked shift (e.g. a slider) to a scalar.
-
-    MoE workflows (Wan2.2) run a high-noise and a low-noise pass with separate
-    ModelSampling nodes, so resolving shift PER sampler lets the HIGH/LOW cards each
-    show their own value instead of sharing one global shift. Returns None when no
-    shift is found in the chain."""
     ref = model_ref
     seen: set[str] = set()
-    for _ in range(16):  # bounded walk; real model chains are short
+    for _ in range(16):
         ref = _demux_pipe_ref(prompt, ref)
         if not (isinstance(ref, list) and len(ref) >= 1):
             return None
@@ -1008,7 +869,7 @@ def _trace_model_shift(prompt: dict, model_ref: Any) -> float | None:
         ct = str(node.get("class_type", "")).lower()
         if "modelsampling" in ct and "shift" in inputs:
             shift = inputs.get("shift")
-            if isinstance(shift, list):  # widget converted to a link (slider, math, …)
+            if isinstance(shift, list):
                 shift = _resolve_scalar_smart(prompt, shift)
             return _safe_float(shift)
         nxt = inputs.get("model")
@@ -1020,12 +881,8 @@ def _trace_model_shift(prompt: dict, model_ref: Any) -> float | None:
         ref = nxt
     return None
 
-
 def _collect_model_chain_nids(prompt: dict, model_ref: Any, max_depth: int = 24) -> list[str]:
-    """Walk a sampler's MODEL input upstream (through LoRA loaders, patches,
-    reroutes) and return every node id on the chain. Same traversal as
-    _trace_model_shift, but it accumulates the loader/patcher nodes instead of a
-    shift value. Used to attribute each loader to the sampler pass it feeds."""
+    """Every node a model passed through, from the sampler back to its loader."""
     nids: list[str] = []
     ref = model_ref
     seen: set[str] = set()
@@ -1051,12 +908,6 @@ def _collect_model_chain_nids(prompt: dict, model_ref: Any, max_depth: int = 24)
                     nxt = inputs.get(_k)
                     break
         if not isinstance(nxt, list):
-            # A model link routed through a switch/reroute carries no "model"-named
-            # input (rgthree Any Switch uses any_01/any_02/…). Follow the branch
-            # live_switch_branch designates so the walk reaches the loader
-            # behind the switch, matching _walk_model_loaders / resolve_link.
-            # Otherwise the chain dead-ends at the switch and a DiffusionModelLoader
-            # behind it is never attributed to its sampler pass.
             ct = str(node.get("class_type", ""))
             ct_l = ct.lower()
             try:
@@ -1072,10 +923,6 @@ def _collect_model_chain_nids(prompt: dict, model_ref: Any, max_depth: int = 24)
                         nxt = v
                         break
             elif "context" in ct_l:
-                # rgthree Context/Context Big carry the model inside the bundle:
-                # a connected model input overrides, otherwise it inherits
-                # through the base context link. Without this the chain
-                # dead-ends at the carrier and loses loader attribution.
                 for _k in ("base_ctx", "ctx", "context"):
                     if isinstance(inputs.get(_k), list):
                         nxt = inputs.get(_k)
@@ -1083,21 +930,15 @@ def _collect_model_chain_nids(prompt: dict, model_ref: Any, max_depth: int = 24)
         ref = nxt
     return nids
 
-
 def _compute_high_low_roles(prompt: dict, sampler_passes: list[dict],
                             model_loader_ids: dict[str, str]) -> dict[str, str]:
-    """Tag the loader nodes feeding each sampler pass with a "high"/"low" role,
-    derived purely from graph topology (no filename/title parsing).
+    """Label the passes of a two model run as the high and the low noise half.
 
-    Genuine Wan2.2-style MoE runs a high-noise pass (start_at_step 0, adds noise,
-    latent from an empty/created node) and a low-noise pass (starts later, no added
-    noise, latent continued from the high pass) on TWO SEPARATE base models. Each
-    pass is classified, then the high and low passes are REQUIRED to resolve to
-    DIFFERENT base-model loaders, so a single model split across two passes
-    (split-sampling, or a refiner on one model) is not mislabeled high/low. Returns
-    {loader_node_id: "high"|"low"}, empty unless a real high/low split on separate
-    base models is found; also stamps p["role"] on each pass (for the sampler
-    cards). A loader feeding both sides is dropped as ambiguous."""
+    A pass that adds no noise, starts partway through the schedule, or takes its
+    latent from another pass, is the low noise one. The labels are only returned
+    when both halves are present, every pass reaches a model loader, and the two
+    halves share none.
+    """
     if not sampler_passes:
         return {}
     sampler_nids = {p["nid"] for p in sampler_passes}
@@ -1113,17 +954,13 @@ def _compute_high_low_roles(prompt: dict, sampler_passes: list[dict],
             pass
         lat = p.get("latent_ref")
         if isinstance(lat, list) and lat and str(lat[0]) in sampler_nids:
-            return "low"  # continues another sampler's latent
+            return "low"
         return "high"
 
     roles = {p["nid"]: _role(p) for p in sampler_passes}
     if "high" not in roles.values() or "low" not in roles.values():
         return {}
 
-    # Resolve each pass's MODEL chain once, and the base-model loader(s) on it.
-    # A custom-sampler pass has no model input of its own; its model arrives
-    # through the guider, so fall back to the guider's model source the same
-    # way _resolve_active_model_loaders does.
     def _model_src(p: dict):
         src = p.get("model_ref")
         if not isinstance(src, list):
@@ -1137,21 +974,11 @@ def _compute_high_low_roles(prompt: dict, sampler_passes: list[dict],
     for p in sampler_passes:
         models = {n for n in pass_chains[p["nid"]] if n in model_loader_ids}
         if not models:
-            # A pass whose chain reaches no loader cannot be placed on either
-            # side; confirming MoE from the remaining passes risks pairing an
-            # unrelated pass's model against it (e.g. a post-process pass
-            # posing as the whole high side while the real one sits behind
-            # a dangling context link).
             return {}
         (hi_models if roles[p["nid"]] == "high" else lo_models).update(models)
-    # Require a confirmed SEPARATE base model on each side. If a base model feeds
-    # both sides, or a side has no resolvable base model (e.g. hidden behind a
-    # switch), fall back to name-based pairing rather than risk a false label.
     if not (hi_models and lo_models) or (hi_models & lo_models):
         return {}
 
-    # Confirmed MoE: stamp each pass (for the sampler cards) and attribute the
-    # loaders on each chain. The caller copies p["role"] onto samplers_found.
     for p in sampler_passes:
         p["role"] = roles[p["nid"]]
     role_map: dict[str, str] = {}
@@ -1167,14 +994,8 @@ def _compute_high_low_roles(prompt: dict, sampler_passes: list[dict],
         role_map.pop(nid, None)
     return role_map
 
-
 def _walk_model_loaders(prompt: dict, start_ref: Any, model_loader_ids: dict[str, str],
                         max_nodes: int = 96) -> set[str]:
-    """BFS from a model link to the terminal model-loader node ids it feeds.
-    At a SWITCH only the branch live_switch_branch selects is followed (the
-    first branch that carries anything at run time). Reroutes pass through;
-    every other node follows ALL its model-ish inputs so model MERGES
-    aren't lost."""
     found: set[str] = set()
     queue: list = [start_ref]
     seen: set[str] = set()
@@ -1204,10 +1025,6 @@ def _walk_model_loaders(prompt: dict, start_ref: Any, model_loader_ids: dict[str
         except Exception:
             role = None
         if role == "switch" or "switch" in ct_l:
-            # live_switch_branch skips a provably empty branch so a dead
-            # context carrier no longer masks the real chain. The name test
-            # also catches classes that classify as something else, keeping
-            # this gate aligned with the sibling walkers.
             sel = comfy_graph.live_switch_branch(
                 prompt, node, comfy_graph.get_registry())
             if sel is not None:
@@ -1225,10 +1042,6 @@ def _walk_model_loaders(prompt: dict, start_ref: Any, model_loader_ids: dict[str
                 if isinstance(v, list) and len(v) >= 1:
                     queue.append(v)
                     followed = True
-            # rgthree Context/Context Big carry the model inside the bundle:
-            # a connected model input overrides, otherwise it inherits
-            # through the base context link. Without this the walk dead-ends
-            # at the carrier and the pass loses its loader chain.
             if not followed and "context" in ct_l:
                 for k in ("base_ctx", "ctx", "context"):
                     v = inputs.get(k)
@@ -1237,14 +1050,11 @@ def _walk_model_loaders(prompt: dict, start_ref: Any, model_loader_ids: dict[str
                         break
     return found
 
-
 def _resolve_active_model_loaders(prompt: dict, sampler_passes: list[dict],
                                   model_loader_ids: dict[str, str]) -> tuple[set[str], bool]:
-    """Resolve the set of model-loader node ids the SAMPLERS actually use, walking
-    switch-aware from each sampler's model source (its `model` input, or the
-    `guider`'s model for custom samplers). Returns (active_ids, safe_to_filter):
-    safe is True only when EVERY sampler resolved to at least one loader, so the
-    caller never trims a model when a sampler's model path can't be followed."""
+    """A graph may load models it never samples with. Narrowing the list to the
+    ones reached is only safe once every pass resolved to at least one loader.
+    """
     active: set[str] = set()
     safe = True
     saw_any = False
@@ -1253,24 +1063,21 @@ def _resolve_active_model_loaders(prompt: dict, sampler_passes: list[dict],
         if not isinstance(src, list):
             src = _guider_model_src(prompt, p.get("guider_ref"))
         if not isinstance(src, list):
-            safe = False           # a sampler whose model source we can't even find
+            safe = False
             continue
         saw_any = True
         loaders = _walk_model_loaders(prompt, src, model_loader_ids)
         if loaders:
             active |= loaders
         else:
-            safe = False           # couldn't reach a loader for this sampler
+            safe = False
     return active, (safe and saw_any and bool(active))
-
 
 def _trace_pass_lineage(prompt: dict, start_nid: str, pass_nids: set[str],
                         max_nodes: int = 400) -> set[str]:
-    """Return the node ids upstream of one sampler pass, following every input
-    link (pipe-demux aware) but stopping AT any other sampler pass: that pass
-    is recorded, its subtree is not walked. So the result names the nodes and
-    the earlier passes this pass directly consumes, which is what separates a
-    base pass (consumes no other pass) from a post-process pass."""
+    """Another pass is recorded and not walked through, so what comes back is the
+    work this pass added plus the passes it was handed.
+    """
     start = prompt.get(start_nid)
     ins = start.get("inputs") if isinstance(start, dict) else None
     queue = [v for v in ins.values() if isinstance(v, list) and v] if isinstance(ins, dict) else []
@@ -1284,7 +1091,7 @@ def _trace_pass_lineage(prompt: dict, start_nid: str, pass_nids: set[str],
             continue
         visited.add(nid)
         if nid in pass_nids:
-            continue  # record the other pass, do not walk into its subtree
+            continue
         node = prompt.get(nid)
         nins = node.get("inputs") if isinstance(node, dict) else None
         if isinstance(nins, dict):
@@ -1293,15 +1100,9 @@ def _trace_pass_lineage(prompt: dict, start_nid: str, pass_nids: set[str],
                     queue.append(v)
     return visited
 
-
 _INTERP_CLASS_PATTERNS = ("interpolat", "vfi", "rife")
 
-
 def _stage_from_lineage(prompt: dict, lineage: set[str]) -> str | None:
-    """Classify a post-process pass by the transform node on the path back to
-    the pass it continues. Returns "interpolation" or "upscale", or None when
-    the path holds neither (a plain continuation such as a video segment or a
-    MoE low-noise pass), so only genuine stages are labeled."""
     stage = None
     for nid in lineage:
         node = prompt.get(nid)
@@ -1311,7 +1112,6 @@ def _stage_from_lineage(prompt: dict, lineage: set[str]) -> str | None:
         if any(p in ct for p in _INTERP_CLASS_PATTERNS):
             return "interpolation"
         if ("upsampl" in ct or "upscale" in ct) and "loader" not in ct:
-            # An upsampler loading a "temporal" model interpolates frames.
             um = (node.get("inputs") or {}).get("upscale_model")
             if isinstance(um, list):
                 un = _resolve_ref(prompt, um)
@@ -1321,43 +1121,21 @@ def _stage_from_lineage(prompt: dict, lineage: set[str]) -> str | None:
             stage = "upscale"
     return stage
 
-
-# Model-file markers used to spot the filename param on a custom encoder/loader
-# leaf node (e.g. a custom LLM-encoder node whose model param is a .gguf file).
 _MODEL_FILE_EXTS = (".safetensors", ".gguf", ".ckpt", ".pt", ".pth", ".bin", ".sft", ".onnx")
-# CLIP/encoder names that are taggers/captioners rather than generation text-encoders.
+# Encoder names belonging to taggers and captioners, excluded from the text encoders.
 _CLIP_TAGGER_PATTERNS = ("joytag", "joytagg", "florence", "blip", "tagger",
                          "captioner", "caption", "wd14", "recognize")
-# Reference-input keys that carry a CLIP/text-encoder (resolved to the loader
-# filename in generic node capture so a node shows which encoder it used).
 _CLIP_INPUT_KEYS = {"clip", "clip_l", "clip_g", "clip1", "clip2"}
-
 
 def _looks_like_model_file(v: Any) -> bool:
     if not isinstance(v, str):
         return False
     return ("/" in v or "\\" in v) or v.lower().endswith(_MODEL_FILE_EXTS)
 
-
 def _resolve_clip_source(prompt: dict, clip_ref: Any, max_nodes: int = 80) -> tuple[list[str], bool, list[str]]:
-    """Follow a text-encoder's `clip` link back to the loader(s) that supplied it.
-
-    Returns (clip_names, baked_in, projection_names). Walks passthroughs
-    (clip/clip1/clip2, rgthree Context base_ctx/ctx, Crystools pipe bundles,
-    the switch branch live_switch_branch designates, reroute) to the
-    terminal source:
-      - a checkpoint loader yields no name, since the CLIP is baked into the
-        checkpoint with no separate file (baked_in=True);
-      - a CLIP loader yields its clip_name / clip_name1..4; a DualCLIPLoader
-        of type ltxv carries the text-projection file in clip_name2, reported
-        in projection_names so the UI can label it separately;
-      - a custom encoder leaf (no clip-ish ref input, e.g. a custom LLM
-        encoder) yields its first model-file-like string param, with a
-        text_projection widget likewise split into projection_names.
-
-    Reported instead of scanning every CLIPLoader, so a CLIPLoader feeding a
-    separate LLM/TextGenerate node is NOT mistaken for the image's CLIP, and a
-    custom-node CLIP is found. Tagger/captioner names are filtered out."""
+    """Returns the encoder names, whether the walk ended at a checkpoint that has
+    its encoder baked in and so names no file, and any text projection files.
+    """
     names: list[str] = []
     projections: list[str] = []
     baked = False
@@ -1381,12 +1159,13 @@ def _resolve_clip_source(prompt: dict, clip_ref: Any, max_nodes: int = 80) -> tu
             continue
         ct = str(node.get("class_type", ""))
         ct_l = ct.lower()
-        # Terminal: CLIP baked into the checkpoint, with no separate file.
         if "checkpointloader" in ct_l:
             baked = True
             continue
         if ("cliploader" in ct_l or "dualcliploader" in ct_l
                 or "tripleclip" in ct_l or "quadruplecliploader" in ct_l):
+            # A dual loader set to ltxv takes a text encoder in its first slot
+            # and a text projection in its second.
             _ltxv_dual = ("dualcliploader" in ct_l
                           and str(inputs.get("type", "")).lower() == "ltxv")
             for k in ("clip_name", "clip_name1", "clip_name2", "clip_name3", "clip_name4"):
@@ -1415,11 +1194,10 @@ def _resolve_clip_source(prompt: dict, clip_ref: Any, max_nodes: int = 80) -> tu
                 _role = comfy_graph.classify(ct, comfy_graph.get_registry().sig(ct))
             except Exception:
                 _role = None
+            # A switch counts as followed even where no branch can be chosen,
+            # since the leaf scan below would take its own widgets for encoder
+            # file names.
             if _role == "switch" or "switch" in ct_l:
-                # live_switch_branch decides which input the run forwarded,
-                # skipping a provably empty branch. A recognized switch ends
-                # the walk here even when undecidable, since falling through
-                # to the leaf scan would read its own widgets as encoder files.
                 followed = True
                 sel = comfy_graph.live_switch_branch(
                     prompt, node, comfy_graph.get_registry())
@@ -1431,10 +1209,8 @@ def _resolve_clip_source(prompt: dict, clip_ref: Any, max_nodes: int = 80) -> tu
                         queue.append(v)
                         followed = True
                         break
-        # Leaf custom encoder/loader: read a model-file-like string param. A
-        # text_projection widget alongside it (loaders that combine the
-        # encoder and its projection file in one node) is split out so the
-        # projection file is never mistaken for the encoder model.
+        # A loader from a node pack names its file in a widget of its own, so
+        # the value that looks like a model path is the encoder.
         if not followed:
             _proj = inputs.get("text_projection")
             if _looks_like_model_file(_proj):
@@ -1457,14 +1233,7 @@ def _resolve_clip_source(prompt: dict, clip_ref: Any, max_nodes: int = 80) -> tu
             proj_out.append(n)
     return out, baked, proj_out
 
-
 def _resolve_vae_source(prompt: dict, vae_ref: Any, max_nodes: int = 40) -> str | None:
-    """Follow a consumer's `vae` link back to the loader that supplied it.
-
-    Walks wrapper/patch nodes (anything passing a vae-ish link through),
-    Crystools pipe bundles, rgthree Context bundles, switches and reroutes.
-    A VAELoader terminal yields its vae_name; a checkpoint loader yields
-    None, since that VAE is baked in with no separate file."""
     queue: list = [vae_ref]
     seen: set[str] = set()
     steps = 0
@@ -1490,6 +1259,7 @@ def _resolve_vae_source(prompt: dict, vae_ref: Any, max_nodes: int = 40) -> str 
             if isinstance(v, str) and v.strip():
                 return v.strip()
             continue
+        # A checkpoint's VAE is inside the checkpoint and has no name of its own.
         if "checkpointloader" in ct_l:
             continue
         followed = False
@@ -1522,7 +1292,6 @@ def _resolve_vae_source(prompt: dict, vae_ref: Any, max_nodes: int = 40) -> str 
                         break
     return None
 
-
 def _find_input_name_in_chain(prompt: dict, start_ref: Any, input_key: str, max_depth: int = 5) -> str | None:
     ref = start_ref
     for _ in range(max_depth):
@@ -1546,12 +1315,9 @@ def _find_input_name_in_chain(prompt: dict, start_ref: Any, input_key: str, max_
             break
     return None
 
-
 def _find_preprocessor_in_chain(prompt: dict, start_ref: Any, max_depth: int = 8) -> str | None:
-    """Follow the 'image' input chain to find a ControlNet preprocessor node.
-
-    Handles AIO_Preprocessor (reads its 'preprocessor' string input),
-    and follows through switch/reroute nodes by trying all reference inputs.
+    """The all-in-one preprocessor names its choice in a widget. Every other one is
+    a node per method, so the class name is the answer.
     """
     PREPROCESSOR_KEYWORDS = {
         "canny", "depth", "openpose", "lineart", "hed", "scribble", "tile",
@@ -1560,7 +1326,6 @@ def _find_preprocessor_in_chain(prompt: dict, start_ref: Any, max_depth: int = 8
         "recolor", "metric3d", "dsine", "diffusion_edge", "preprocessor",
     }
 
-    # BFS to handle switch nodes with multiple outputs
     queue: list[tuple[Any, int]] = [(start_ref, 0)]
     visited: set[str] = set()
 
@@ -1595,7 +1360,6 @@ def _find_preprocessor_in_chain(prompt: dict, start_ref: Any, max_depth: int = 8
             img_ref = inputs.get("image")
             if isinstance(img_ref, list):
                 queue.append((img_ref, depth + 1))
-            # Also follow any other reference inputs (switch nodes: any_01, any_02, etc.)
             for key, val in inputs.items():
                 if key == "image":
                     continue
@@ -1604,16 +1368,12 @@ def _find_preprocessor_in_chain(prompt: dict, start_ref: Any, max_depth: int = 8
 
     return None
 
-
 _TEXT_INPUT_KEYS = ("text", "string", "value", "text_positive", "text_negative",
                     "prompt", "text_input", "text_output", "text_0", "text_1",
                     "input_text", "prompt_text")
 
-# Link keys that carry NON-text data. The text resolver must not follow these:
-# a node fed by both a text source and an image would otherwise wander up the
-# image's chain into the sampler and return that generation's prompt (e.g. a
-# SpeechBubble whose text comes from a runtime LLM was resolving to the negative
-# prompt via the LLM's image input).
+# A node fed by both a text source and an image would otherwise be walked up
+# the image side, which arrives at the prompt that made that image.
 _NON_TEXT_LINK_KEYS = {
     "image", "images", "pixels", "model", "clip", "vae", "latent", "samples",
     "mask", "conditioning", "positive", "negative", "control_net", "controlnet",
@@ -1621,52 +1381,35 @@ _NON_TEXT_LINK_KEYS = {
     "clip_vision", "ipadapter", "style_model", "gligen", "upscale_model",
 }
 
-# Nodes whose text OUTPUT is generated at runtime (VLM/LLM captioners). Their
-# output string is not in the saved file, so a text chain that reaches one stops
-# there rather than descending into its inputs (which would surface its system/
-# instruction prompt, or an unrelated upstream prompt). Recover the real output
-# from the matching ShowText/display node's widgets_values instead.
+# These write their text while the graph runs, so the file holds their settings
+# and never the words they produced.
 _RUNTIME_TEXT_NODE_PATTERNS = ("llava", "vlm", "llamasampler", "joycaption",
                                "florence", "cogvlm", "minicpm", "internvl",
                                "qwenvl", "ollama", "promptenhancer",
                                "textgenerate", "llmsampler")
 
-
 def _is_runtime_text_node(class_type: str) -> bool:
     ct = str(class_type).lower().replace(" ", "").replace("_", "")
     return any(p in ct for p in _RUNTIME_TEXT_NODE_PATTERNS)
 
-
-# Display/passthrough nodes (ShowText and friends). Their text widget holds a
-# SNAPSHOT of whatever the node displayed when the run was queued. On video
-# saves that snapshot sits one queue behind whenever the upstream generator
-# re-ran; image saves carry the current run's text.
+# A display node keeps the text it last showed in its own widget, which is the
+# only place a run time value is written down.
 _SHOW_TEXT_NODE_PATTERNS = ("showtext", "showanything", "display", "textoutput",
                             "stringoutput", "debugtext", "showstring", "show_text",
                             "display_text", "text_display", "previewtext",
                             "was_text", "easy_showanything")
 
-
 def _is_show_text_node(class_type: str) -> bool:
     ct = str(class_type).lower().replace(" ", "").replace("_", "")
     return any(p in ct for p in _SHOW_TEXT_NODE_PATTERNS)
 
-
 def _resolve_text_recursive(prompt: dict, start_ref: Any, max_depth: int = 8) -> str | None:
-    """Recursively follow node reference chains to find a text string value.
-
-    Handles: Any Switch (rgthree), TextVersions, TextVersionsPro, ShowText,
-    PrimitiveStringMultiline, String Literal, SimpleText, easy ifElse, Reroute,
-    and any other node with common text keys.
+    """A display node's own text is held back as a fallback. Once the walk reaches
+    a node that generates its text at run time, even that fallback is given up,
+    since it would then be the text of some earlier run.
     """
     queue: list[tuple[Any, int]] = [(start_ref, 0)]
     visited: set[str] = set()
-    # A display node's own widget text, kept aside while its live link is
-    # preferred. Used only if the whole walk finds nothing AND the walk never
-    # reached a runtime generator, so a prompt that exists solely as a display
-    # snapshot is never dropped. An enhancer's capture never comes back through
-    # this fallback, since that walk reaches the generator; the enhancer path
-    # recovers the capture itself and decides where it belongs.
     snapshot_fallback: str | None = None
     reached_runtime = False
 
@@ -1688,22 +1431,10 @@ def _resolve_text_recursive(prompt: dict, start_ref: Any, max_depth: int = 8) ->
         if not isinstance(inputs, dict):
             continue
 
-        # A runtime text generator (LLaVA/LLM/captioner) produces its text when
-        # the workflow runs, so it is NOT in the file. Stop BEFORE reading its own
-        # literal prompt/system widgets (a node fed by an LLM must not resolve to
-        # the LLM's instruction prompt) and before descending into its inputs,
-        # which would surface an unrelated upstream prompt. The real output
-        # lives in a ShowText/display node's widgets_values, recovered separately.
         if _is_runtime_text_node(node.get("class_type", "")):
             reached_runtime = True
             continue
 
-        # An inline ShowText/display node prefers its LIVE link over its widget
-        # snapshot, which can reflect the queue before. The widget is remembered
-        # as a fallback: when the link yields no stored text (a styles selector
-        # or tag rewriter computes its output, an LLM generates it), the
-        # snapshot is the sole record of the prompt in the file and losing it
-        # would blank the panel.
         _has_link = any(isinstance(v, list) and len(v) >= 2 for v in inputs.values())
         if _has_link and _is_show_text_node(node.get("class_type", "")):
             if snapshot_fallback is None:
@@ -1724,8 +1455,6 @@ def _resolve_text_recursive(prompt: dict, start_ref: Any, max_depth: int = 8) ->
             if isinstance(val, str) and val.strip():
                 return val
 
-        # Follow only TEXT-ish reference inputs (switch/reroute/concat chains),
-        # never image/model/conditioning links.
         for key, val in inputs.items():
             if str(key).lower() in _NON_TEXT_LINK_KEYS:
                 continue
@@ -1734,21 +1463,13 @@ def _resolve_text_recursive(prompt: dict, start_ref: Any, max_depth: int = 8) ->
 
     return None if reached_runtime else snapshot_fallback
 
-
-# Scalar link resolution (numbers fed through slider/math/reroute chains)
-
 _MATH_FUNCS: dict[str, Any] = {
     "min": min, "max": max, "abs": abs, "round": round,
     "floor": math.floor, "ceil": math.ceil,
 }
 
-
 def _safe_eval_expr(expr: str, variables: dict[str, int | float]) -> int | float | None:
-    """Evaluate a simple arithmetic expression (MathExpression-style nodes)
-    without eval()/compile(). Whitelisted AST only: numbers, the given
-    variables, + - * / // % **, unary +/-, and min/max/abs/round/floor/ceil.
-    Returns None on anything else, oversized input, or a non-finite result.
-    """
+    """Evaluate an arithmetic expression that came out of the file."""
     if not isinstance(expr, str) or not expr.strip() or len(expr) > 200:
         return None
     try:
@@ -1792,7 +1513,6 @@ def _safe_eval_expr(expr: str, variables: dict[str, int | float]) -> int | float
             if isinstance(op, ast.Mod):
                 return left % right
             if isinstance(op, ast.Pow):
-                # Bound to keep results sane and cheap
                 if abs(right) > 16 or abs(left) > 1e6:
                     raise ValueError("pow out of bounds")
                 return left ** right
@@ -1814,26 +1534,25 @@ def _safe_eval_expr(expr: str, variables: dict[str, int | float]) -> int | float
         return None
     return result
 
-
-def _normalize_number(x: int | float) -> int | float:
-    """Turn 16.0 into 16; long floats rounded to 4 decimals for display."""
+# A whole float reads as a count in the panel, so it goes in as an integer.
+def _normalize_number(x: int | float) -> int | float | None:
+    """None for an infinity or a not-a-number, which a file can carry since
+    the JSON reader accepts the bare words, and which no field can hold."""
     if isinstance(x, float):
+        if not math.isfinite(x):
+            return None
         if x == int(x) and abs(x) < 1e12:
             return int(x)
         return round(x, 4)
     return x
 
-
-# Math/evaluate nodes whose output we can compute from their expression input.
 _MATH_NODE_PATTERNS = ("mathexpression", "simplemath", "mathformula",
                        "evaluateinteger", "evaluatefloat")
 _MATH_EXPR_KEYS = ("expression", "expr", "formula", "python_expression")
 
-
 def _is_math_node(class_type: str) -> bool:
     ct = str(class_type).lower().replace(" ", "").replace("_", "")
     return any(p in ct for p in _MATH_NODE_PATTERNS)
-
 
 def _eval_math_node(prompt: dict, node: dict, max_depth: int = 8) -> int | float | None:
     inputs = node.get("inputs", {})
@@ -1847,8 +1566,8 @@ def _eval_math_node(prompt: dict, node: dict, max_depth: int = 8) -> int | float
             break
     if expr is None:
         return None
-    # Variable inputs may be plain ("a") or prefixed ("values.a" in
-    # ComfyMathExpression), so match on the last dot-segment.
+    # The expression refers to its inputs as a, b, c and d, which is what those
+    # sockets are named.
     variables: dict[str, int | float] = {}
     for k, v in inputs.items():
         name = str(k).rsplit(".", 1)[-1].lower()
@@ -1863,18 +1582,12 @@ def _eval_math_node(prompt: dict, node: dict, max_depth: int = 8) -> int | float
     result = _safe_eval_expr(expr, variables)
     return None if result is None else _normalize_number(result)
 
-
-# Value-ish input keys checked (in priority order) when resolving a link
-# back to a concrete literal.
 _SCALAR_VALUE_KEYS = ("value", "Value", "int", "float", "number", "num",
                       "seed", "noise_seed", "steps", "cfg", "fps",
                       "Xi", "Xf", "x", "text", "string")
 
-# Preferred pass-through inputs when traversing reroute/switch/get-set nodes.
 _PASSTHROUGH_PRIORITY_KEYS = ("value", "input", "any", "any_01", "source", "signal")
 
-# Input names that carry tensors/objects (model, latent, conditioning, …).
-# These are never worth resolving to a scalar, so skip the BFS entirely.
 _NON_SCALAR_INPUT_KEYS = {
     "model", "clip", "vae", "latent", "latent_image", "samples", "image", "images",
     "conditioning", "mask", "audio", "sigmas", "noise", "guider", "sampler",
@@ -1885,26 +1598,23 @@ _NON_SCALAR_INPUT_KEYS = {
     "positive", "negative",
 }
 
-# Nodes whose outputs are computed AT RUNTIME from their inputs (image/video
-# measurements). Their value cannot be known from the stored workflow. A
-# chain that reaches one must stop and report nothing; walking past it would
-# land on an unrelated upstream literal (e.g. WanImageToVideo.width linked to
-# GetImageSize would "resolve" to whatever number sat above the image).
+# These measure something the run produced, so their stored inputs say nothing
+# about the number they handed on.
 _RUNTIME_OUTPUT_NODE_PATTERNS = (
     "getimagesize", "getresolution", "getvideoinfo", "getimagesizeandcount",
     "imagesizetonumber", "getlatentsize", "imagedimensions",
 )
 
-
 def _is_runtime_output_node(class_type: str) -> bool:
     ct = str(class_type).lower().replace(" ", "").replace("_", "")
     return any(p in ct for p in _RUNTIME_OUTPUT_NODE_PATTERNS)
 
-
 def _resolve_scalar_smart(prompt: dict, ref: Any) -> int | float | str | bool | None:
-    """Resolve a linked scalar with the signature-aware pure-value resolver;
-    fall back to the legacy BFS only when the chain crosses node types the
-    registry doesn't know (uninstalled packs in old files)."""
+    """Only a node the registry has no signature for, answered UNKNOWN, falls back
+    to the walk over literals. UNRESOLVED and NO_VALUE are final, since a value
+    computed at run time, split between branches or never set has no literal in
+    the file that stands for it.
+    """
     r = comfy_graph.resolve_link(prompt, ref, comfy_graph.get_registry())
     if r is comfy_graph.UNKNOWN:
         return _resolve_scalar_ref(prompt, ref)
@@ -1912,16 +1622,9 @@ def _resolve_scalar_smart(prompt: dict, ref: Any) -> int | float | str | bool | 
         return None
     return r
 
-
 def _resolve_scalar_ref(prompt: dict, start_ref: Any, max_depth: int = 8) -> int | float | str | bool | None:
-    """Follow a node reference chain to a concrete scalar value.
-
-    Math-expression nodes are evaluated to their computed output (so e.g. a
-    slider feeding MathExpression feeding WanImageToVideo.fps resolves to the
-    FINAL fps).
-    Reroute/switch/converter nodes are passed through (BFS, cycle-safe).
-    If no value-ish key is found, falls back to the first literal seen
-    anywhere along the chain, else None.
+    """Any literal but the usual value names is kept as a fallback while the walk
+    carries on, so a passthrough that only forwards a value does not end it.
     """
     queue: list[tuple[Any, int]] = [(start_ref, 0)]
     visited: set[str] = set()
@@ -1944,9 +1647,6 @@ def _resolve_scalar_ref(prompt: dict, start_ref: Any, max_depth: int = 8) -> int
         if not isinstance(inputs, dict):
             continue
 
-        # Runtime-measured nodes (GetImageSize etc.): the real value is not in
-        # the file. Stop this branch, because returning an upstream literal
-        # would be a confidently wrong number.
         if _is_runtime_output_node(node.get("class_type", "")):
             continue
 
@@ -1954,7 +1654,6 @@ def _resolve_scalar_ref(prompt: dict, start_ref: Any, max_depth: int = 8) -> int
             result = _eval_math_node(prompt, node, max_depth=max_depth - depth)
             if result is not None:
                 return result
-            # eval failed, so fall through to this node's inputs (nearest literal)
 
         for k in _SCALAR_VALUE_KEYS:
             v = inputs.get(k)
@@ -1984,19 +1683,11 @@ def _resolve_scalar_ref(prompt: dict, start_ref: Any, max_depth: int = 8) -> int
 
     return fallback
 
-
-# Shared with comfy_graph (identical WxH-combo pattern) so the legacy and
-# signature-driven resolvers can't diverge on what counts as a dimension string.
 _DIM_STRING_RE = comfy_graph._DIM_STRING_RE
 
-
 def _resolve_dimension_ref(prompt: dict, ref: Any, axis: int) -> int | None:
-    """Resolve a linked width/height input to a number.
-
-    axis: 0 = width, 1 = height. Resolution-picker nodes (SDXL Resolutions
-    (JPS), CR Aspect Ratio, …) hold one combo STRING like "portrait -
-    832x1216 (2:3)" and output (width, height) on separate slots, so parse the
-    string and pick the side indicated by the link's output slot.
+    """A resolution picker hands on a single string such as 1024x1024, and the
+    output slot says which half this link takes.
     """
     v = _resolve_scalar_ref(prompt, ref)
     if isinstance(v, (int, float)) and not isinstance(v, bool):
@@ -2015,18 +1706,8 @@ def _resolve_dimension_ref(prompt: dict, ref: Any, axis: int) -> int | None:
                     return int(m.group(1 if slot == 0 else 2))
     return None
 
-
 def _chain_reaches(prompt: dict, start_ref: Any, patterns: tuple[str, ...], max_depth: int = 12,
                    accept_decoder: bool = False) -> bool:
-    """BFS upstream through reference inputs: True if the chain contains a node
-    whose class_type matches any pattern. Used to tell POST-generation resizes
-    (image path comes out of a VAEDecode / model upscaler) from input-prep
-    resizes (load image, resize it, encode it), which aren't upscaling output.
-
-    With accept_decoder, a node whose registry signature takes a LATENT and
-    produces an IMAGE also counts. Wrapper packs name their decoders freely
-    (WanVideoDecode, tiled variants), so the structural test covers what the
-    name patterns cannot."""
     queue: list[tuple[Any, int]] = [(start_ref, 0)]
     visited: set[str] = set()
     while queue:
@@ -2055,18 +1736,13 @@ def _chain_reaches(prompt: dict, start_ref: Any, patterns: tuple[str, ...], max_
                     queue.append((v, depth + 1))
     return False
 
-
-def _feeds_upscaler_first(prompt: dict, start_nid: str, max_steps: int = 400) -> bool:
-    """True when the node's output reaches an upscaler before any encoder or
-    sampler. A resize FEEDING an upscaler is a stage of the upscale pipeline
-    (load, normalize, upscale, save), while one feeding an encoder prepares
-    sampler input and is not upscaling output. Walked over explicit links."""
-    consumers: dict[str, list[str]] = {}
-    for nid, nd in prompt.items():
-        if isinstance(nd, dict) and isinstance(nd.get("inputs"), dict):
-            for v in nd["inputs"].values():
-                if isinstance(v, list) and v:
-                    consumers.setdefault(str(v[0]), []).append(str(nid))
+def _feeds_upscaler_first(prompt: dict, start_nid: str, max_steps: int = 400,
+                          consumers: dict[str, list[str]] | None = None) -> bool:
+    """The walk runs forward through the consumers and stops at a re-encode or a
+    sampler, since past one of those the picture is being generated again.
+    """
+    if consumers is None:
+        consumers = comfy_graph._build_consumers(prompt)
     seen: set[str] = set()
     stack = [str(start_nid)]
     steps = 0
@@ -2084,31 +1760,22 @@ def _feeds_upscaler_first(prompt: dict, start_nid: str, max_steps: int = 400) ->
             if "upscale" in ctl or "upsampl" in ctl:
                 return True
             if "vaeencode" in ctl or "sampler" in ctl:
-                continue  # this path prepares sampler input; do not cross it
+                continue
             stack.append(cnid)
     return False
 
-
 def _switch_active_ref(prompt: dict, node: dict) -> Any:
-    """The input ref a switch statically forwards, or None when the choice
-    cannot be decided and every input must be treated as live. Delegates to
-    comfy_graph.live_switch_branch so branch selection stays in one place:
-    a decidable selector designates its branch, an undecidable one comes
-    back None, and every other switch takes its first non-empty input
-    (falling back to the first connected input if all branches are empty)."""
     ref = comfy_graph.live_switch_branch(prompt, node, comfy_graph.get_registry())
     return ref if isinstance(ref, list) and len(ref) >= 1 else None
 
-
 def _switched_off_nids(prompt: dict, nids: set[str]) -> set[str]:
-    """The subset of `nids` whose output can only reach the rest of the graph
-    through a switch input the switch does not forward. An upscaler or
-    interpolator parked on the unselected branch of a test switch executes on
-    paper and contributes nothing to the saved file, so its entries must not
-    display. Fail-open: with implicit-link nodes present (broadcasts, Set/Get
-    wires), explicit reachability is incomplete and nothing is reported off."""
+    """A node counts as off when it can reach an output with the switches ignored
+    and cannot reach one with the switches obeyed.
+    """
     if not nids:
         return set()
+    # Nodes that pass values around without links leave the consumer map
+    # incomplete, so nothing can be called unreachable.
     if comfy_graph.has_implicit_links(prompt, comfy_graph.get_registry()):
         return set()
     consumers: dict[str, list[str]] = {}
@@ -2150,13 +1817,10 @@ def _switched_off_nids(prompt: dict, nids: set[str]) -> set[str]:
                 if respect_switches and _is_switch(cnd):
                     active = _switch_active_ref(prompt, cnd)
                     if isinstance(active, list) and str(active[0]) != cur:
-                        continue  # the switch forwards a different input
+                        continue
                 stack.append(cnid)
         return False
 
-    # A node is off only when the switch is definitively what blocks it: the
-    # output is reachable ignoring switch selection and unreachable respecting
-    # it. A graph with no recognizable output node stays untouched.
     off: set[str] = set()
     for nid in nids:
         nid = str(nid)
@@ -2165,7 +1829,8 @@ def _switched_off_nids(prompt: dict, nids: set[str]) -> set[str]:
             off.add(nid)
     return off
 
-
+# A model that rewrites the prompt before it is encoded. What the user typed
+# survives upstream of it and is kept as the initial prompt.
 _VLM_ENHANCER_PATTERNS = ("llava", "vlm", "prompt_enhancer", "promptenhancer",
                           "llamasampler", "llm", "florence", "joycaption",
                           "cogvlm", "minicpm", "internvl", "qwenvl",
@@ -2174,7 +1839,6 @@ _VLM_ENHANCER_PATTERNS = ("llava", "vlm", "prompt_enhancer", "promptenhancer",
                           "gemini", "chatgpt", "claude", "openai",
                           "llmsampler", "enhanceprompt", "improve_prompt",
                           "stylize_prompt", "rewrite_prompt")
-
 
 def _find_enhancer_in_chain(prompt: dict, start_ref: Any, max_depth: int = 6) -> dict | None:
     queue: list[tuple[Any, int]] = [(start_ref, 0)]
@@ -2205,21 +1869,14 @@ def _find_enhancer_in_chain(prompt: dict, start_ref: Any, max_depth: int = 6) ->
 
     return None
 
-
 def _find_enhancer_initial_prompt(prompt: dict, text_ref: Any) -> str | None:
-    """The user's initial prompt when a prompt enhancer sits in the reference chain.
-
-    Two strategies:
-    1. The enhancer node's own inputs.
-    2. For subgraph workflows, where the text is passed in externally and the
-       enhancer's prompt input is empty, the OTHER inputs of the switch/router
-       nodes on the chain.
+    """The enhancer's own instruction widgets come first. Failing those, a switch
+    on the way in is asked for a branch that reaches no enhancer.
     """
     enhancer_node = _find_enhancer_in_chain(prompt, text_ref)
     if enhancer_node is None:
         return None
 
-    # Strategy 1: Check the enhancer node's own inputs for user prompt text
     ref_inputs = enhancer_node.get("inputs", {})
     _PROMPT_KEYS = ("user_prompt", "prompt_text", "prompt", "text", "question",
                     "instruction", "system_message", "input_text", "content")
@@ -2232,10 +1889,6 @@ def _find_enhancer_initial_prompt(prompt: dict, text_ref: Any) -> str | None:
             if resolved_init and len(resolved_init.strip()) > 5:
                 return resolved_init.strip()
 
-    # Strategy 2: The enhancer's prompt input was empty (common in subgraph workflows).
-    # Trace the reference chain from text_ref and find switch/router nodes.
-    # When a switch is found with an enhancer on one path, the OTHER path(s)
-    # likely carry the original user prompt.
     _SWITCH_PATTERNS = ("switch", "reroute", "ifelse", "if_else", "selector",
                         "mux", "router", "choose")
     queue: list[tuple[Any, int]] = [(text_ref, 0)]
@@ -2279,20 +1932,8 @@ def _find_enhancer_initial_prompt(prompt: dict, text_ref: Any) -> str | None:
 
     return None
 
-
 def _sampler_runs_no_steps(info: dict[str, Any]) -> bool:
-    """True when an Advanced KSampler's step window is empty, so it performs no
-    denoising and was not actually part of how the image was made.
-
-    ComfyUI's KSamplerAdvanced builds a sigma schedule for ``steps``, truncates
-    it at ``end_at_step``, then begins at ``start_at_step``; when
-    ``start_at_step >= min(end_at_step, steps)`` the node just returns its input
-    latent untouched. The common case is a disabled refiner pass left at
-    ``start_at_step == steps`` (e.g. start_at_step=9 with a 9-step schedule).
-
-    Conservative: fires only when start_at_step AND a real step bound are known,
-    so a plain KSampler (no start_at_step) is never dropped.
-    """
+    """Whether a pass begins at or past its own last step, and so did nothing."""
     def _num(x: Any) -> int | float | None:
         return x if isinstance(x, (int, float)) and not isinstance(x, bool) else None
 
@@ -2307,45 +1948,32 @@ def _sampler_runs_no_steps(info: dict[str, Any]) -> bool:
         return False
     return start >= last
 
-
 def _extract_from_comfyui_prompt(prompt: dict, summary: dict):
-    """Walk ComfyUI API-format prompt ({class_type, inputs} records keyed by node_id)."""
+    """Read the executed graph into the summary."""
     samplers_found: list[dict] = []
     models_found: list[str] = []
-    # CLIP is resolved by following each active text-encoder's `clip` link to its
-    # real source (see _resolve_clip_source) instead of scanning every CLIPLoader.
-    active_clip_refs: list = []               # (encoder_node_id, clip_ref) pairs
-    # VAE is likewise resolved per CONSUMER link in the merge phase: the decode
-    # chain names the video/main VAE and audio consumers name the audio VAE.
-    # The loader names collected below stay as the no-consumer fallback.
+    active_clip_refs: list = []
     main_vae_refs: list = []
     audio_vae_refs: list = []
     vae_loader_names: list[str] = []
     loras_found: list[dict] = []
-    initial_images_found: list[str] = []  # every active input image, in prompt order
-    initial_audios_found: list[str] = []  # every active input audio, in prompt order
+    initial_images_found: list[str] = []
+    initial_audios_found: list[str] = []
     controlnets_found: list[dict] = []
     adetailers_found: list[dict] = []
-    positive_texts: list[tuple[str, str]] = []  # (node_id, text)
+    positive_texts: list[tuple[str, str]] = []
     negative_texts: list[tuple[str, str]] = []
-    initial_prompts: list[tuple[str, str]] = []  # (encoder node_id, original text)
-    tags_texts: list[tuple[str, str]] = []  # (encoder node_id, song style tags)
-    lyrics_texts: list[tuple[str, str]] = []  # (encoder node_id, song lyrics)
-    enhancer_encoder_nids: list[str] = []  # encoders whose chain held an enhancer
+    initial_prompts: list[tuple[str, str]] = []
+    tags_texts: list[tuple[str, str]] = []
+    lyrics_texts: list[tuple[str, str]] = []
+    enhancer_encoder_nids: list[str] = []
     upscaling_found: list[dict] = []
     interpolation_found: list[dict] = []
     mmaudio_info: dict | None = None
-    # Side-data for topology-based HIGH/LOW role tagging (Wan2.2-style MoE): which
-    # node id loaded each base model, and each sampler pass with the step range +
-    # model/latent links needed to tell the high-noise pass from the low-noise one.
-    model_loader_ids: dict[str, str] = {}     # model names, keyed by loader node_id
-    sampler_passes: list[dict] = []           # {nid, start, add_noise, model_ref, latent_ref}
-    diffusion_model_candidates: list = []     # (node_id, name); promoted only if it feeds a sampler
+    model_loader_ids: dict[str, str] = {}
+    sampler_passes: list[dict] = []
+    diffusion_model_candidates: list = []
 
-    # Pre-scan: text nodes traced back from the "negative" and "positive" inputs
-    # through the conditioning chains (ConditioningCombine, etc.). A text node
-    # reached from BOTH sides (one encode wired to positive and negative) counts
-    # as positive.
     negative_node_ids: set[str] = set()
     positive_node_ids: set[str] = set()
     _NEG_INPUT_NAMES = {"negative", "cond_negative", "negative_conditioning", "neg_conditioning"}
@@ -2354,15 +1982,14 @@ def _extract_from_comfyui_prompt(prompt: dict, summary: dict):
                            "cliptextencodesd3", "cliptextencodehunyuan",
                            "bnk_cliptextencodeadvanced", "cliptextencodeflux"}
 
-    # Input names that are known to carry POSITIVE conditioning. Never follow these
-    # when tracing negative chains, or the positive CLIPTextEncode gets misclassified.
     _POSITIVE_INPUT_NAMES = {"positive", "cond_positive", "positive_conditioning",
                              "pos_conditioning", "cond"}
 
+    # Which encoders are positive and which are negative is only knowable from
+    # the socket their conditioning finally arrives at. `skip_names` keeps a
+    # walk from crossing into the opposite polarity where a node takes both.
     def _trace_cond_chain(nid_str: str, mark: set[str], skip_names: set[str],
                           visited: set[str] | None = None) -> None:
-        """Recursively trace node reference chains to find text-encode nodes feeding
-        a conditioning input, marking them in `mark`."""
         if visited is None:
             visited = set()
         if nid_str in visited:
@@ -2374,38 +2001,24 @@ def _extract_from_comfyui_prompt(prompt: dict, summary: dict):
         ct_raw = ndata.get("class_type") or ""
         ct = ct_raw.lower().replace(" ", "").replace("_", "")
         _role = comfy_graph.classify(ct_raw, comfy_graph.get_registry().sig(ct_raw))
-        # ConditioningZeroOut erases the conditioning: the standard Flux/Qwen
-        # CFG=1 pattern feeds the POSITIVE encode through it into the negative
-        # input. Whatever text sits upstream is NOT a prompt for this side.
+        # Zeroed conditioning carries none of the text it was made from.
         if _role == "zero_conditioning" or "zeroout" in ct:
             return
-        # A pipe node reached WITHOUT slot context bundles both sides'
-        # conditioning, so recursing into it would mark encoders from the other
-        # side too. Slot refs into pipes are demuxed before recursion below;
-        # landing here means the slot is unknown, and stopping keeps the
-        # classification clean while the texts fall back to the default bucket.
+        # A pipe bundles both polarities into one value, so which one came out
+        # of it cannot be told from here.
         ct_spaced = ct_raw.lower()
         if _PIPE_FROM_PATTERN in ct_spaced or _PIPE_TO_PATTERN in ct_spaced:
             return
-        # Mark only text-producing nodes; intermediate conditioning nodes are
-        # only traversed on the way to them.
         if _role == "text_encode" or (_role is None and any(tp in ct for tp in _TEXT_PRODUCER_TYPES)):
             mark.add(nid_str)
             return
         inp = ndata.get("inputs", {})
         if not isinstance(inp, dict):
             return
-        # Follow reference-type inputs to trace upstream text nodes,
-        # but SKIP the other side's inputs to avoid cross-contamination.
-        # A ref pointing into a "Pipe from any" output slot is demuxed to the
-        # bundled source ref first, so a pipe carrying both sides' conditioning
-        # in separate slots keeps them separate here too.
         for key, val in inp.items():
             if key.lower() in skip_names:
                 continue
             if isinstance(val, list) and len(val) >= 1:
-                # The demux returns NO_VALUE for a provably empty pipe slot, so
-                # re-check the shape before following the ref.
                 val = _demux_pipe_ref(prompt, val)
                 if isinstance(val, list) and len(val) >= 1:
                     _trace_cond_chain(str(val[0]), mark, skip_names, visited)
@@ -2425,7 +2038,6 @@ def _extract_from_comfyui_prompt(prompt: dict, summary: dict):
                     if isinstance(pos_ref, list) and len(pos_ref) >= 1:
                         _trace_cond_chain(str(pos_ref[0]), positive_node_ids, _NEG_INPUT_NAMES)
 
-    # Pre-scan: map ControlNet loader node_ids to model names (order-independent)
     cn_loader_map: dict[str, str] = {}
     for nid, ndata in prompt.items():
         if not isinstance(ndata, dict):
@@ -2441,11 +2053,9 @@ def _extract_from_comfyui_prompt(prompt: dict, summary: dict):
                     cn_loader_map[nid] = val
                     break
 
-    # Pre-scan: reverse link map for connection context. upstream_src maps a
-    # node to the source of its first reference input; feeds_map maps a node to
-    # the "<TargetTitleOrType>.<input>" slots that consume its outputs. Used to
-    # disambiguate node instances (e.g. a ShowAny displaying an LLM output vs
-    # one displaying a scheduler name).
+    # A display node, or one with no settings of its own, carries the name of
+    # the node feeding it, and several nodes of one type each record what they
+    # feed, so both ends of every link are remembered.
     upstream_src: dict[str, str] = {}
     feeds_map: dict[str, list[str]] = {}
     for nid, ndata in prompt.items():
@@ -2462,26 +2072,19 @@ def _extract_from_comfyui_prompt(prompt: dict, summary: dict):
                 upstream_src.setdefault(nid, src)
                 feeds_map.setdefault(src, []).append(f"{target_label}.{key}")
 
-    # Generic node collection: captures ALL node params not handled by specific extractors
     generic_nodes: list[dict[str, Any]] = []
 
-    # Display/show nodes: their meaning comes from what feeds them, so they
-    # always get upstream (_from) context.
     _DISPLAY_NODE_PATTERNS = ("showtext", "showany", "showanything", "displayany",
                               "showstring", "displaytext", "previewany")
 
-    # Nodes to SKIP in generic capture (utility/infrastructure, no useful params,
-    # OR already handled by dedicated extractors above)
+    # Left out of the node list: the ones read into a field of their own, and
+    # the plumbing whose settings say nothing about the picture.
     _SKIP_GENERIC_TYPES = {
-        # Utility / infrastructure
         "vaedecode", "vaeencode", "previewimage", "saveimage", "loadimage",
         "emptylatentimage", "emptysd3latentimage",
         "reroute", "unloadmodel", "ramcleanup",
         "easycleangpuused", "easyclearcacheall", "easyconvertanything",
         "imagefrombatch", "localmediamanagernode",
-        # Routing / passthrough, with no generation-relevant params. (Display nodes
-        # like ShowText/DisplayAny ARE captured: they carry the shown value and
-        # upstream context. Math nodes are captured with their computed result.)
         "anyswitchrgthree", "anythingeverywhere", "anythingswitchrgthree",
         "note",
         "primitivestringmultiline", "primitivestringsimple", "primitiveboolean",
@@ -2489,10 +2092,8 @@ def _extract_from_comfyui_prompt(prompt: dict, summary: dict):
         "df_text", "df_integer", "df_float",
         "textversionspro", "textversions", "stringliteral", "simpletext",
         "easyifelsestring", "easyifelse",
-        # Sampler sub-nodes (data already captured by SamplerCustomAdvanced resolver)
         "ksamplerselect", "basicscheduler", "randomnoise", "disablenoise",
         "basicguider", "cfgguider", "dualcfgguider", "splitsigmas",
-        # Already handled by dedicated extractors (set _is_handled=True)
         "cliptextencode", "cliptextencodesdxl", "cliptextencodesdxlrefiner",
         "controlnetloader", "diffcontrolnetloader", "setunioncontrolnettype",
         "modelpatchloader",
@@ -2500,33 +2101,24 @@ def _extract_from_comfyui_prompt(prompt: dict, summary: dict):
         "modelsamplingflux", "modelsamplingsd3", "modelsamplingdiscrete",
         "modelsamplingauraflow", "modelsampling",
         "clipsetlastlayer",
-        # Resolution / resize nodes (actual resolution comes from the media file itself)
         "sdxlresolutionsjps", "getresolutioncrystools", "getimagesize",
         "jwimageresizelongerside", "jwimageresizebylongerside",
         "imagescaleby", "imagescale", "batchresizewithlanczos",
         "latentupscale", "latentupscaleby",
-        # Seed/selector utility nodes
         "seedgeneratorimagesaver", "samplerselectorimagesaver",
         "schedulerselectorimagesaver",
         "selectoriginalimagenode", "seedvarianceenhancer",
-        # Text manipulation (not generation params)
         "textfindandreplace", "removeduplicatetagslp",
         "tagremover", "textconcatenate",
     }
 
-    # Disconnected editing leftovers (nodes that feed nothing on the way to a
-    # save/output node) are skipped entirely, since they played no part in how
-    # this image was made. Only computed for graphs without implicit-link nodes
-    # (rgthree broadcasts / Set-Get), where reachability is exact.
     _dead_ids = comfy_graph.dead_node_ids(prompt, comfy_graph.get_registry())
-    # Direct-consumer map: in implicit-link graphs (where _dead_ids is empty by
-    # design) an image loader wired to NOTHING must still not claim to be a
-    # source image of this generation.
     _consumers_map = comfy_graph._build_consumers(prompt)
 
     for node_id, node_data in prompt.items():
         if not isinstance(node_data, dict):
             continue
+        # Nothing that was saved or shown was built from this node.
         if str(node_id) in _dead_ids:
             continue
         class_type = node_data.get("class_type", "")
@@ -2538,9 +2130,8 @@ def _extract_from_comfyui_prompt(prompt: dict, summary: dict):
         node_title = str(node_data.get("_meta", {}).get("title", "")).strip()
 
         _is_handled = False
-        _full_handled_params = False  # handled node that still wants full params
+        _full_handled_params = False
 
-        # LoadImage / LoadImageMask / custom loaders (initial image)
         _LOAD_IMAGE_TYPES = ("loadimage", "loadimagemask", "loadimagefromurl",
                              "loadimagebatch", "loadimagelistfrombatch",
                              "loadimagewithmetadatacrystools",
@@ -2551,12 +2142,8 @@ def _extract_from_comfyui_prompt(prompt: dict, summary: dict):
             t.replace(" ", "").replace("_", "") for t in _LOAD_IMAGE_TYPES
         } or ct_lower in ("loadimage", "loadimagemask"):
             img_val = inputs.get("image", "")
-            # Guards: a base64 loader's "image" input holds the raw payload
-            # instead of a path, so the 500-char cap keeps megabyte blobs out
-            # of the summary (mirroring generic capture's string cap). A loader
-            # nothing consumes is an editing leftover with no part in this
-            # image; the consumer check covers implicit-link graphs where the
-            # dead-node sweep is unavailable.
+            # A loader nothing reads from was left in the graph and gave the
+            # run no starting image.
             if (isinstance(img_val, str) and img_val.strip()
                     and len(img_val) <= 500
                     and _consumers_map.get(str(node_id))):
@@ -2565,10 +2152,6 @@ def _extract_from_comfyui_prompt(prompt: dict, summary: dict):
                     initial_images_found.append(_img)
             _is_handled = True
 
-        # Audio loaders (initial audio), the same contract as image loaders:
-        # the widget holds a path (possibly location-annotated), and a loader
-        # nothing consumes is an editing leftover with no part in this file.
-        # Full params stay so workflow_nodes.LoadAudio.audio remains bindable.
         if "loadaudio" in ct_lower.replace(" ", "").replace("_", ""):
             _aud_val = inputs.get("audio", "")
             if (isinstance(_aud_val, str) and _aud_val.strip()
@@ -2578,9 +2161,10 @@ def _extract_from_comfyui_prompt(prompt: dict, summary: dict):
                 if _aud not in initial_audios_found:
                     initial_audios_found.append(_aud)
             _is_handled = True
+            # Its settings stay in the node list, since a layout can bind to
+            # this node's own fields.
             _full_handled_params = True
 
-        # start_image inputs (WanImageToVideo, img2img, etc.)
         for _si_key in ("start_image", "init_image", "pixels"):
             _si_val = inputs.get(_si_key)
             if isinstance(_si_val, list) and len(_si_val) >= 2:
@@ -2598,18 +2182,12 @@ def _extract_from_comfyui_prompt(prompt: dict, summary: dict):
                                 if _si_clean not in initial_images_found:
                                     initial_images_found.append(_si_clean)
 
-        # Samplers
-        # Structural: a sampler PRODUCES a latent and takes denoising params
-        # (ComfyUI's own node signature, via the registry). Name matching is
-        # only the fallback for node packs that aren't installed any more,
-        # where the old exclusions (selectors/packers/VLM samplers) apply.
+        # One the registry calls something else still counts if its name says
+        # sampler and it puts out a latent, which a video pack spells its own
+        # way.
         _node_role = comfy_graph.classify(class_type, comfy_graph.get_registry().sig(class_type))
-        # Shared with comfy_graph.find_generation_resolution so the "is this a
-        # sampler by name" heuristic can't drift between the two.
         _name_says_sampler = comfy_graph.name_says_sampler(class_type)
         if _node_role == "sampler" or (_node_role is None and _name_says_sampler) or (
-                # Custom latent types (e.g. video wrappers) aren't literal
-                # "LATENT", so accept name+latent-ish output evidence.
                 _node_role == "other" and _name_says_sampler and any(
                     "latent" in str(t).lower()
                     for t in (comfy_graph.get_registry().sig(class_type) or {}).get("output_types", []))):
@@ -2624,10 +2202,8 @@ def _extract_from_comfyui_prompt(prompt: dict, summary: dict):
                     out_key = "seed" if key == "noise_seed" else key
                     info[out_key] = val
 
-            # A widget converted to a LINK keeps a stale literal in the workflow
-            # but carries its real value through the link, so always prefer the
-            # link. Resolve EVERY sampler param that is a link via the pure-value
-            # resolver (sliders, math, switches, rgthree Context passthrough…).
+            # A widget turned into a link keeps its last typed value in the
+            # workflow, while the run used what the link resolves to.
             for key in _SAMPLER_KEYS:
                 val = inputs.get(key)
                 if not isinstance(val, list):
@@ -2637,11 +2213,10 @@ def _extract_from_comfyui_prompt(prompt: dict, summary: dict):
                 if rv is not None and not isinstance(rv, (list, dict)):
                     info[out_key] = rv
 
-            # Resolve node references for standard sampler params
-            # (e.g., when steps/cfg/seed come from separate Number/Selector nodes)
-            # Follows chains up to 5 hops (handles Packer-feeding-Unpacker patterns)
+            # A sampler setting that came down a link passes through a
+            # primitive or a converter whose own widget is named something else.
             _SAMPLER_ALT_KEYS = {
-                "sampler_name": ["sampler_name", "sampler"],  # SamplerParameterPacker uses "sampler"
+                "sampler_name": ["sampler_name", "sampler"],
                 "scheduler": ["scheduler"],
                 "seed": ["seed", "noise_seed"],
                 "noise_seed": ["seed", "noise_seed"],
@@ -2668,8 +2243,8 @@ def _extract_from_comfyui_prompt(prompt: dict, summary: dict):
                     ref_inputs = ref_node.get("inputs", {})
                     if not isinstance(ref_inputs, dict):
                         break
-                    # Math node in the chain: its computed output IS the value,
-                    # so don't walk past it to the (pre-math) upstream literal.
+                    # A math node's computed output is the value, so the walk
+                    # stops there.
                     if _is_math_node(ref_node.get("class_type", "")):
                         mres = _eval_math_node(prompt, ref_node)
                         if mres is not None:
@@ -2700,13 +2275,9 @@ def _extract_from_comfyui_prompt(prompt: dict, summary: dict):
                 if resolved is not None:
                     info[out_key] = resolved
 
-            # SamplerCustomAdvanced: resolve sub-node references for noise/guider/sampler/sigmas
+            # A custom sampler takes its sampler and sigmas from linked nodes,
+            # and the advanced one its noise and guider as well.
             if "samplercustom" in ct_lower:
-                # Sub-node params (seed/cfg/steps/denoise) are often LINKS to a
-                # slider / math / primitive (e.g. an mxSlider feeding steps & cfg),
-                # not literals. _scalar() returns a literal as-is and resolves a
-                # [node, slot] link via the pure-value resolver (which honors e.g.
-                # mxSlider's isfloatX), so linked values are captured too.
                 def _scalar(val):
                     if isinstance(val, list):
                         return _resolve_scalar_smart(prompt, val)
@@ -2714,7 +2285,6 @@ def _extract_from_comfyui_prompt(prompt: dict, summary: dict):
                         return None
                     return val
 
-                # The noise link leads to RandomNoise/DisableNoise, which carries the seed.
                 noise_ref = _demux_pipe_ref(prompt, inputs.get("noise"))
                 if isinstance(noise_ref, list):
                     noise_node = _resolve_ref(prompt, noise_ref)
@@ -2726,7 +2296,6 @@ def _extract_from_comfyui_prompt(prompt: dict, summary: dict):
                                 info.setdefault("seed", sv)
                                 break
 
-                # The guider link leads to BasicGuider/CFGGuider/ScheduledCFGGuidance, which carries cfg.
                 guider_ref = _demux_pipe_ref(prompt, inputs.get("guider"))
                 if isinstance(guider_ref, list):
                     guider_node = _resolve_ref(prompt, guider_ref)
@@ -2736,7 +2305,6 @@ def _extract_from_comfyui_prompt(prompt: dict, summary: dict):
                         if cfg_val is not None:
                             info.setdefault("cfg", cfg_val)
 
-                # The sampler link leads to KSamplerSelect, which carries sampler_name.
                 sampler_ref = _demux_pipe_ref(prompt, inputs.get("sampler"))
                 if isinstance(sampler_ref, list):
                     sampler_node = _resolve_ref(prompt, sampler_ref)
@@ -2746,13 +2314,6 @@ def _extract_from_comfyui_prompt(prompt: dict, summary: dict):
                         if isinstance(sname, str):
                             info.setdefault("sampler_name", sname)
 
-                # The sigmas link leads (possibly through SplitSigmas / FlipSigmas /
-                # multiply nodes) to a BasicScheduler carrying steps, scheduler and
-                # denoise. Multi-part and high/low workflows feed the sampler from a
-                # sigma-splitter, so the scheduler isn't the DIRECT sigmas node; walk
-                # the "sigmas" link upstream (bounded, cycle-safe) until the node
-                # carrying steps is hit. steps/denoise may themselves be LINKED
-                # (slider), so resolve them.
                 sigmas_ref = inputs.get("sigmas")
                 _sig_seen: set[str] = set()
                 for _ in range(8):
@@ -2768,26 +2329,24 @@ def _extract_from_comfyui_prompt(prompt: dict, summary: dict):
                         break
                     sig_inputs = sigmas_node.get("inputs", {})
                     _got_steps = False
+                    # The scheduler is always a chosen string, while the steps
+                    # and the denoise can each arrive down a link.
                     for sk in ("steps", "scheduler", "denoise"):
                         raw = sig_inputs.get(sk)
-                        # scheduler is a combo STRING; steps/denoise may be links.
                         sv = (raw if isinstance(raw, str) else None) if sk == "scheduler" else _scalar(raw)
                         if sv is not None:
                             info.setdefault(sk, sv)
                             if sk == "steps":
                                 _got_steps = True
-                    # LTX schedulers carry the sampling shift here instead of a
-                    # ModelSampling node: max_shift is the operative value and
-                    # base_shift the floor it stretches from.
                     _msv = _scalar(sig_inputs.get("max_shift"))
                     if _msv is not None:
                         info.setdefault("shift", _msv)
                         _bsv = _scalar(sig_inputs.get("base_shift"))
                         if _bsv is not None:
                             info.setdefault("base_shift", _bsv)
-                    # ManualSigmas-style nodes hold a literal sigma list; N
-                    # sigmas run N-1 steps.
                     if not _got_steps:
+                        # A schedule written out by hand has one more sigma than
+                        # it has steps.
                         _sraw = sig_inputs.get("sigmas")
                         if isinstance(_sraw, str) and _sraw.strip():
                             _toks = [t for t in re.split(r"[\s,]+", _sraw.strip()) if t]
@@ -2800,9 +2359,8 @@ def _extract_from_comfyui_prompt(prompt: dict, summary: dict):
                                 _got_steps = True
                     if _got_steps:
                         break
-                    sigmas_ref = sig_inputs.get("sigmas")  # follow the splitter upstream
+                    sigmas_ref = sig_inputs.get("sigmas")
 
-            # Per-sampler shift (MoE high/low)
             if "shift" not in info:
                 _model_ref = inputs.get("model")
                 if not isinstance(_model_ref, list) and "samplercustom" in ct_lower:
@@ -2816,29 +2374,20 @@ def _extract_from_comfyui_prompt(prompt: dict, summary: dict):
                     if _sv is not None:
                         info["shift"] = _sv
 
-            # Require real sampler evidence: an entry with only a label (or only
-            # a scheduler string) is a helper node rather than a sampling pass.
             if any(k in info for k in ("seed", "steps", "cfg", "denoise", "sampler_name")):
                 samplers_found.append(info)
                 _is_handled = True
-                # Sampler packs carry extras beyond the card's fixed fields
-                # (eta, sampler_mode, bongmath, ...); keep their scalars in the
-                # workflow_nodes entry so they stay searchable and placeable.
                 _full_handled_params = True
-                # Record the pass for HIGH/LOW topology tagging: the raw model /
-                # latent links plus the resolved step range tell the high-noise
-                # pass (start 0, adds noise) from the low-noise one (starts later).
                 sampler_passes.append({
                     "nid": str(node_id),
                     "start": info.get("start_at_step"),
                     "add_noise": info.get("add_noise"),
                     "model_ref": inputs.get("model"),
                     "latent_ref": inputs.get("latent_image"),
-                    "guider_ref": inputs.get("guider"),  # custom samplers carry the model via the guider
-                    "info": info,  # the samplers_found entry, tagged with its role below
+                    "guider_ref": inputs.get("guider"),
+                    "info": info,
                 })
 
-        # Models / Checkpoints
         if "checkpointloader" in ct_lower:
             name = inputs.get("ckpt_name")
             if name and isinstance(name, str):
@@ -2846,7 +2395,6 @@ def _extract_from_comfyui_prompt(prompt: dict, summary: dict):
                 model_loader_ids[str(node_id)] = name
                 _is_handled = True
 
-        # GGUF / Unet loaders
         if "unetloader" in ct_lower:
             name = inputs.get("unet_name")
             if name and isinstance(name, str):
@@ -2854,14 +2402,8 @@ def _extract_from_comfyui_prompt(prompt: dict, summary: dict):
                 model_loader_ids[str(node_id)] = name
                 _is_handled = True
 
-        # Diffusion-model loaders (DiffusionModelLoaderKJ, …)
-        # Load the base diffusion model from a `model_name` widget but match
-        # neither "checkpointloader" nor "unetloader". Recorded as a CANDIDATE and
-        # promoted to summary.model only if it actually feeds a sampler (below); a
-        # Florence2/captioner "…ModelLoader" wired elsewhere must NOT be taken for
-        # the base model. NOT marked _is_handled: users bind
-        # workflow_nodes.<loader>.model_name (e.g. HIGH/LOW model cards), which
-        # needs this node's full params kept in workflow_nodes.
+        # A loader from a node pack can be named for any kind of model, so one
+        # of these only counts once a sampler is found to have used it.
         if "diffusionmodelloader" in ct_lower or (
                 "modelloader" in ct_lower and not any(
                     x in ct_lower for x in ("clip", "vae", "lora", "controlnet",
@@ -2872,19 +2414,9 @@ def _extract_from_comfyui_prompt(prompt: dict, summary: dict):
             if name and isinstance(name, str):
                 diffusion_model_candidates.append((str(node_id), name))
 
-        # CLIP loaders
-        # The CLIP shown in the panel is resolved by following each active text
-        # encoder's `clip` link to its real source (_resolve_clip_source, below),
-        # NOT by scanning every CLIPLoader: a CLIPLoader feeding a separate
-        # LLM/TextGenerate node is not this image's CLIP. Just mark handled so the
-        # node isn't also captured generically (its name still reaches the layout
-        # via workflow_nodes for user-built LLM sections).
         if "cliploader" in ct_lower or "dualcliploader" in ct_lower:
             _is_handled = True
 
-        # LoRA loaders
-        # Role first (signature-identified LoRA loader), name as the fallback for
-        # uninstalled packs the registry can't classify.
         if _node_role == "lora" or ("lora" in ct_lower and "loader" in ct_lower):
             _loras_before = len(loras_found)
             name = inputs.get("lora_name")
@@ -2896,22 +2428,18 @@ def _extract_from_comfyui_prompt(prompt: dict, summary: dict):
                     entry["strength_model"] = strength_m
                 if strength_c is not None and not isinstance(strength_c, (list, dict)):
                     entry["strength_clip"] = strength_c
-                # Record which loader node this LoRA came from. For Wan2.2-style
-                # MoE workflows that use two separate LoRA loaders (high-noise /
-                # low-noise), this lets the UI pair them by loader even when the
-                # filenames don't share a high/low token.
+                # The loader's id rides along so the high and low noise roles
+                # can be hung on each LoRA once the passes are worked out.
                 entry["loader"] = str(node_id)
                 loras_found.append(entry)
 
-            # Power Lora Loader (rgthree): has lora_N dict inputs
-            # e.g. "lora_1": {"on": True, "lora": "name.safetensors", "strength": 1.0}
-            # Stack loaders (rgthree "Lora Loader Stack"): numbered STRING slots
-            # e.g. "lora_01": "name.safetensors" with a matching "strength_01".
+            # A stacked loader keeps a numbered slot per LoRA, either as an
+            # object with its own on switch and strength, or as a name in
+            # `lora_N` with the strength in `strength_N`.
             _has_lora_slots = False
             for inp_key, inp_val in inputs.items():
-                # The rgthree header widget marks a Power Lora Loader even when
-                # the user never added a single slot row. Such a node must be
-                # suppressed like the all-off case instead of generically captured.
+                # The header widget marks the node as a stacked loader even
+                # while every slot is empty.
                 if inp_key == "PowerLoraLoaderHeaderWidget":
                     _has_lora_slots = True
                     continue
@@ -2936,17 +2464,12 @@ def _extract_from_comfyui_prompt(prompt: dict, summary: dict):
                         if _strength is not None and not isinstance(_strength, (list, dict)):
                             entry["strength_model"] = _strength
                         loras_found.append(entry)
-            # Claim the node when a LoRA was extracted, OR when it carries lora
-            # slots that are simply all off/None (it IS a lora loader with
-            # nothing selected, so falling through to generic capture would dump
-            # its slot dicts into workflow_nodes, where OFF lora filenames leak
-            # into search and the picker). A node that merely LOOKS lora-ish
-            # (e.g. an IPAdapter FaceID loader with only lora_strength) still
-            # falls through so its real params stay visible.
+            # A loader with every slot switched off counts as handled too,
+            # since the generic capture would otherwise put the names of LoRAs
+            # that never loaded into the node list.
             if len(loras_found) > _loras_before or _has_lora_slots:
                 _is_handled = True
 
-        # ControlNet
         _CN_APPLY_CLASSES = ("controlnetapply", "controlnetapplyadvanced",
                               "controlnetapplysd3", "acn_advancedcontrolnetapply",
                               "setunioncontrolnettype", "qwenimagediffsynthcontrolnet")
@@ -2982,7 +2505,8 @@ def _extract_from_comfyui_prompt(prompt: dict, summary: dict):
                 controlnets_found.append(cn_entry)
             _is_handled = True
 
-        # ADetailer / FaceDetailer / DetailerForEach
+        # The words ruled out here appear in the helper nodes that configure a
+        # detailer, and only the node that runs one holds the detector.
         if ("facedetailer" in ct_lower or
             ("detailer" in ct_lower and "hook" not in ct_lower
              and "pipe" not in ct_lower and "schedule" not in ct_lower
@@ -3021,7 +2545,6 @@ def _extract_from_comfyui_prompt(prompt: dict, summary: dict):
                 adetailers_found.append(det_entry)
             _is_handled = True
 
-        # MMAudio
         if "mmaudiosampler" in ct_lower:
             mma: dict[str, Any] = {}
             for key in ("steps", "cfg", "seed", "prompt", "negative_prompt",
@@ -3037,7 +2560,6 @@ def _extract_from_comfyui_prompt(prompt: dict, summary: dict):
                 mmaudio_info = mma
             _is_handled = True
 
-        # Upscaling
         if "upscale" in ct_lower and "model" in ct_lower and "loader" not in ct_lower:
             up_entry: dict[str, Any] = {}
             model_ref = inputs.get("upscale_model")
@@ -3049,6 +2571,8 @@ def _extract_from_comfyui_prompt(prompt: dict, summary: dict):
                     if isinstance(mn, str):
                         up_entry["model"] = mn
             if up_entry:
+                # The id and the image link order the entries later on, and both
+                # are popped before the summary is assembled.
                 up_entry["_nid"] = str(node_id)
                 _uiv = inputs.get("image")
                 if isinstance(_uiv, list) and len(_uiv) >= 1:
@@ -3057,10 +2581,6 @@ def _extract_from_comfyui_prompt(prompt: dict, summary: dict):
             _is_handled = True
         elif _node_role == "latent_resize" or (
                 ("upscale" in ct_lower or "upsampl" in ct_lower) and "loader" not in ct_lower):
-            # LatentUpscale, LatentUpscaleBy, UltimateSDUpscale, SeedVR2VideoUpscaler,
-            # LTXVLatentUpsampler(Tiled), … (role-driven so a latent-upscale node
-            # from a pack without "upscale" anywhere in its class name is still
-            # recognized; the LTX family spells it "upsampler").
             up_entry = {}
             for pk in ("upscale_method", "width", "height", "scale_by", "scale_factor",
                        "resolution"):
@@ -3074,13 +2594,11 @@ def _extract_from_comfyui_prompt(prompt: dict, summary: dict):
                 if pv is not None and not isinstance(pv, (list, dict)):
                     if isinstance(pv, (int, float)) and not isinstance(pv, bool):
                         pv = _normalize_number(pv)
-                    # SeedVR2-style nodes take the TARGET size as "resolution".
-                    # Stored under target_resolution so an unprefixed
-                    # "resolution" param in a cards layout keeps reading the
-                    # file's own resolution rather than this widget.
-                    up_entry["target_resolution" if pk == "resolution" else pk] = pv
-            # Model-based upscalers fed by a separate loader (SeedVR2 etc.):
-            # resolve the loader's model name so the Upscaling card has one.
+                    # A node that takes the size it is aiming for as
+                    # `resolution` is stored under another name, since
+                    # `resolution` in the summary is the file's own.
+                    if pv is not None:
+                        up_entry["target_resolution" if pk == "resolution" else pk] = pv
             if "model" not in up_entry:
                 for _mk in ("upscale_model", "dit_model", "dit", "model"):
                     _mref = inputs.get(_mk)
@@ -3096,14 +2614,6 @@ def _extract_from_comfyui_prompt(prompt: dict, summary: dict):
                     if up_entry.get("model"):
                         break
             if up_entry:
-                # A DiT upscaler (SeedVR2-style single nodes) carries its own
-                # VAE and sometimes a text encoder; resolve their loader
-                # widgets onto the entry so they display with their pass. The
-                # probe order is per link: a vae link reads vae_name before the
-                # generic model widgets, a clip link reads clip_name first, and
-                # neither ever reads ckpt_name, since a link landing on a
-                # checkpoint loader means the component is baked into the
-                # checkpoint and has no filename of its own to record.
                 for _ck, _ekey, _ckeys in (
                         ("vae", "vae", ("vae_name", "model_name", "model")),
                         ("clip", "clip", ("clip_name", "model_name", "model")),
@@ -3121,10 +2631,6 @@ def _extract_from_comfyui_prompt(prompt: dict, summary: dict):
                                 up_entry[_ekey] = _cv.strip()
                                 break
                 up_entry["type"] = class_type
-                # The LTX temporal upsampler doubles the FRAME count, so it is
-                # interpolation. Its class signature is identical to the
-                # spatial one; the loaded model filename ("temporal" versus
-                # "spatial") is the only static discriminator in the graph.
                 if "temporal" in str(up_entry.get("model", "")).lower():
                     interpolation_found.append(
                         {"type": class_type, "model_name": up_entry["model"],
@@ -3141,30 +2647,21 @@ def _extract_from_comfyui_prompt(prompt: dict, summary: dict):
         elif _node_role == "image_resize" or (_node_role in (None, "other") and
               ("resize" in ct_lower or "scale" in ct_lower) and "image" in ct_lower
               and "latent" not in ct_lower):
-            # Image-space resize family (ImageResizeKJv2, ImageScaleToTotalPixels,
-            # ResizeImageMaskNode, WanVideoImageResizeToClosest, ResizeImagesBy
-            # LongerEdge, ImageScale/By, …): MANY node packs, one meaning. Only
-            # POST-generation resizes (the image came out of a VAE decode or a
-            # model upscaler) count as upscaling output. A resize that prepares
-            # an input image does not. Normalized into the same `upscaling` entries
-            # so layouts can read upscaling.* instead of per-node-type paths.
-            # (These nodes still ALSO appear under workflow_nodes.)
             _img_ref = None
             for _ik in ("image", "images", "pixels", "input"):
                 _iv = inputs.get(_ik)
                 if isinstance(_iv, list) and len(_iv) >= 1:
                     _img_ref = _iv
                     break
+            # A resize only counts as upscaling once the image it takes has
+            # been generated, or where it leads into an upscaler.
             _in_pipeline = _img_ref is not None and _chain_reaches(
                 prompt, _img_ref,
                 ("vaedecode", "videodecode", "latentdecode",
                  "upscalewithmodel", "imageupscale"),
                 accept_decoder=True)
             if not _in_pipeline and _img_ref is not None:
-                # A pre-upscale resize in a load-then-upscale workflow has no
-                # decode upstream; its DOWNSTREAM reaching an upscaler before
-                # any encoder makes it a pipeline stage all the same.
-                _in_pipeline = _feeds_upscaler_first(prompt, str(node_id))
+                _in_pipeline = _feeds_upscaler_first(prompt, str(node_id), consumers=_consumers_map)
             if _in_pipeline:
                 up_entry = {}
                 _RESIZE_KEY_MAP = (
@@ -3184,17 +2681,16 @@ def _extract_from_comfyui_prompt(prompt: dict, summary: dict):
                             up_entry[out_key] = pv
                             break
                         if isinstance(pv, (int, float)) and not isinstance(pv, bool) and pv:
-                            up_entry[out_key] = _normalize_number(pv)
-                            break
+                            pv = _normalize_number(pv)
+                            if pv is not None:
+                                up_entry[out_key] = pv
+                                break
                 if up_entry:
                     up_entry["type"] = class_type
                     up_entry["_nid"] = str(node_id)
                     up_entry["_img_ref"] = _img_ref
                     upscaling_found.append(up_entry)
-            # NOT marked handled: keep the full generic workflow_nodes entry so
-            # existing layouts that reference these nodes by name keep working.
 
-        # Frame Interpolation
         if _node_role == "interpolation" or (_node_role != "image_resize" and (
                 "interpolation" in ct_lower or "vfi" in ct_lower or "rife" in ct_lower)):
             interp: dict[str, Any] = {}
@@ -3202,11 +2698,10 @@ def _extract_from_comfyui_prompt(prompt: dict, summary: dict):
                         "multiplier", "ckpt_name"):
                 val = inputs.get(key)
                 if isinstance(val, list):
-                    # A pipe bundle can carry the fps; unwrap to the real source.
                     val = _demux_pipe_ref(prompt, val)
+                    # The pipe carries nothing in that slot, and the sentinel
+                    # saying so must not be stored as a value.
                     if val is comfy_graph.NO_VALUE:
-                        # The pipe chain provably never packs this slot; a bare
-                        # sentinel must never land in the summary.
                         continue
                 if val is not None and not isinstance(val, (list, dict)):
                     interp[key] = val
@@ -3216,8 +2711,6 @@ def _extract_from_comfyui_prompt(prompt: dict, summary: dict):
                         interp[key] = rv
             if interp:
                 interp["type"] = class_type
-                # Transient bookkeeping for execution ordering, popped at
-                # summary assembly: this node's id and its frames input.
                 interp["_nid"] = str(node_id)
                 for _fk in ("images", "frames", "image"):
                     _fv = inputs.get(_fk)
@@ -3227,40 +2720,27 @@ def _extract_from_comfyui_prompt(prompt: dict, summary: dict):
                 interpolation_found.append(interp)
             _is_handled = True
 
-        # CLIP Text Encode: prompts
         if _node_role == "text_encode" or (_node_role is None and (
                 "cliptextencode" in ct_lower or "textencode" in ct_lower)):
-            # Record this (non-dead) encoder's clip source so clip_models can be
-            # resolved by following the real link instead of a global CLIPLoader scan.
             _clip_ref = inputs.get("clip")
             if isinstance(_clip_ref, list) and _clip_ref:
                 active_clip_refs.append((str(node_id), _clip_ref))
-            # Check both "text" and "prompt" keys, since some nodes (e.g.,
-            # TextEncodeQwen*) use "prompt" instead of "text" for the text input
             text = inputs.get("text")
             if text is None:
                 text = inputs.get("prompt")
-            # Song encoders (the TextEncodeAceStepAudio family) carry their
-            # style prompt in "tags" and the song text in "lyrics". Both are
-            # collected as their own audio_* summary keys rather than joining
-            # positive_prompt, so a combined image-plus-audio workflow keeps
-            # the two prompts apart.
+            # An audio encoder puts the style words in `tags` and the words
+            # to be sung in `lyrics`.
             for _sk, _bucket in (("tags", tags_texts), ("lyrics", lyrics_texts)):
                 _sv = inputs.get(_sk)
                 if isinstance(_sv, list) and len(_sv) >= 1:
                     _sv = _resolve_text_recursive(prompt, _sv)
                 if isinstance(_sv, str) and _sv.strip():
                     _bucket.append((str(node_id), _sv.strip()))
-                    # A song encoder carries its generation settings (bpm,
-                    # keyscale, language, ...) as widgets on the encoder
-                    # itself, so keep its scalars in workflow_nodes like
-                    # sampler-pack extras. Ordinary encoders stay stubs, since
-                    # their only widget is the prompt shown elsewhere.
                     _full_handled_params = True
+            # An encoder node for a two encoder model takes one box per
+            # encoder, written as `text_g` with `text_l`, or as `clip_l` with
+            # one of the T5 boxes.
             if text is None:
-                # Encoders that split the prompt across TWO string inputs: combine
-                # both parts (de-duplicated when identical), in the node's field order:
-                # SDXL text_g + text_l; Flux/SD3 clip_l + t5xxl/mt5xl.
                 _pair = None
                 if inputs.get("text_g") is not None or inputs.get("text_l") is not None:
                     _pair = (inputs.get("text_g"), inputs.get("text_l"))
@@ -3271,13 +2751,6 @@ def _extract_from_comfyui_prompt(prompt: dict, summary: dict):
                     _has_str = any(isinstance(p, str) and p.strip() for p in _pair)
                     _has_link = any(isinstance(p, list) and len(p) >= 1 for p in _pair)
                     if _has_str and _has_link:
-                        # MIXED pair: one half inline text, the other wired from
-                        # another node (commonly text_g converted to an input fed
-                        # by a Primitive holding the MAIN prompt). Resolve the link
-                        # in place, keeping the node's field order, so the linked
-                        # half is not dropped. Limitation: inline resolution skips
-                        # enhancer / initial-prompt detection for the linked half,
-                        # acceptable since the mixed case is rare.
                         _parts = []
                         for p in _pair:
                             if isinstance(p, str) and p.strip():
@@ -3287,25 +2760,18 @@ def _extract_from_comfyui_prompt(prompt: dict, summary: dict):
                                 if isinstance(_resolved, str) and _resolved.strip():
                                     _parts.append(_resolved.strip())
                     else:
-                        # Link-only pairs deliberately fall through with no
-                        # parts: the variant-link loop below hands ONE bare
-                        # link downstream (full enhancer machinery) using its
-                        # preference order: t5xxl/mt5xl before clip_l, since
-                        # the T5 input carries the main prompt on Flux/SD3.
                         _parts = [p.strip() for p in _pair if isinstance(p, str) and p.strip()]
                     if text is None and _parts:
                         if len(_parts) == 2 and _parts[0] == _parts[1]:
                             _parts = _parts[:1]
                         text = ", ".join(_parts)
                 if text is None:
-                    # Both variant inputs fed by links (rare): resolve the first
-                    # downstream.
                     for _vk in ("text_g", "text_l", "t5xxl", "mt5xl", "clip_l"):
                         _vv = inputs.get(_vk)
                         if isinstance(_vv, list) and len(_vv) >= 1:
                             text = _vv
                             break
-            initial_text = None  # the user's own prompt before enhancement
+            initial_text = None
             enhanced_text = None
             enhancer_node = None
 
@@ -3320,8 +2786,6 @@ def _extract_from_comfyui_prompt(prompt: dict, summary: dict):
                                           "result", "output_text")
                     _SHOW_TEXT_PATTERNS = _SHOW_TEXT_NODE_PATTERNS
 
-                    # Pass A: Find any node that directly references the enhancer's output
-                    # and has captured text (e.g., ShowText nodes)
                     enhancer_id = None
                     for _eid, _edata in prompt.items():
                         if _edata is enhancer_node:
@@ -3347,7 +2811,6 @@ def _extract_from_comfyui_prompt(prompt: dict, summary: dict):
                             if enhanced_text:
                                 break
 
-                    # Pass B: Check the enhancer node's own inputs for captured output
                     if not enhanced_text:
                         for _tk in _CAPTURED_TEXT_KEYS:
                             _tv = (enhancer_node.get("inputs") or {}).get(_tk)
@@ -3355,8 +2818,6 @@ def _extract_from_comfyui_prompt(prompt: dict, summary: dict):
                                 enhanced_text = _tv.strip()
                                 break
 
-                    # Pass C: Broader search covering any ShowText-like node
-                    # connected to any enhancer in the prompt
                     if not enhanced_text:
                         for _nid, _ndata in prompt.items():
                             if not isinstance(_ndata, dict):
@@ -3384,22 +2845,16 @@ def _extract_from_comfyui_prompt(prompt: dict, summary: dict):
                 if resolved:
                     text = resolved
                 elif initial_text:
-                    # The walk found no stored text (the paths behind the
-                    # enhancer are runtime-generated), so the user's input to
-                    # the enhancer is the only recoverable prompt text.
                     text = initial_text
 
-            # If a ShowText capture of the enhancer output was found, use it as
-            # the positive prompt. It is more reliable than the resolved text,
-            # which may be either the enhanced or the pre-enhancement original.
             if enhanced_text:
                 text = enhanced_text
 
             if isinstance(text, str) and text.strip():
                 title_lower = (node_title or "").lower()
+                # A title that names the node negative counts on its own, even
+                # where the conditioning walk found it on a positive path.
                 _is_neg_by_title = bool(re.search(r'\bneg(?:ative)?\b', title_lower))
-                # A node reached from BOTH positive and negative inputs (one encode
-                # reused for both sides) counts as a positive prompt.
                 _in_neg_chain = (str(node_id) in negative_node_ids
                                  and str(node_id) not in positive_node_ids)
                 is_negative = _in_neg_chain or _is_neg_by_title
@@ -3407,13 +2862,6 @@ def _extract_from_comfyui_prompt(prompt: dict, summary: dict):
                     negative_texts.append((str(node_id), text.strip()))
                 else:
                     positive_texts.append((str(node_id), text.strip()))
-                    # Track the pre-enhancement original, and flag the
-                    # enhancement itself (positive side only).
-                    # Recorded even when it currently equals the resolved text:
-                    # an embedded parameters block can still replace the
-                    # positive prompt further on, and dropping the original
-                    # here would leave the user's own words nowhere. The final
-                    # cleanup removes it if it still matches the positive.
                     if initial_text:
                         initial_prompts.append((str(node_id), initial_text))
                     if enhancer_node is not None:
@@ -3421,35 +2869,33 @@ def _extract_from_comfyui_prompt(prompt: dict, summary: dict):
                         summary["prompt_enhanced"] = True
             _is_handled = True
 
-        # VAE loaders: collect names in iteration order; the merge phase picks
-        # per consumer chain and falls back to the first loader seen.
         if "vaeloader" in ct_lower:
             vae = inputs.get("vae_name")
             if vae and isinstance(vae, str):
                 vae_loader_names.append(vae)
             _is_handled = True
 
-        # VAE consumers: record the links the decode/encode nodes actually use,
-        # keyed by the consumer so a post-process pass's VAE can be told apart.
         if "vaedecode" in ct_lower or "vaeencode" in ct_lower:
             _vref = inputs.get("vae")
             if isinstance(_vref, list) and _vref:
                 if "audio" in ct_lower:
                     audio_vae_refs.append(_vref)
                 else:
+                    # Kept per consumer, so a VAE that only a later pass decodes
+                    # with can be told from the one the generation used.
                     main_vae_refs.append((str(node_id), _vref))
         _avref = inputs.get("audio_vae")
         if isinstance(_avref, list) and _avref:
             audio_vae_refs.append(_avref)
 
-        # Clip Skip
         if "clipsetlastlayer" in ct_lower:
+            # The layer is written as a negative index counting back from the
+            # last, and clip skip is that same number without its sign.
             skip = inputs.get("stop_at_clip_layer")
             if skip is not None:
                 summary.setdefault("clip_skip", abs(int(skip)) if isinstance(skip, (int, float)) else skip)
             _is_handled = True
 
-        # Flux Shift / ModelSampling
         if "modelsamplingflux" in ct_lower or "modelsamplingsd3" in ct_lower:
             shift = inputs.get("shift")
             if shift is not None and not isinstance(shift, (list, dict)):
@@ -3461,13 +2907,8 @@ def _extract_from_comfyui_prompt(prompt: dict, summary: dict):
                 summary.setdefault("sampling_type", sampling)
             _is_handled = True
 
-        # Generic node capture: ALL non-utility nodes are recorded for the
-        # "Workflow Nodes" section, handled ones as a lightweight entry and
-        # unhandled ones with their full scalar params.
         ct_clean = ct_lower.replace(" ", "").replace("_", "").replace("(", "").replace(")", "").replace("|", "")
         if ct_clean not in _SKIP_GENERIC_TYPES:
-            # Upstream context label: title (preferred) or class_type of the
-            # node feeding this one's first reference input.
             from_label = None
             src_id = upstream_src.get(str(node_id))
             if src_id:
@@ -3478,8 +2919,6 @@ def _extract_from_comfyui_prompt(prompt: dict, summary: dict):
             is_display_node = any(p in ct_clean for p in _DISPLAY_NODE_PATTERNS)
 
             if _is_handled:
-                # Sampler nodes keep their scalar widgets, since pack-specific
-                # extras live only here (the sampler card captures fixed fields).
                 _hp: dict[str, Any] = {}
                 if _full_handled_params:
                     for _pk, _pv in inputs.items():
@@ -3490,16 +2929,15 @@ def _extract_from_comfyui_prompt(prompt: dict, summary: dict):
                 generic_entry: dict[str, Any] = {
                     "class_type": class_type,
                     "params": _hp,
-                    "_handled": True,  # flag so frontend can skip duplicate display if needed
+                    "_handled": True,
                 }
                 if node_title and node_title != class_type:
                     generic_entry["title"] = node_title
                 if from_label and is_display_node:
                     generic_entry["_from"] = from_label
-                generic_entry["_node_id"] = str(node_id)  # correlate with workflow node
+                generic_entry["_node_id"] = str(node_id)
                 generic_nodes.append(generic_entry)
             else:
-                # VLM / PromptEnhancer / LLM nodes: special handling to capture long prompts
                 _VLM_PATTERNS = ("llava", "vlm", "prompt_enhancer", "promptenhancer",
                                  "llamasampler", "llm", "florence", "joycaption",
                                  "cogvlm", "minicpm", "internvl", "qwenvl",
@@ -3509,12 +2947,6 @@ def _extract_from_comfyui_prompt(prompt: dict, summary: dict):
                 _PROMPT_KEYS = ("user_prompt", "system_prompt", "prompt", "text",
                                 "question", "instruction", "system_message")
 
-                # Keys whose reference inputs are worth resolving to text (node
-                # prompts fed by a linked text/primitive node).
-                # NOTE: bare "positive"/"negative" are conditioning links on
-                # sampler-type nodes, and resolving them would copy the whole
-                # prompt text into the node's params. "positive_prompt" style
-                # keys still match via "prompt".
                 _PROMPT_REF_HINTS = ("prompt", "msg", "message", "text", "caption",
                                      "system", "instruction", "question")
 
@@ -3524,57 +2956,33 @@ def _extract_from_comfyui_prompt(prompt: dict, summary: dict):
                         if isinstance(v, str):
                             if not v.strip():
                                 continue
+                            # A long value is a node's payload and no longer a
+                            # setting, unless it is the instruction given to a
+                            # language model.
                             if len(v) > 500 and not (is_vlm and k in _PROMPT_KEYS):
                                 continue
-                            # Cap even the allowed long values so a node wired to a
-                            # huge blob can't bloat the stored row.
                             if len(v) > _NODE_TEXT_MAX:
                                 v = v[:_NODE_TEXT_MAX] + "…"
                         node_params[k] = v
                     elif isinstance(v, dict):
-                        # Keep a small structured dict, but drop an image-preview
-                        # widget (the rgthree comparer): its view URLs point at
-                        # gone preview files and pollute free-text search. The
-                        # ComfyUI view-URL pattern marks every preview scheme and
-                        # never a genuine param.
+                        # A widget whose object holds a view link is a preview
+                        # of a file the run left behind.
                         if "view?filename=" not in json.dumps(v, default=str):
                             node_params[k] = v
                     elif isinstance(v, list) and len(v) >= 1:
-                        # Reference input. For prompt-ish fields, follow the link to
-                        # the source text/primitive node and capture its string, so
-                        # node prompts (JoyCaption custom_prompt, LLava system_msg,
-                        # MMAudio positive/negative, etc.) become visible in the panel,
-                        # searchable, and selectable in the layout editor.
                         kl = k.lower()
                         if k in _PROMPT_KEYS or any(t in kl for t in _PROMPT_REF_HINTS):
                             resolved = _resolve_text_recursive(prompt, v)
                             if resolved and resolved.strip():
-                                # These keys are explicitly prompts, so keep the full
-                                # text (capped) rather than dropping long ones. This
-                                # preserves e.g. JoyCaption custom_prompt, a long
-                                # instruction fed from a text node.
                                 node_params[k] = resolved if len(resolved) <= 4000 else (resolved[:4000] + "…")
                         elif kl in _CLIP_INPUT_KEYS:
-                            # Resolve a clip link to the loader filename so a node that
-                            # USES a CLIP/text-encoder (e.g. a TextGenerate LLM) shows
-                            # which model it ran. The image's own CLIP lives in
-                            # clip_models; an LLM-via-CLIPLoader has no other home, so
-                            # this gives the LLM panel section a node-scoped source
-                            # (workflow_nodes.<Node>.clip). Baked-checkpoint clips
-                            # resolve to nothing (no separate file).
                             _cn, _baked, _cprojs = _resolve_clip_source(prompt, v)
                             if _cn:
                                 node_params[k] = _cn[0]
                         elif kl not in _NON_SCALAR_INPUT_KEYS:
-                            # Scalar link (e.g. slider feeding MathExpression feeding
-                            # fps): resolve through the chain to the FINAL value, so
-                            # the consumer node shows what was actually used.
                             rv = _resolve_scalar_smart(prompt, v)
-                            # Name-ish keys (lora_name, model_name, ...) expect a
-                            # STRING. The legacy nearest-literal fallback can trace
-                            # a link to an unrelated numeric widget (a selector's
-                            # index), and showing that as "the name" would be
-                            # confidently wrong, so drop non-string results here.
+                            # A key naming something wants a string, and the
+                            # nearest literal fallback can land on a number.
                             if kl.endswith("_name") or kl.endswith("name"):
                                 if isinstance(rv, str) and rv.strip() and len(rv) <= 500:
                                     node_params[k] = rv
@@ -3582,47 +2990,29 @@ def _extract_from_comfyui_prompt(prompt: dict, summary: dict):
                                 node_params[k] = rv
                             elif isinstance(rv, str) and rv.strip() and len(rv) <= 500:
                                 node_params[k] = rv
-                # Math nodes: also expose the computed output as "result"
-                # (inputs a/b/c are captured above, resolved when linked).
                 if _is_math_node(class_type):
                     mres = _eval_math_node(prompt, node_data)
                     if mres is not None:
                         node_params["result"] = mres
-                # Always include nodes: even those with only reference inputs
-                # should appear in Workflow Nodes section with their class_type
                 generic_entry = {
                     "class_type": class_type,
                     "params": node_params,
                 }
                 if node_title and node_title != class_type:
                     generic_entry["title"] = node_title
-                # Flag VLM nodes so frontend can render prompts specially
                 if is_vlm:
                     generic_entry["is_vlm"] = True
                 if from_label and (is_display_node or not node_params):
                     generic_entry["_from"] = from_label
-                generic_entry["_node_id"] = str(node_id)  # correlate with workflow node
+                generic_entry["_node_id"] = str(node_id)
                 generic_nodes.append(generic_entry)
 
-
-    # Merge results into summary
-
-    # Samplers: structured array
     if samplers_found:
-        # Drop passes that perform no denoising (an Advanced KSampler whose
-        # start_at_step is at/after its last step, e.g. a disabled refiner left
-        # at start_at_step == steps), so the panel shows only the passes that
-        # actually ran. Keep them all if that would empty the list (defensive:
-        # every sampler reporting "no steps" means the heuristic is wrong here).
+        # A graph whose passes all look inactive keeps them, since showing none
+        # of them would say less than showing all.
         active = [s for s in samplers_found if not _sampler_runs_no_steps(s)]
         summary.setdefault("samplers", active or samplers_found)
-        # No backward-compat flat keys (steps, cfg, etc.) are set here.
-        # All sampler data lives exclusively in the samplers array.
-        # _final_summary_cleanup() will sweep any stale flat keys to 'extra'.
 
-    # Promote diffusion-model-loader candidates that actually feed a sampler, since
-    # a captioner/vision "…ModelLoader" (Florence2, etc.) wired to a non-sampler
-    # node must NOT be mistaken for the base model.
     if diffusion_model_candidates:
         _chain_nids: set = set()
         for _p in sampler_passes:
@@ -3632,22 +3022,17 @@ def _extract_from_comfyui_prompt(prompt: dict, summary: dict):
                 models_found.append(_nm)
                 model_loader_ids[_nid] = _nm
 
-    # HIGH/LOW roles from graph topology (Wan2.2 MoE), shared by models + loras.
     role_map = _compute_high_low_roles(prompt, sampler_passes, model_loader_ids)
 
-    # Carry each pass's role onto its sampler entry (HIGH/LOW pairing for the
-    # sampler cards). p["info"] is the samplers_found dict by reference.
+    # Each pass holds its card by reference, so writing here writes the card.
     for _p in sampler_passes:
         _r = _p.get("role")
         if _r and isinstance(_p.get("info"), dict):
             _p["info"]["role"] = _r
 
-    # A refine pass that reruns the SAME settings after a latent upscale
-    # yields a second sampler entry repeating the first minus a field or two
-    # (steps stay unresolved behind a ManualSigmas). Collapse such subset
-    # duplicates into the fuller entry so the panel shows one card per
-    # distinct configuration. Passes carrying a topology role (HIGH/LOW)
-    # always stay separate.
+    # One pass can be described by more than one node, so a card whose every
+    # field matches another's is folded into it. A card carrying a high or low
+    # noise role stands for a pass of its own and is left alone.
     _smp = summary.get("samplers")
     if isinstance(_smp, list) and len(_smp) > 1:
         _kept: list = []
@@ -3658,10 +3043,10 @@ def _extract_from_comfyui_prompt(prompt: dict, summary: dict):
                     if not (isinstance(_m, dict) and "role" not in _m):
                         continue
                     if all(_m.get(_k) == _v for _k, _v in _e.items()):
-                        _host = _m          # _e repeats (a subset of) _m
+                        _host = _m
                         break
                     if all(_e.get(_k) == _v for _k, _v in _m.items()):
-                        _m.update(_e)       # _m was the subset: absorb _e
+                        _m.update(_e)
                         _host = _m
                         break
             if _host is None:
@@ -3669,18 +3054,6 @@ def _extract_from_comfyui_prompt(prompt: dict, summary: dict):
         if len(_kept) < len(_smp):
             summary["samplers"] = _kept
 
-    # Multi-pass ordering and stage labels. Each pass's lineage names the nodes
-    # and earlier passes it consumes (see _trace_pass_lineage). A pass that
-    # consumes an earlier pass is a POST-PROCESS pass:
-    #   - running the SAME base model: it stays a sampler card, labeled only
-    #     when an upscaler or interpolation node sits on the path to the pass it
-    #     continues (plain continuations such as video segments stay unlabeled);
-    #   - running its OWN separate model (a self-contained upscaler pipeline
-    #     like PiD): the whole pass leaves the sampling and model summaries and
-    #     is reported under upscaling instead.
-    # HIGH/LOW role passes keep their role and are never stage-labeled. Finally
-    # the sampler cards are ordered by execution (a pass runs after any pass it
-    # consumes), so the base pass is always first.
     _pass_nids = {p["nid"] for p in sampler_passes}
     _pass_lineage = {p["nid"]: _trace_pass_lineage(prompt, p["nid"], _pass_nids)
                      for p in sampler_passes}
@@ -3692,6 +3065,9 @@ def _extract_from_comfyui_prompt(prompt: dict, summary: dict):
         return {n for n in _collect_model_chain_nids(prompt, p.get("model_ref"))
                 if n in model_loader_ids}
 
+    # A pass fed by an earlier pass, loading models the first one never used, is
+    # a stage of its own instead of a second half of the generation. It moves
+    # into upscaling, taking the prompt, VAE and encoder that belong to it.
     if len(sampler_passes) > 1:
         _base_loaders: set[str] = set()
         for _p in sampler_passes:
@@ -3711,10 +3087,6 @@ def _extract_from_comfyui_prompt(prompt: dict, summary: dict):
                 for _fk in ("sampler_name", "steps", "cfg", "denoise", "seed"):
                     if _fk in _p["info"]:
                         _entry[_fk] = _p["info"][_fk]
-                # Ordering identity: the moved pass orders by execution like
-                # every other upscaling entry, walking upstream from its own
-                # latent or image input. Without these markers the sort cannot
-                # place it and the size chain anchors the wrong ends.
                 _entry["_nid"] = _p["nid"]
                 _pnode = prompt.get(_p["nid"]) if isinstance(prompt, dict) else None
                 if isinstance(_pnode, dict) and isinstance(_pnode.get("inputs"), dict):
@@ -3727,9 +3099,8 @@ def _extract_from_comfyui_prompt(prompt: dict, summary: dict):
                 upscaling_found.append(_entry)
                 _post_pass_nids.add(_p["nid"])
                 _upscale_entries[_p["nid"]] = _entry
-                # Remove the moved pass's card by IDENTITY. The subset collapse
-                # above can leave the base card EQUAL to this one, and a value
-                # remove would then delete the base card instead.
+                # Removed by identity, since the fold above can leave the base
+                # card equal to this one and removing by value would take that.
                 _cards = summary.get("samplers")
                 if isinstance(_cards, list):
                     for _ci, _c in enumerate(_cards):
@@ -3741,14 +3112,9 @@ def _extract_from_comfyui_prompt(prompt: dict, summary: dict):
                 if _stage:
                     _p["info"]["stage"] = _stage
         if _post_pass_nids:
-            # The active-loader model filter and the CLIP merge below must not
-            # count the post-process pipeline's passes or its encoders.
             _post_vis = set().union(*(_pass_lineage[n] for n in _post_pass_nids))
             _remaining = _pass_nids - _post_pass_nids
             _base_vis = set().union(*(_pass_lineage[n] for n in _remaining)) if _remaining else set()
-            # Carry each moved pass's own text encoder onto its upscaling entry.
-            # The filter below drops an encoder that feeds only a moved pass, so
-            # without this the encoder would leave Models and be recorded nowhere.
             for _nid_pp, _uentry in _upscale_entries.items():
                 _pv = _pass_lineage.get(_nid_pp, set())
                 _eclip: list[str] = []
@@ -3762,9 +3128,8 @@ def _extract_from_comfyui_prompt(prompt: dict, summary: dict):
             active_clip_refs[:] = [(_enc, _ref) for _enc, _ref in active_clip_refs
                                    if _enc in _base_vis or _enc not in _post_vis]
 
-            # Same treatment for the pass's prompt and VAE. The encoders sit in
-            # the pass's lineage; the decode sits DOWNSTREAM of it, so a decode
-            # is attributed by walking its inputs back to a moved pass.
+            # An encoder sits in the pass's own lineage, while the decode that
+            # pass feeds sits downstream of it.
             def _feeds_from_pass(_cnid: str, _depth: int = 6) -> str | None:
                 queue: list[tuple[str, int]] = [(_cnid, 0)]
                 seen: set[str] = set()
@@ -3795,10 +3160,6 @@ def _extract_from_comfyui_prompt(prompt: dict, summary: dict):
                 if _cnid not in _base_vis:
                     _ccl = str((prompt.get(_cnid) or {}).get("class_type", "")).lower()
                     if "vaeencode" in _ccl:
-                        # An encode feeding the moved pass sits in its lineage.
-                        # A decode must NOT use the lineage test: the base
-                        # decode is upstream of the pass's image input too, so
-                        # only the walk from the decode back to the pass counts.
                         for _nid_pp in _post_pass_nids:
                             if _cnid in _pass_lineage.get(_nid_pp, set()):
                                 _pp = _nid_pp
@@ -3814,19 +3175,11 @@ def _extract_from_comfyui_prompt(prompt: dict, summary: dict):
                 else:
                     _kept_vrefs.append((_cnid, _vr))
             main_vae_refs[:] = _kept_vrefs
-            # The loader-name fallback must not resurrect a VAE that was just
-            # attributed to a moved pass (the PiD pipeline ships its own
-            # pixel_space loader, and with an AIO base checkpoint it would be
-            # the only loader in the graph).
             _post_vaes = {e.get("vae") for e in _upscale_entries.values()
                           if e.get("vae")}
             if _post_vaes:
                 vae_loader_names[:] = [n for n in vae_loader_names
                                        if n not in _post_vaes]
-                # A saver-written parameters chunk can state the same VAE (the
-                # saver reads whatever VAE reaches it, the moved pass's here).
-                # The value lives on the upscaling entry now, so an identical
-                # summary value is the same fact in the wrong place.
                 if summary.get("vae") in _post_vaes:
                     summary.pop("vae", None)
             positive_texts[:] = [(n, t) for n, t in positive_texts
@@ -3845,23 +3198,19 @@ def _extract_from_comfyui_prompt(prompt: dict, summary: dict):
                 summary.pop("prompt_enhanced", None)
             sampler_passes[:] = [p for p in sampler_passes if p["nid"] not in _post_pass_nids]
 
-        # Order the remaining sampler cards by execution: a pass runs after
-        # every pass it consumes. Sorting by predecessor count (stable) puts
-        # the base pass first, then each downstream stage in turn.
+        # The cards read in the order the passes ran.
         _cards = summary.get("samplers")
         if isinstance(_cards, list) and len(_cards) > 1:
             _nid_of = {id(p["info"]): p["nid"] for p in sampler_passes}
             _cards.sort(key=lambda e: len(_predecessor_passes(_nid_of.get(id(e), ""))))
 
-    # Models
     if models_found:
         seen: list[str] = []
         for m in models_found:
             if m not in seen:
                 seen.append(m)
-        # When topology identified a high/low pass, order the model list
-        # high-then-low so the HIGH/LOW model cards line up even when the
-        # filenames carry no high/low token.
+        # With both halves of a two model run named, the high noise model is the
+        # one listed first.
         if role_map and model_loader_ids and len(seen) > 1:
             name_role: dict[str, str] = {}
             for nid, nm in model_loader_ids.items():
@@ -3871,10 +3220,6 @@ def _extract_from_comfyui_prompt(prompt: dict, summary: dict):
             if name_role:
                 _ord = {"high": 0, "low": 1}
                 seen.sort(key=lambda nm: _ord.get(name_role.get(nm, ""), 2))
-        # Switch-aware: keep only the models the SAMPLERS actually use, dropping a
-        # switch's unselected branch (e.g. a GGUF/safetensors A-or-B "Any Switch").
-        # Applied ONLY when every sampler's model resolved to a loader, so a model
-        # hidden behind an unhandled node is never silently dropped.
         _active_ids, _safe = _resolve_active_model_loaders(prompt, sampler_passes, model_loader_ids)
         if _safe:
             _active_names = {model_loader_ids[a] for a in _active_ids if a in model_loader_ids}
@@ -3882,10 +3227,6 @@ def _extract_from_comfyui_prompt(prompt: dict, summary: dict):
                 seen = [m for m in seen if m in _active_names]
         summary.setdefault("model", seen[0] if len(seen) == 1 else seen)
 
-    # CLIP models: follow each active text encoder's clip link to its real source.
-    # Excludes a CLIPLoader feeding a separate LLM/TextGenerate node; yields nothing
-    # when the CLIP is baked into the checkpoint; reads a custom encoder leaf's model
-    # file (e.g. an LLM used as a text encoder).
     clip_names: list[str] = []
     projection_names: list[str] = []
     for _enc_nid, _cref in active_clip_refs:
@@ -3902,23 +3243,19 @@ def _extract_from_comfyui_prompt(prompt: dict, summary: dict):
         summary.setdefault("text_projection",
                            projection_names[0] if len(projection_names) == 1 else projection_names)
 
-    # VAE per consumer chain: the decode path names the video/main VAE and the
-    # audio consumers name the audio VAE, so a graph with two VAELoaders no
-    # longer collapses to whichever loader the node loop met first. The first
-    # loader seen stays as the fallback when no consumer link resolves.
     _main_vae = None
     for _cnid, _vr in main_vae_refs:
         _main_vae = _resolve_vae_source(prompt, _vr)
         if _main_vae:
             break
+    # A loader's name stands in only where no decode link led to a VAE of its
+    # own.
     if _main_vae is None and vae_loader_names:
         _main_vae = vae_loader_names[0]
     if _main_vae:
         summary.setdefault("vae", _main_vae)
-        # Transient provenance marker for _final_summary_cleanup: a VAE the
-        # graph itself resolves is legitimate even when an upscaling pass uses
-        # the same file (one loader feeding decode and upscaler is the normal
-        # single-VAE hires shape). Popped during cleanup.
+        # Kept for the cleanup pass, which has to tell a VAE the graph named
+        # from one that only a parameters line mentioned.
         summary["_vae_graph"] = _main_vae
     _audio_vae = None
     for _vr in audio_vae_refs:
@@ -3928,9 +3265,6 @@ def _extract_from_comfyui_prompt(prompt: dict, summary: dict):
     if _audio_vae and _audio_vae != summary.get("vae"):
         summary.setdefault("audio_vae", _audio_vae)
 
-    # LoRAs (structured): dedup identical entries (the same LoRA loaded by two
-    # parallel high/low loaders) and tag each with its topology role so the UI
-    # pairs HIGH vs LOW reliably instead of guessing from the filename.
     if loras_found:
         seen_lora: set = set()
         deduped_loras: list[dict] = []
@@ -3945,17 +3279,12 @@ def _extract_from_comfyui_prompt(prompt: dict, summary: dict):
             deduped_loras.append(lo)
         summary.setdefault("loras", deduped_loras)
 
-    # Initial images (all active input images, deduped, prompt order). ONE
-    # write site: the back-compat scalar is by definition the list's first
-    # entry, so deriving it here means a future detection site only has to
-    # append to the list and can never desync the pair.
     if initial_images_found:
         summary.setdefault("initial_images", initial_images_found[:8])
         summary.setdefault("initial_image", initial_images_found[0])
     if initial_audios_found:
         summary.setdefault("initial_audios", initial_audios_found[:8])
 
-    # ControlNet (structured with preprocessor): MERGE duplicates
     if controlnets_found:
         merged_cn: dict[str, dict] = {}
         for c in controlnets_found:
@@ -3970,7 +3299,6 @@ def _extract_from_comfyui_prompt(prompt: dict, summary: dict):
                 merged_cn[key] = dict(c)
         summary.setdefault("controlnet", list(merged_cn.values()))
 
-    # ADetailer (structured with sampler params)
     if adetailers_found:
         seen_ad: set[str] = set()
         unique_ad: list[dict] = []
@@ -3981,12 +3309,9 @@ def _extract_from_comfyui_prompt(prompt: dict, summary: dict):
                 unique_ad.append(a)
         summary.setdefault("adetailer", unique_ad)
 
-    # MMAudio
     if mmaudio_info:
         summary.setdefault("mmaudio", mmaudio_info)
 
-    # Entries produced on a switch branch the switch does not forward never
-    # touched the saved file; drop them before display.
     if (upscaling_found or interpolation_found) and isinstance(prompt, dict):
         _gate_nids = {e.get("_nid") for e in upscaling_found + interpolation_found
                       if e.get("_nid")}
@@ -3997,8 +3322,6 @@ def _extract_from_comfyui_prompt(prompt: dict, summary: dict):
             interpolation_found = [e for e in interpolation_found
                                    if e.get("_nid") not in _off]
 
-    # Shared by the upscaling and interpolation assembly: every node id
-    # upstream of a ref, so chained passes can order by execution.
     def _upstream_nids(start_ref, max_depth: int = 24) -> set[str]:
         out: set[str] = set()
         queue = [(start_ref, 0)]
@@ -4017,8 +3340,7 @@ def _extract_from_comfyui_prompt(prompt: dict, summary: dict):
                         queue.append((v, depth + 1))
         return out
 
-    # Upscaling: order chained passes by execution (a pass whose frames come
-    # from another pass renders after it), then deduplicate.
+    # The entries read in the order the image passed through them.
     if upscaling_found:
         _up_nids = {u.get("_nid") for u in upscaling_found}
         _updeco: list[tuple[int, dict]] = []
@@ -4029,8 +3351,6 @@ def _extract_from_comfyui_prompt(prompt: dict, summary: dict):
         _updeco.sort(key=lambda t: t[0])
         upscaling_found = [u for _c, u in _updeco]
         for u in upscaling_found:
-            # A factor stated in the model filename ("x2", "4x") stands in for
-            # a missing scale, which also lets the initial resolution derive.
             if u.get("model") and not any(
                     k in u for k in ("scale_by", "scale_factor", "width",
                                      "height", "resolution")):
@@ -4048,9 +3368,6 @@ def _extract_from_comfyui_prompt(prompt: dict, summary: dict):
                 unique_ups.append(u)
         summary.setdefault("upscaling", unique_ups)
 
-    # Interpolation: order chained passes by execution (a pass whose frames
-    # come from another pass renders after it), then deduplicate by content so
-    # a chain of same-type nodes keeps every distinct pass.
     if interpolation_found:
         interp_nids = {ip.get("_nid") for ip in interpolation_found}
         by_nid = {ip.get("_nid"): ip for ip in interpolation_found}
@@ -4062,15 +3379,11 @@ def _extract_from_comfyui_prompt(prompt: dict, summary: dict):
             ups_by_nid[_ip_nid] = ups
             decorated.append((len(ups), ups, _ip_nid, ip))
         decorated.sort(key=lambda t: t[0])
-        # A pass with no source rate inherits it from its IMMEDIATE feeders,
-        # the maximal upstream passes (not upstream of any other member), which
-        # covers straight chains, merges, and depth-capped views alike. A rate
-        # further back says nothing once a pass between changed it. All the
-        # feeders must agree on a numeric target, so a runtime-computed feeder
-        # blocks the inheritance.
         for _cnt, ups, _ip_nid, ip in decorated:
             if "source_fps" in ip or not ups:
                 continue
+            # Where every interpolator feeding this one targets the same rate,
+            # that rate is what this one was handed.
             feeders = [n for n in ups
                        if n in by_nid and not any(
                            n in ups_by_nid.get(m, set()) for m in ups if m != n)]
@@ -4090,12 +3403,13 @@ def _extract_from_comfyui_prompt(prompt: dict, summary: dict):
             unique_interp.append(ip)
         summary.setdefault("interpolation", unique_interp)
 
-    # Prompts. Multiple distinct texts (multi-part video workflows, base+refiner)
-    # are joined with "---"; sort by node id first so the order is deterministic
-    # and usually matches the order the parts were authored in.
+    # A node inside a subgraph carries its parents' ids before its own, so each
+    # segment sorts on its number where it has one.
     def _nid_sort_key(nid: str):
         return [(0, int(seg)) if seg.isdigit() else (1, seg) for seg in nid.split(":")]
 
+    # Several encoders can hold different text, so the parts go in graph order,
+    # ruled off from each other.
     def _joined_unique(texts: list[tuple[str, str]], clean=None) -> str | None:
         seen: set[str] = set()
         unique: list[str] = []
@@ -4111,13 +3425,9 @@ def _extract_from_comfyui_prompt(prompt: dict, summary: dict):
             return None
         return "\n---\n".join(unique) if len(unique) > 1 else unique[0]
 
-    # The positive side strips inline lora tags before dedupe, so two texts
-    # differing only in a lora tag collapse to one.
     for _texts, _skey, _clean in (
             (positive_texts, "positive_prompt",
              lambda t: re.sub(r'<lora:[^>]+>', '', t).strip()),
-            # Initial prompt from the enhancer (the user's text before VLM/LLM
-            # enhancement).
             (initial_prompts, "initial_prompt", None),
             (tags_texts, "audio_tags", None),
             (lyrics_texts, "audio_lyrics", None),
@@ -4126,12 +3436,7 @@ def _extract_from_comfyui_prompt(prompt: dict, summary: dict):
         if _joined is not None:
             summary.setdefault(_skey, _joined)
 
-    # Generic workflow nodes
     if generic_nodes:
-        # Keep ALL instances of each node type (a workflow can legitimately use
-        # the same node 4x for different purposes), capped to avoid DB bloat:
-        # at most 8 per class_type (prefer the ones with the most params) and
-        # ~120 overall (param-less _handled stubs dropped first).
         _MAX_PER_TYPE = 8
         _MAX_TOTAL = 120
         by_type: dict[str, list[dict]] = {}
@@ -4144,8 +3449,6 @@ def _extract_from_comfyui_prompt(prompt: dict, summary: dict):
                 entries = [g for g in entries if any(g is r for r in richest)]
             for g in entries:
                 kept.add(id(g))
-            # Duplicated types: attach downstream context (up to 2 consumer
-            # slots) so instances can be told apart in the layout editor.
             if len(entries) > 1:
                 for g in entries:
                     feeds = feeds_map.get(g.get("_node_id", ""), [])
@@ -4159,83 +3462,76 @@ def _extract_from_comfyui_prompt(prompt: dict, summary: dict):
             capped = [g for g in capped if id(g) not in drop_ids][:_MAX_TOTAL]
         summary.setdefault("workflow_nodes", capped)
 
-
+# A display node fed the file's own prompt or workflow shows the metadata back
+# to itself.
 def _looks_like_raw_metadata(t: str) -> bool:
-    """A display node wired to a loader's "metadata raw" output shows the whole
-    prompt/workflow JSON (or an embedded-metadata blob) instead of a caption. Only a
-    leading "{" (JSON object) is a reliable signal. A leading "[" is unreliable
-    because it also starts genuine captions like prompt-editing "[dog:cat:0.5]" or a
-    tag list ["1girl","solo"]; array-of-object dumps are still caught by the markers."""
     s = t.lstrip()
     if s.startswith("{"):
         return True
     return ('"class_type"' in s or '"last_node_id"' in s
             or '"extra_pnginfo"' in s or '"nodes":' in s)
 
-
-# Reconstruction of the API prompt from the workflow graph (workflow-only PNGs)
-# ComfyUI PNGs saved with only the UI "workflow" graph (no API "prompt" chunk)
-# still carry everything needed to reconstruct the run: named input/output slots,
-# an explicit links array, node modes (bypass/mute), and subgraph definitions.
-# _workflow_to_prompt rebuilds the API-format prompt dict so the EXISTING extractor
-# recovers full metadata. Core rule: return a VALID prompt or None, since
-# wrong data is worse than none.
-
 _WF_WIDGET_KINDS = {"INT", "FLOAT", "STRING", "BOOLEAN", "COMBO"}
 _WF_CONTROL_VALUES = {"fixed", "increment", "decrement", "randomize"}
 
-
 def _wf_map_widgets(node: dict, class_type: str, registry, api_inputs: dict) -> None:
-    """Map positional widgets_values to named inputs via the node's schema. Skips
-    connection inputs, converted-to-link sockets, and the synthetic
-    control_after_generate widget. No-op when the schema is unknown."""
+    """`widgets_values` is a bare list in the order the node declares its widget
+    inputs, so the registry's signature is what names them. A value stays in the
+    list even for an input turned into a link, which is why the index always
+    advances. A seed widget is followed by its own control value, which belongs
+    to no input and is stepped over.
+    """
     wv = node.get("widgets_values")
     if not isinstance(wv, list) or not wv:
         return
     sig = registry.sig(class_type) if registry else None
     if not sig:
-        return                                                # unknown node: connections only
+        return
     idx = 0
     for name, kind in (sig.get("inputs") or {}).items():
-        if kind not in _WF_WIDGET_KINDS:                      # a connection, no widget slot
+        if kind not in _WF_WIDGET_KINDS:
             continue
         if idx >= len(wv):
             break
         val = wv[idx]
         idx += 1
-        # A seed INT keeps a synthetic control_after_generate widget right after
-        # it in widgets_values. Consume it so later widgets stay aligned.
-        # Restricted to inputs actually NAMED like seeds: consuming after ANY
-        # INT could swallow a legitimate COMBO whose value happens to be
-        # "fixed"/"increment"/…, shifting every later widget onto the wrong
-        # input (wrong steps/cfg extracted from workflow-only PNGs).
         if (kind == "INT" and name in ("seed", "noise_seed")
                 and idx < len(wv) and isinstance(wv[idx], str) and wv[idx] in _WF_CONTROL_VALUES):
             idx += 1
-        # ComfyUI keeps every widget's value in widgets_values even when the widget is
-        # converted to a link input, so we always advance the index. setdefault never
-        # overrides a value already resolved from a link (the link wins); when a
-        # converted input's link is dead/unset it falls back to the widget value.
         api_inputs.setdefault(name, val)
 
+# A subgraph definition can hold instances of another, and each instance is
+# expanded into a fresh copy, so a chain where each level holds two of the
+# next doubles at every level. Any real workflow sits far inside this.
+_SUBGRAPH_MAX_NODES = 20000
+
+class _ExpansionBudget(Exception):
+    pass
 
 def _workflow_to_prompt(workflow: dict, registry) -> dict | None:
-    """Reconstruct the API-format prompt dict from a ComfyUI workflow graph,
-    flattening subgraphs (boundary in/out) and following bypass (mode 4) / mute
-    (mode 2). Returns None on any failure so a malformed prompt is never produced."""
+    """The workflow holds nodes and links where the prompt holds inputs, so each
+    link is followed to whatever really produced the value: through a node the
+    user muted or bypassed, through a Set and Get pair that carries a value by
+    name, and in and out of a subgraph, whose nodes come back with their
+    instance id in front. A malformed workflow, or one whose subgraphs expand
+    past the budget, gives nothing instead of failing the read.
+    """
     try:
         if not isinstance(workflow, dict):
             return None
+        expanded = 0
         defs: dict = {}
         for s in ((workflow.get("definitions") or {}).get("subgraphs") or []):
             if isinstance(s, dict) and s.get("id"):
                 defs[s["id"]] = s
 
-        set_nodes: dict = {}                                   # rgthree Set/Get: (frame, set_node_id), keyed by name
+        set_nodes: dict = {}
 
         def _wf_norm(t):
             return str(t or "").replace(" ", "").replace("_", "").lower()
 
+        # A Set and its Get are paired by the name in the node's first widget, and
+        # fall back to the title, or to the part after an underscore where it has one.
         def _wf_vname(n):
             wv = n.get("widgets_values")
             if isinstance(wv, list) and wv and isinstance(wv[0], str):
@@ -4244,12 +3540,19 @@ def _workflow_to_prompt(workflow: dict, registry) -> dict | None:
             return t.split("_", 1)[1] if "_" in t else t
 
         def build_frame(container, prefix, parent, inst_nid):
+            nonlocal expanded
             nodes = {}
             for n in container.get("nodes", []) or []:
                 if isinstance(n, dict) and n.get("id") is not None:
                     nodes[n["id"]] = n
-            by_target = {}                                       # (origin_id, origin_slot), keyed by (target_id, target_slot)
-            by_link = {}                                         # (origin_id, origin_slot), keyed by link_id
+            expanded += len(nodes)
+            if expanded > _SUBGRAPH_MAX_NODES:
+                raise _ExpansionBudget()
+            by_target = {}
+            by_link = {}
+            # A link is written either as the list of its id, origin node,
+            # origin slot, target node, target slot and type, or as an object
+            # naming the same things.
             for l in container.get("links", []) or []:
                 if isinstance(l, (list, tuple)) and len(l) >= 6:
                     by_target[(l[3], l[4])] = (l[1], l[2])
@@ -4261,13 +3564,8 @@ def _workflow_to_prompt(workflow: dict, registry) -> dict | None:
                   "parent": parent, "inst_nid": inst_nid, "children": {},
                   "in_id": (container.get("inputNode") or {}).get("id"),
                   "out_id": (container.get("outputNode") or {}).get("id"),
-                  # subgraph boundary slot NAMES: an instance node only exposes the
-                  # connected slots, so boundary hops must match by name (slot
-                  # indexes shift with the connections).
                   "input_names": [s.get("name") for s in (container.get("inputs") or []) if isinstance(s, dict)],
                   "output_names": [s.get("name") for s in (container.get("outputs") or []) if isinstance(s, dict)],
-                  # each subgraph output slot's internal link ids (the outputNode uses
-                  # odd internal target slots, so resolve outputs via linkIds instead).
                   "output_links": [s.get("linkIds") for s in (container.get("outputs") or []) if isinstance(s, dict)]}
             for nid, n in nodes.items():
                 if _wf_norm(n.get("type")) == "setnode":
@@ -4295,10 +3593,9 @@ def _workflow_to_prompt(workflow: dict, registry) -> dict | None:
         def resolve_output(fr, node_id, slot, depth):
             if depth > 512:
                 return None
-            # boundary IN: a subgraph input slot resolves to the instance's external
-            # input in the parent, matched by NAME (an instance exposes only its
-            # connected slots, so slot indices differ between the subgraph
-            # definition and the instance).
+            # An output taken from the subgraph's own input node leaves the
+            # frame, so the question moves to the matching input of the
+            # instance one level up.
             if fr["parent"] is not None and node_id == fr["in_id"]:
                 names = fr["input_names"]
                 tname = names[slot] if isinstance(slot, int) and 0 <= slot < len(names) else None
@@ -4312,25 +3609,25 @@ def _workflow_to_prompt(workflow: dict, registry) -> dict | None:
             node = fr["nodes"].get(node_id)
             if node is None:
                 return None
+            # Mode 2 is a muted node, which produced nothing, and mode 4 is a
+            # bypassed one, which passed its input along.
             mode = node.get("mode")
-            if mode == 2:                                        # muted, so the output is dead
+            if mode == 2:
                 return None
             nt = _wf_norm(node.get("type"))
-            if nt == "getnode":                                  # rgthree Get: resolve the matching Set's input
+            if nt == "getnode":
                 tgt = set_nodes.get(_wf_vname(node))
                 return resolve_input(tgt[0], tgt[1], 0, depth + 1) if tgt else None
-            if nt == "setnode":                                  # rgthree Set: pass its stored input through
+            if nt == "setnode":
                 return resolve_input(fr, node_id, 0, depth + 1)
-            if mode == 4:                                        # bypassed: pass the matching input through
+            if mode == 4:
                 return _bypass_through(fr, node, node_id, slot, depth)
-            if node.get("type") in defs:                         # active subgraph instance
+            # An output of a subgraph instance is answered inside the subgraph,
+            # by the link its matching output slot carries.
+            if node.get("type") in defs:
                 child = fr["children"].get(node_id)
                 if child is None:
                     return None
-                # boundary OUT: an instance output slot resolves to its internal
-                # producer, matched by NAME then resolved via the subgraph output's
-                # linkIds (the outputNode uses odd internal target slots that
-                # by_target can't key on).
                 outs = node.get("outputs") or []
                 oname = outs[slot].get("name") if isinstance(slot, int) and 0 <= slot < len(outs) and isinstance(outs[slot], dict) else None
                 onames = child["output_names"]
@@ -4341,8 +3638,8 @@ def _workflow_to_prompt(workflow: dict, registry) -> dict | None:
                     src = child["by_link"].get(lids[0])
                     if src is not None:
                         return resolve_output(child, src[0], src[1], depth + 1)
-                return resolve_input(child, child["out_id"], oslot, depth + 1)   # fallback (older format)
-            return (fr["prefix"] + str(node_id), slot)           # real producer
+                return resolve_input(child, child["out_id"], oslot, depth + 1)
+            return (fr["prefix"] + str(node_id), slot)
 
         prompt: dict = {}
 
@@ -4350,7 +3647,7 @@ def _workflow_to_prompt(workflow: dict, registry) -> dict | None:
             for nid, node in fr["nodes"].items():
                 ct = node.get("type")
                 if ct in defs or node.get("mode") in (2, 4) or not isinstance(ct, str) or not ct \
-                        or _wf_norm(ct) in ("setnode", "getnode"):    # virtual link-only nodes
+                        or _wf_norm(ct) in ("setnode", "getnode"):
                     continue
                 api_inputs: dict = {}
                 for i, inp in enumerate(node.get("inputs") or []):
@@ -4372,24 +3669,15 @@ def _workflow_to_prompt(workflow: dict, registry) -> dict | None:
     except Exception:
         return None
 
-
 def _extract_from_comfyui_workflow(workflow: dict, summary: dict,
                                    linked_size_ids: set[str] | frozenset = frozenset(),
                                    executed_ids: set[str] | None = None):
-    """Extract width/height from ComfyUI workflow graph format.
-
-    linked_size_ids: prompt node ids whose width/height inputs are LINKS. The
-    workflow widgets for those nodes hold a stale typed-in value from before
-    the conversion (e.g. WanImageToVideo showing 480×720 while the real size
-    came from a GetImageSize at runtime), so they must be skipped.
+    """Widget values are whatever was last typed into the editor, so no size is
+    read from a node named in `linked_size_ids` or absent from `executed_ids`.
     """
     nodes = workflow.get("nodes", [])
     if not isinstance(nodes, list):
         return
-
-    # Do NOT set workflow_nodes here: the prompt-based extractor
-    # (_extract_from_comfyui_prompt) already populates it with detailed
-    # node dicts for search. Setting it to an integer count would break search.
 
     _RESOLUTION_NODES = {
         "emptylatentimage", "emptysd3latent",
@@ -4400,16 +3688,16 @@ def _extract_from_comfyui_workflow(workflow: dict, summary: dict,
             continue
         if str(node.get("id")) in linked_size_ids:
             continue
-        # Muted/bypassed nodes exist in the workflow but never ran (they are
-        # absent from the prompt), so their widget sizes are not this image's.
         if executed_ids is not None and str(node.get("id")) not in executed_ids:
             continue
         ntype = node.get("type", "")
         if ntype.lower().replace(" ", "") in {n.replace(" ", "") for n in _RESOLUTION_NODES}:
+            # These nodes take width first and height second.
             widgets = node.get("widgets_values", [])
             if isinstance(widgets, list) and len(widgets) >= 2:
                 try:
                     w, h = int(widgets[0]), int(widgets[1])
+                    # Outside these bounds the pair is some other widget.
                     if 64 <= w <= 8192 and 64 <= h <= 8192:
                         summary.setdefault("resolution", f"{w}×{h}")
                         summary.setdefault("width", w)
@@ -4417,11 +3705,6 @@ def _extract_from_comfyui_workflow(workflow: dict, summary: dict,
                 except (ValueError, TypeError):
                     pass
 
-    # Correct display-node text from widgets_values
-    # "Show" nodes (easy showAnything, ShowText, …) store the REAL displayed
-    # output in the workflow's widgets_values, whereas the prompt's text input can
-    # hold a STALE value baked in from a previous run. Override the captured text
-    # with the workflow value, matched by node id.
     _SHOW_NODE_PATTERNS = ("showanything", "showtext", "displayany", "showstring",
                            "displaytext", "previewany")
 
@@ -4445,15 +3728,13 @@ def _extract_from_comfyui_workflow(workflow: dict, summary: dict,
             txt = _first_str(node.get("widgets_values"))
             if isinstance(txt, str) and txt.strip():
                 t = txt.strip()
-                # A "metadata raw" dump would bloat the row and reads as noise
-                # in the panel; skip storing it and drop the node entirely.
                 if _looks_like_raw_metadata(t):
                     raw_meta_ids.add(str(node.get("id")))
                     continue
-                # Cap: a show node can display a huge blob. Store at most
-                # _NODE_TEXT_MAX chars so it can't bloat the row.
                 wf_show_text[str(node.get("id"))] = t if len(t) <= _NODE_TEXT_MAX else (t[:_NODE_TEXT_MAX] + "…")
 
+    # The workflow's own copy is what the node really displayed, while the text
+    # input in the prompt can be a run behind, so this one replaces it.
     if wf_show_text:
         for entry in summary.get("workflow_nodes", []) or []:
             if not isinstance(entry, dict):
@@ -4463,25 +3744,17 @@ def _extract_from_comfyui_workflow(workflow: dict, summary: dict,
             if nid in wf_show_text and isinstance(params, dict):
                 params["text"] = wf_show_text[nid]
 
-    # Drop display nodes that dump raw metadata: the dump carries no
-    # generation params and bloats the stored row.
     if raw_meta_ids:
         summary["workflow_nodes"] = [
             e for e in (summary.get("workflow_nodes") or [])
             if not (isinstance(e, dict) and str(e.get("_node_id")) in raw_meta_ids)
         ]
 
-
 _MODEL_SCALE_X = re.compile(r"(?:^|[^0-9A-Za-z])[xX](\d{1,2})(?!\d)")
 _MODEL_SCALE_NX = re.compile(r"(?:^|[^0-9A-Za-z])(\d{1,2})[xX](?!\d)")
 
-
 def _scale_from_model_name(name: Any) -> int | None:
-    """The upscale factor stated in a model filename, in either spelling:
-    "RealESRGAN_x2plus" or "4x-UltraSharp". Trusted only for whole factors
-    2..16; a 1x model changes no dimensions and contributes nothing to the
-    size derivation. The boundary requirement keeps a trailing "x" in a base
-    name ("flux2") from reading as a factor."""
+    """The factor an upscale model's own name states, written 4x or x4."""
     base = os.path.basename(str(name).replace("\\", "/"))
     for rx in (_MODEL_SCALE_X, _MODEL_SCALE_NX):
         m = rx.search(base)
@@ -4491,18 +3764,11 @@ def _scale_from_model_name(name: Any) -> int | None:
                 return f
     return None
 
-
 def _chain_upscale_pass_sizes(summary: dict[str, Any]) -> None:
-    """Give each upscaling pass its own initial and final resolution by
-    propagating size constraints BOTH ways along the ordered pipeline: the
-    generation size anchors the front, the file's real size anchors the end,
-    and each pass with a known transform carries a size across (a factor
-    multiplies, explicit width and height set the size, a DiT target rescales
-    by the SHORT edge, a longer-edge target by the long edge, megapixels by
-    area). Factor passes also invert, so sizes flow backward from the file
-    through them; a load-then-upscale workflow with no generation size still
-    resolves from the end. A boundary neither direction reaches stays
-    unclaimed rather than guessed."""
+    """A pass in the middle may state only a factor, so the sizes are filled
+    forward from the generation resolution and then backward from the file's
+    own, which stands as the last size whatever the forward pass worked out.
+    """
     ups = summary.get("upscaling")
     if (not isinstance(ups, list) or not ups
             or not all(isinstance(u, dict) for u in ups)):
@@ -4510,33 +3776,39 @@ def _chain_upscale_pass_sizes(summary: dict[str, Any]) -> None:
 
     def _parse(res):
         m = re.match(r"^\s*(\d+)\s*[×x]\s*(\d+)\s*$", str(res or ""))
-        return (int(m.group(1)), int(m.group(2))) if m else None
+        wh = (int(m.group(1)), int(m.group(2))) if m else None
+        return wh if wh and wh[0] > 0 and wh[1] > 0 else None
 
     def _num(v):
-        return isinstance(v, (int, float)) and not isinstance(v, bool) and v > 0
+        return isinstance(v, (int, float)) and not isinstance(v, bool) and v > 0 and math.isfinite(v)
+
+    # A pass never produces an empty side, and a side of zero would be divided
+    # by on the next pass, so every computed size is floored at one pixel.
+    def _size(w, hgt):
+        return (max(1, round(w)), max(1, round(hgt)))
 
     def _fwd(u, cur):
         sb = u.get("scale_by") or u.get("scale_factor")
         w, hgt = u.get("width"), u.get("height")
         if _num(sb):
-            return (round(cur[0] * sb), round(cur[1] * sb))
+            return _size(cur[0] * sb, cur[1] * sb)
         if _num(w) and _num(hgt):
-            return (int(w), int(hgt))
+            return _size(int(w), int(hgt))
         for key, edge in (("target_resolution", min), ("longer_edge", max)):
             t = u.get(key)
             if _num(t):
                 f = t / edge(cur)
-                return (round(cur[0] * f), round(cur[1] * f))
+                return _size(cur[0] * f, cur[1] * f)
         mp = u.get("megapixels")
         if _num(mp):
             f = (mp * 1_000_000 / (cur[0] * cur[1])) ** 0.5
-            return (round(cur[0] * f), round(cur[1] * f))
+            return _size(cur[0] * f, cur[1] * f)
         return None
 
     def _bwd(u, nxt):
         sb = u.get("scale_by") or u.get("scale_factor")
         if _num(sb):
-            return (round(nxt[0] / sb), round(nxt[1] / sb))
+            return _size(nxt[0] / sb, nxt[1] / sb)
         return None
 
     n = len(ups)
@@ -4547,7 +3819,7 @@ def _chain_upscale_pass_sizes(summary: dict[str, Any]) -> None:
             bounds[i + 1] = _fwd(u, bounds[i])
     file_wh = _parse(summary.get("resolution"))
     if file_wh:
-        bounds[n] = file_wh  # the pipeline ends at the saved file
+        bounds[n] = file_wh
     for i in range(n - 1, -1, -1):
         if bounds[i + 1] is not None and bounds[i] is None:
             bounds[i] = _bwd(ups[i], bounds[i + 1])
@@ -4558,11 +3830,10 @@ def _chain_upscale_pass_sizes(summary: dict[str, Any]) -> None:
         if bounds[i + 1] is not None:
             u["final_resolution"] = f"{bounds[i + 1][0]}×{bounds[i + 1][1]}"
 
-
 def _derive_generation_resolution(summary: dict[str, Any], w: int, h: int) -> None:
-    """When the workflow didn't reveal the pre-upscale size (e.g. it came from a
-    runtime GetImageSize), derive it from the file's final size and the single
-    known upscale factor: gen = final / scale."""
+    """With more than one factor in the chain the share each took is a guess, so
+    nothing is recorded.
+    """
     if summary.get("generation_resolution"):
         return
     ups = summary.get("upscaling")
@@ -4571,23 +3842,14 @@ def _derive_generation_resolution(summary: dict[str, Any], w: int, h: int) -> No
     scales = [u.get("scale_by") for u in ups if isinstance(u, dict)]
     scales = [s for s in scales if isinstance(s, (int, float)) and not isinstance(s, bool) and s > 1]
     if len(scales) != 1:
-        return  # none, or ambiguous (multiple upscale passes)
+        return
     gw, gh = round(w / scales[0]), round(h / scales[0])
     if gw >= 16 and gh >= 16:
         summary["generation_resolution"] = f"{gw}×{gh}"
 
-
-# Image metadata readers
-
-
+# A camera or an editor writes its own text into the same EXIF fields, so one is
+# only read as generation parameters once it carries a marker of them.
 def _looks_like_generation_params(text: str) -> bool:
-    """True when EXIF text plausibly holds an A1111-style parameter block.
-
-    The description and user-comment tags hold arbitrary captions on ordinary
-    photos and edited images, and a caption copied into the parameters slot
-    becomes the file's Positive Prompt. A real parameter block is recognisable
-    by its settings line, its negative marker, or a lora tag, so text carrying
-    none of those is treated as a caption and skipped."""
     if re.search(r"(?m)^Negative prompt:", text):
         return True
     if re.search(r"\bSteps:\s*\d+", text):
@@ -4596,16 +3858,11 @@ def _looks_like_generation_params(text: str) -> bool:
         return True
     return False
 
-
 def _decode_exif_text(raw: Any) -> str | None:
-    """Decode EXIF text bytes (UserComment, ImageDescription) to a string.
-
-    A UserComment opens with an eight byte character code. The UNICODE code
-    states no byte order, so a BOM decides when present and otherwise both
-    UTF-16 orders are decoded and the cleaner one wins (piexif, used by A1111
-    and Forge, writes big endian; Windows tools write little endian). A bare
-    payload takes strict UTF-8 only when the result holds no NULs, since
-    UTF-16 bytes of mostly Latin text also pass strict UTF-8."""
+    """The value opens with an eight byte code: `ASCII`, `UNICODE` for UTF-16,
+    `JIS`, or eight zero bytes for unstated. Writers get this wrong often
+    enough that the rest is sniffed when the code does not hold up.
+    """
     if not isinstance(raw, (bytes, bytearray)):
         return raw if isinstance(raw, str) else None
     raw = bytes(raw)
@@ -4622,10 +3879,8 @@ def _decode_exif_text(raw: Any) -> str | None:
                 return _clean(payload.decode("utf-16"))
             except Exception:
                 return None
-        # Score each order by readable ASCII structure: a parameter block's
-        # ASCII labels and separators decode as high codepoints in the wrong
-        # order, so the right one scores far higher. Control chars and stray
-        # surrogates penalise heavily; ties keep big endian (piexif's order).
+        # Without a byte order mark the endianness is only knowable from what
+        # each reading produces.
         best = None
         best_score = None
         for enc in ("utf-16-be", "utf-16-le"):
@@ -4646,9 +3901,8 @@ def _decode_exif_text(raw: Any) -> str | None:
     if raw.startswith(b"ASCII\x00\x00\x00"):
         return _clean(raw[8:].decode("latin-1", errors="replace"))
     if raw.startswith(b"UNICODE"):
-        # Standard: seven letters plus a NUL pad to eight bytes. Some writers
-        # follow the seven letters with a BOM directly; keep that BOM for the
-        # UTF-16 decode to consume.
+        # The code is seven letters padded to eight bytes with a zero, and some
+        # writers put the byte order mark in that eighth byte instead.
         payload = raw[8:] if raw[7:8] == b"\x00" else raw[7:]
         return _utf16(payload)
     if raw.startswith(b"JIS\x00\x00\x00\x00\x00"):
@@ -4669,7 +3923,6 @@ def _decode_exif_text(raw: Any) -> str | None:
         return u16
     return _clean(raw.decode("latin-1", errors="replace"))
 
-
 def read_image_metadata_best_effort(path: str) -> dict[str, Any]:
     try:
         from PIL import Image
@@ -4679,6 +3932,9 @@ def read_image_metadata_best_effort(path: str) -> dict[str, Any]:
     try:
         with Image.open(path) as img:
             info = dict(img.info or {})
+            # Popped by the caller, which would otherwise open the file again
+            # for nothing but its size.
+            info["_sbg_px"] = img.size
             exif = None
             try:
                 exif = img.getexif()
@@ -4687,9 +3943,8 @@ def read_image_metadata_best_effort(path: str) -> dict[str, Any]:
             if exif:
                 info["exif"] = dict(exif)
 
-                # A1111/Forge/WebUI store generation params in EXIF tags, which
-                # PIL's img.info dict does not carry (it covers PNG tEXt chunks).
-                # Tag 270 = ImageDescription, Tag 37510 = UserComment
+                # Tag 270 is the image description and 37510 the user comment,
+                # which are the two fields a generator writes its parameters to.
                 _EXIF_TEXT_TAGS = {270: "parameters", 37510: "parameters"}
 
                 for tag_id, target_key in _EXIF_TEXT_TAGS.items():
@@ -4699,7 +3954,8 @@ def read_image_metadata_best_effort(path: str) -> dict[str, Any]:
                     if isinstance(val, str) and val.strip() and _looks_like_generation_params(val):
                         info[target_key] = val.strip()
 
-                # Also check EXIF IFD sub-block (0x8769) for UserComment
+                # The user comment is usually one level down, in the EXIF sub
+                # directory, where reading the top level tags does not reach it.
                 if "parameters" not in info:
                     try:
                         ifd = exif.get_ifd(0x8769)
@@ -4724,8 +3980,10 @@ def read_image_metadata_best_effort(path: str) -> dict[str, Any]:
     except Exception:
         return {}
 
-
-def read_video_sidecar(path: str) -> dict[str, Any] | None:
+def read_video_sidecar(path: str, *, max_bytes: int | None = None) -> dict[str, Any] | None:
+    """A writer either appends the suffix to the whole name or puts it in place of
+    the extension, so both spellings of both names are looked for.
+    """
     base = path
     candidates = [
         base + ".json",
@@ -4737,12 +3995,13 @@ def read_video_sidecar(path: str) -> dict[str, Any] | None:
         if not os.path.isfile(c):
             continue
         try:
+            if max_bytes is not None and os.path.getsize(c) > max_bytes:
+                continue
             with open(c, "r", encoding="utf-8") as f:
                 return json.loads(f.read())
         except Exception:
             continue
     return None
-
 
 def _duration_fields(secs: float) -> dict[str, Any]:
     mins, s = divmod(int(secs), 60)
@@ -4750,29 +4009,21 @@ def _duration_fields(secs: float) -> dict[str, Any]:
     text = f"{hrs}:{mins:02d}:{s:02d}" if hrs else f"{mins}:{s:02d}"
     return {"duration": text, "duration_seconds": round(secs, 2)}
 
-
 def _extract_embedded_container_meta(container) -> dict[str, Any]:
-    """Prompt/workflow embedded in an open PyAV container's tags.
-
-    VHS_VideoCombine embeds {"prompt": ..., "workflow": ...} as JSON in the
-    container comment tag. mp4 uses lowercase "comment", webm/matroska
-    uppercase "COMMENT". Some savers write the metadata into per-stream tags
-    instead of the container's format tags, so those are checked too (also
-    "description"). ComfyUI's core save nodes (SaveVideo, and the audio savers
-    for flac/mp3/opus) write "prompt" and "workflow" as their own metadata
-    keys. Libavformat surfaces them as container tags under those names for
-    most formats, but ogg carries them as per-stream vorbis comments, so
-    stream tags are folded in for the per-key lookup as well.
+    """The prompt and the workflow travel as a JSON object in the container's
+    comment tag. Some writers use the description instead, or put the tag on a
+    stream and not on the container, and some write each of the two as a tag of
+    its own.
     """
     out: dict[str, Any] = {}
-    tags = dict(container.metadata or {})
+    tags = media_av.tags_of(container)
     for stream in container.streams:
-        for k, v in dict(stream.metadata or {}).items():
+        for k, v in media_av.tags_of(stream).items():
             tags.setdefault(k, v)
     comment = tags.get("comment", "") or tags.get("COMMENT", "") or tags.get("Comment", "")
     if not comment:
         for stream in container.streams:
-            stags = dict(stream.metadata or {})
+            stags = media_av.tags_of(stream)
             comment = (stags.get("comment", "") or stags.get("COMMENT", "")
                        or stags.get("description", "") or stags.get("DESCRIPTION", ""))
             if comment:
@@ -4799,12 +4050,9 @@ def _extract_embedded_container_meta(container) -> dict[str, Any]:
                 out[key] = parsed_v
     return out
 
-
 def _read_video_av(path: str) -> dict[str, Any]:
-    """Extract video info (duration, resolution, codec, fps) and embedded metadata.
-    Reads the container in process with PyAV (a ComfyUI dependency), so no
-    external command-line tool is needed. Returns an empty dict when PyAV is
-    unavailable or the file cannot be read as a video."""
+    # Video reading is optional, and a file whose fields stay blank is better
+    # than a scan that stops.
     try:
         import av
     except Exception:
@@ -4813,10 +4061,8 @@ def _read_video_av(path: str) -> dict[str, Any]:
     info: dict[str, Any] = {}
 
     try:
-        # "replace" keeps tags whose bytes fail UTF-8 decoding; the default of
-        # "strict" would abort the whole open on one bad tag.
-        with av.open(path, metadata_errors="replace") as container:
-            # Container duration is measured in AV_TIME_BASE (microsecond) ticks.
+        with media_av.open_media(path) as container:
+            # The container's duration is in microseconds.
             if container.duration:
                 info.update(_duration_fields(container.duration / 1_000_000))
 
@@ -4829,27 +4075,25 @@ def _read_video_av(path: str) -> dict[str, Any]:
                 h = stream.height
                 if w and h:
                     info["resolution"] = f"{w}×{h}"
-                # canonical_name is the format's own name (av1); codec_context.name
-                # is the decoder libavcodec picked (e.g. libdav1d), which varies
-                # with the installed wheel, so canonical_name is the stable choice.
+                # The canonical name is the format's own, while the context's
+                # name is whichever decoder was picked to read it.
                 cdesc = getattr(stream.codec_context, "codec", None)
                 codec = (getattr(cdesc, "canonical_name", None)
                          or getattr(stream.codec_context, "name", None))
                 if codec:
                     info["codec"] = codec
-                # base_rate is the stream's declared frame rate and
-                # average_rate its measured average. Prefer the declared rate,
-                # then fall back to the average.
+                # The declared rate is what the file was written at, and the
+                # average is only asked for where there is no declared one.
                 for rate in (stream.base_rate, stream.average_rate):
                     if rate:
                         fps = float(rate)
+                        # Outside these bounds the figure is no frame rate.
                         if 0 < fps < 1000:
                             info["fps"] = round(fps, 2)
                             break
                 nb = stream.frames
                 if nb:
                     info["total_frames"] = int(nb)
-                # Duration fallback for containers that only stamp the stream.
                 if "duration_seconds" not in info and stream.duration and stream.time_base:
                     info.update(_duration_fields(float(stream.duration * stream.time_base)))
     except Exception:
@@ -4857,17 +4101,10 @@ def _read_video_av(path: str) -> dict[str, Any]:
 
     return info
 
-
-# Mirror the extension sets in server.db, duplicated so this module keeps
-# importing without the index module.
-AUDIO_EXTS = frozenset({".mp3", ".flac", ".wav", ".ogg", ".opus", ".m4a"})
-VIDEO_EXTS = frozenset({".mp4", ".webm", ".mov", ".mkv", ".avi"})
-
+AUDIO_EXTS = media_types.AUDIO_EXTS
+VIDEO_EXTS = media_types.VIDEO_EXTS
 
 def _read_audio_av(path: str) -> dict[str, Any]:
-    """Extract audio info (duration, codec, sample rate, channels, bitrate) and
-    embedded metadata. Returns an empty dict when PyAV is unavailable or the
-    file cannot be read as audio."""
     try:
         import av
     except Exception:
@@ -4875,24 +4112,22 @@ def _read_audio_av(path: str) -> dict[str, Any]:
 
     info: dict[str, Any] = {}
 
-    # Music tags kept for the Track section. A curated allowlist, since the
-    # tag dict also carries encoder noise and the embedded prompt/workflow
-    # JSON. Tag case varies by format (vorbis comments arrive uppercase), so
-    # lookup is case-insensitive under the canonical lowercase name.
+    # An allowlist, since the tags also carry encoder noise and the embedded
+    # prompt.
     _TRACK_TAGS = ("title", "artist", "album", "album_artist", "albumartist",
                    "genre", "date", "year", "track", "composer", "publisher",
                    "copyright", "isrc")
 
     try:
-        with av.open(path, metadata_errors="replace") as container:
+        with media_av.open_media(path) as container:
             if container.duration:
                 info.update(_duration_fields(container.duration / 1_000_000))
 
             info.update(_extract_embedded_container_meta(container))
 
-            tags = dict(container.metadata or {})
+            tags = media_av.tags_of(container)
             for stream in container.streams:
-                for k, v in dict(stream.metadata or {}).items():
+                for k, v in media_av.tags_of(stream).items():
                     tags.setdefault(k, v)
             lower = {str(k).lower(): v for k, v in tags.items()}
             track: dict[str, str] = {}
@@ -4920,9 +4155,8 @@ def _read_audio_av(path: str) -> dict[str, Any]:
                     info["channels"] = int(ch)
                 if "duration_seconds" not in info and stream.duration and stream.time_base:
                     info.update(_duration_fields(float(stream.duration * stream.time_base)))
-                # Some formats (flac) stamp no per-stream rate. The container
-                # figure counts every stream, so with attached art present it
-                # overstates the audio rate. Better no value than a wrong one.
+                # The container's rate covers every stream in it, so it only
+                # stands for the audio where the file holds no picture.
                 br = getattr(stream, "bit_rate", None)
                 if not br and not container.streams.video:
                     br = container.bit_rate
@@ -4933,14 +4167,9 @@ def _read_audio_av(path: str) -> dict[str, Any]:
 
     return info
 
-
-# Main entry point
-
-
-def _sidecar_prompt_workflow(path: str, parsed: dict[str, Any]) -> tuple[Any, Any]:
-    """Prompt/workflow from a JSON sidecar next to the file, when one exists.
-    Records the sidecar under parsed["sidecar"] as a side effect."""
-    sidecar = read_video_sidecar(path)
+def _sidecar_prompt_workflow(path: str, parsed: dict[str, Any],
+                             *, max_bytes: int | None = None) -> tuple[Any, Any]:
+    sidecar = read_video_sidecar(path, max_bytes=max_bytes)
     if sidecar is None:
         return None, None
     parsed["sidecar"] = sidecar
@@ -4954,8 +4183,8 @@ def _sidecar_prompt_workflow(path: str, parsed: dict[str, Any]) -> tuple[Any, An
                 if isinstance(v, dict) and "workflow" in v:
                     workflow = v["workflow"]
                     break
-        # A sidecar can also BE the payload: a prompt dict ({class_type, inputs}
-        # keyed by node id) or a workflow (a "nodes" list).
+        # A sidecar that names neither can be the prompt or the workflow itself,
+        # which its own shape tells apart.
         if prompt is None and workflow is None:
             for k, v in sidecar.items():
                 if isinstance(v, dict) and "class_type" in v:
@@ -4965,7 +4194,6 @@ def _sidecar_prompt_workflow(path: str, parsed: dict[str, Any]) -> tuple[Any, An
             if "nodes" in sidecar and isinstance(sidecar.get("nodes"), list):
                 workflow = sidecar
     return prompt, workflow
-
 
 def read_metadata_for_file(
     path: str,
@@ -4979,6 +4207,7 @@ def read_metadata_for_file(
     parsed: dict[str, Any] = {}
     prompt: Any | None = None
     workflow: Any | None = None
+    px: tuple[int, int] | None = None
 
     if ext == ".png":
         raw_text = read_png_text_chunks(
@@ -4992,7 +4221,8 @@ def read_metadata_for_file(
             prompt = parsed.get("prompt")
         if "workflow" in parsed:
             workflow = parsed.get("workflow")
-        # Some nodes store workflow under "extra_pnginfo" keys.
+        # A file saved with the extra information wrapped puts the workflow one
+        # level down, under either spelling.
         if workflow is None:
             for k in ("extra_pnginfo", "EXTRA_PNGINFO"):
                 v = parsed.get(k)
@@ -5001,13 +4231,12 @@ def read_metadata_for_file(
                     break
     elif ext in {".jpg", ".jpeg", ".webp"}:
         parsed = read_image_metadata_best_effort(path)
+        px = parsed.pop("_sbg_px", None) if isinstance(parsed, dict) else None
         prompt = parsed.get("prompt") if isinstance(parsed, dict) else None
         workflow = parsed.get("workflow") if isinstance(parsed, dict) else None
     else:
-        # Only the known container extensions get the libav probe. On
-        # anything else libavformat invents stream fields (a still image
-        # comes back with fps 25), so unknown extensions keep to the
-        # sidecar check below.
+        # Only a known container extension is probed, since the reader makes up
+        # stream fields for anything else.
         info = info_key = None
         if ext in AUDIO_EXTS:
             info, info_key = _read_audio_av(path), "audio_info"
@@ -5021,15 +4250,19 @@ def read_metadata_for_file(
                 workflow = info.pop("workflow")
 
         if prompt is None and workflow is None:
-            prompt, workflow = _sidecar_prompt_workflow(path, parsed)
+            prompt, workflow = _sidecar_prompt_workflow(
+                path, parsed, max_bytes=max_text_chunk_bytes)
 
     summary = _extract_summary(prompt, workflow, parsed)
 
     video_info = parsed.get("video_info") if isinstance(parsed.get("video_info"), dict) else None
     audio_info = parsed.get("audio_info") if isinstance(parsed.get("audio_info"), dict) else None
 
+    # The PNG reader above never opened the image, so its real size is read now.
     file_w = file_h = None
-    if ext in {".png", ".jpg", ".jpeg", ".webp", ".bmp", ".tiff", ".tif"}:
+    if px:
+        file_w, file_h = px
+    elif ext == ".png":
         try:
             from PIL import Image
             with Image.open(path) as img:
@@ -5042,16 +4275,12 @@ def read_metadata_for_file(
 
     return MetadataResult(prompt=prompt, workflow=workflow, parsed=parsed, raw_text=raw_text, summary=summary)
 
-
 def finalize_summary(summary: dict[str, Any], *, video_info: dict | None = None,
                      audio_info: dict | None = None,
                      file_width: int | None = None, file_height: int | None = None) -> None:
-    """Apply the file-authoritative post-extraction steps to a summary.
-
-    Pure function (no file I/O): merges video or audio technical info,
-    overrides resolution with the file's real size (keeping a differing
-    workflow size as generation_resolution), and derives generation size and
-    the interpolation fps pair.
+    """The file's own size is the resolution, and a size the graph asked for
+    becomes the generation resolution. Everything else the container holds only
+    fills a gap.
     """
     if audio_info:
         for k in ("duration", "duration_seconds", "codec", "sample_rate",
@@ -5063,10 +4292,6 @@ def finalize_summary(summary: dict[str, Any], *, video_info: dict | None = None,
         for k in ("duration", "duration_seconds", "codec", "fps", "total_frames"):
             if k in video_info:
                 summary.setdefault(k, video_info[k])
-        # Always use actual video dimensions as authoritative resolution
-        # (workflow-inferred resolution from EmptyLatentImage may be wrong).
-        # When the workflow-derived resolution DIFFERS from the file's, it is
-        # the pre-upscale generation size, so keep it as generation_resolution.
         if "resolution" in video_info:
             _gen_res = summary.get("resolution")
             summary["resolution"] = video_info["resolution"]
@@ -5081,17 +4306,6 @@ def finalize_summary(summary: dict[str, Any], *, video_info: dict | None = None,
             except (ValueError, TypeError):
                 pass
 
-        # Derive the fps pair for multiplier-based interpolation nodes, which
-        # record only the factor. The file's fps stands in for the pass's
-        # output only when nothing else changed the rate: dividing it by the
-        # multiplier gives the source, and multiplying back gives the target.
-        # With several passes that arithmetic attributes the file's rate to
-        # one node as a guess (a chained pass consumes another pass's output,
-        # and a saver can override the rate outright), so a derived pair is
-        # kept only when the pass stands alone or its derived source equals
-        # another pass's recorded target, meaning the chain lines up. An
-        # entry that fails the gate keeps just its multiplier, which is
-        # always true.
         _interp = summary.get("interpolation")
         _fps = summary.get("fps")
         if isinstance(_interp, list):
@@ -5108,6 +4322,10 @@ def finalize_summary(summary: dict[str, Any], *, video_info: dict | None = None,
                     _mult = 0.0
                 if _mult <= 1:
                     continue
+                # An interpolator states a multiplier and leaves the rates open,
+                # so the file's rate divides down to a source only where there
+                # is one interpolator, or where the result meets another's
+                # target.
                 if "source_fps" not in _e and isinstance(_fps, (int, float)) and _fps:
                     _src = _fps / _mult
                     _src = int(_src) if float(_src).is_integer() else round(_src, 2)
@@ -5118,12 +4336,7 @@ def finalize_summary(summary: dict[str, Any], *, video_info: dict | None = None,
                     _tgt = _src * _mult
                     _e["target_fps"] = int(_tgt) if float(_tgt).is_integer() else round(_tgt, 2)
 
-    # Always use actual file dimensions as authoritative resolution.
-    # Workflow-inferred resolution (e.g., from EmptyLatentImage) shows generation
-    # size which may differ from final output (after upscaling, img2img, etc.)
     if file_width and file_height and file_width > 0 and file_height > 0:
-        # Keep the workflow/A1111-derived size as the pre-upscale
-        # generation resolution when it differs from the file's.
         _gen_res = summary.get("resolution")
         summary["resolution"] = f"{file_width}×{file_height}"
         summary["width"] = file_width
@@ -5133,7 +4346,6 @@ def finalize_summary(summary: dict[str, Any], *, video_info: dict | None = None,
         _derive_generation_resolution(summary, file_width, file_height)
 
     _chain_upscale_pass_sizes(summary)
-
 
 def guess_mime(path: str) -> str:
     return mimetypes.guess_type(path)[0] or "application/octet-stream"

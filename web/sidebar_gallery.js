@@ -1,27 +1,26 @@
-/**
- * sidebar_gallery.js: Entry point for the SBG ComfyUI extension
- *
- * Thin shell: registers the sidebar tab, applies saved CSS variables, installs the
- * global keybindings and drag-drop handlers, and bridges ComfyUI's execution events
- * to the gallery. All rendering lives in sbg-gallery.js.
- */
-
 import { app } from "../../scripts/app.js";
 import { api as comfyApi } from "../../scripts/api.js";
+import { progressFeed, watchIndexEndings } from "./sbg-progress.js";
 
 import {
-  EXT_NAME, CSS_URL,
-  _dataCache, ensureCss, h, api, showToast,
-  S, getSetting, loadSettings, APP_REGISTRY,
+  EXT_NAME,
+  ensureCss,
+  lsGet,
+  lsSet,
 } from "./sbg-core.js";
+import { paintTheme, loadUserThemes, adoptSettingColours } from "./sbg-theme.js";
+import { S, getSetting, loadSettings, settingsUnread, B, downgradedFrom, clearDowngradeNotice, onSettingsChanged } from "./sbg-settings-store.js";
+import { showFailure, postNotice } from "./sbg-toast.js";
 
-import { openGallerySettings as _openGallerySettings } from "./sbg-settings.js";
-import { openLightbox } from "./sbg-lightbox.js";
+import { openGallerySettings as _openGallerySettings, closeGallerySettings } from "./sbg-settings.js";
+import { sweepStalePromptTabKeys, consolidateLayoutStorage, LAYOUTS_HELD, layoutsHeldText } from "./sbg-layout-store.js";
+import { openLightbox, isLightboxOpen } from "./sbg-lightbox.js";
 import { initGallery } from "./sbg-gallery.js";
-import { descFromKeyEvent, descFromMouseEvent, matchExplicit, matchBare } from "./sbg-keybinds.js";
-
-
-/* SIDEBAR EXTENSION */
+import { galleryCache, disposeLiveTeardown } from "./sbg-gallery-store.js";
+import { descFromKeyEvent, matchExplicit, matchBare, focusOwnsKey, wireMouseBindings } from "./sbg-keybinds.js";
+import { fileUrl } from "./sbg-media-kind.js";
+import { loadWorkflowFrom } from "./sbg-file-actions.js";
+import { fetchFullMeta } from "./sbg-meta-cache.js";
 
 app.registerExtension({
   name: EXT_NAME,
@@ -29,49 +28,59 @@ app.registerExtension({
   async setup() {
     ensureCss();
 
-    // Load disk-backed settings before anything reads them
     await loadSettings();
 
-    /* Apply saved CSS custom properties */
+    await loadUserThemes();
+    try { await adoptSettingColours(); } catch (e) { console.warn("[SBG] Taking the settings colors into the theme failed:", e); }
 
-    // One pass over the shared app registry: every app's badge colour var is
-    // set (saved value or registry default), so the stylesheet's var()
-    // fallback literals are cosmetic-only and can never drift from here.
-    for (const a of APP_REGISTRY) {
-      const saved = getSetting(a.settingKey, "");
-      document.documentElement.style.setProperty(a.cssVar, saved || a.defaultColor);
+    consolidateLayoutStorage().catch((e) => { postNotice(LAYOUTS_HELD, layoutsHeldText(e)); });
+
+    const newer = downgradedFrom();
+    if (newer) {
+      postNotice("downgrade", `You last used gallery version ${newer}, which is newer than this one. The layouts and presets made in it come back after updating to it again. To use its layouts now, load a preset saved in ${newer} from the Presets tab.`,
+        { onShown: clearDowngradeNotice });
     }
 
-    const pillBg = getSetting(S.PILL_BG_COLOR, "");
-    const pillText = getSetting(S.PILL_TEXT_COLOR, "");
-    const pillBorder = getSetting(S.PILL_BORDER_COLOR, "");
-    if (pillBg) document.documentElement.style.setProperty("--sbg-pill-bg", pillBg);
-    if (pillText) document.documentElement.style.setProperty("--sbg-pill-text", pillText);
-    if (pillBorder) document.documentElement.style.setProperty("--sbg-pill-border", pillBorder);
+    paintTheme();
 
-    const promptPad = getSetting(S.PROMPT_PADDING, "");
-    if (promptPad) document.documentElement.style.setProperty("--sbg-prompt-padding", promptPad + "px");
+    // The sweep walks all of localStorage, so a mark keeps it to one pass.
+    // Deleting a section in the Metadata tab removes its key as it goes.
+    // Unread settings answer no layouts, which would sweep every custom
+    // section's key, so the pass waits for a load that reads them.
+    if (!settingsUnread() && lsGet(B.LAYOUT_HYGIENE_MARK) !== "1") {
+      sweepStalePromptTabKeys();
+      lsSet(B.LAYOUT_HYGIENE_MARK, "1");
+    }
 
-    const hlBg = localStorage.getItem("SBG.GS.HighlightBg");
-    if (hlBg) document.documentElement.style.setProperty("--sbg-highlight-bg", hlBg);
+    const applyCardLift = () => {
+      if (getSetting(S.CARD_LIFT)) document.documentElement.removeAttribute("data-sbg-card-lift");
+      else document.documentElement.setAttribute("data-sbg-card-lift", "off");
+    };
+    applyCardLift();
+    onSettingsChanged((ids) => { if (ids.has(S.CARD_LIFT)) applyCardLift(); });
 
-    /* Global drag-drop handler for workflow loading */
+    // The body carries the graph library's class and ComfyUI draws its panels
+    // inside the graph's container, so neither tells the graph apart. A target
+    // over the graph is the canvas, a node of the newer renderer, or a widget
+    // the classic renderer lays over the canvas.
+    function _overGraph(t) {
+      if (!t || t.closest?.(".sbg-root")) return false;
+      return t.id === "graph-canvas" || !!t.closest?.('#graph-canvas, [data-testid="transform-pane"], .dom-widget');
+    }
+    const _inGallery = (t) => !!(t && t.closest?.(".sbg-root"));
 
     document.body.addEventListener("dragover", (e) => {
       if (!e.dataTransfer.types.includes("application/x-sbg-workflow")) return;
       e.preventDefault();
-      e.dataTransfer.dropEffect = "copy";
-      // ComfyUI doesn't highlight nodes for this custom drag payload, so drive its
-      // native per-node highlight directly: set dragOverNode to the node under
-      // the cursor (or null) and redraw. Cleared on drop/dragend.
+
+      e.dataTransfer.dropEffect = _overGraph(e.target) ? "copy" : "none";
+
+      // ComfyUI lights a node only for a drag the node itself accepts, which a
+      // gallery card is not, so the highlight is set here. A point over the
+      // sidebar still maps onto the canvas, so the node is looked up only over
+      // the graph.
       try {
-        // Only highlight when the cursor is actually over the graph canvas,
-        // otherwise mapped coords could light up a node while dragging over the
-        // sidebar/gallery.
-        const t = e.target;
-        const overGraph = !!(t && (t.tagName === "CANVAS"
-          || t.closest?.(".litegraph, canvas, #graph-canvas, .graph-canvas-container, .comfyui-body-center")));
-        const node = overGraph ? (_nodeUnderDrop(e) || null) : null;
+        const node = _overGraph(e.target) ? _nodeUnderDrop(e) : null;
         if (app.dragOverNode !== node) {
           app.dragOverNode = node;
           app.canvas?.setDirty?.(true, true);
@@ -80,111 +89,108 @@ app.registerExtension({
     }, true);
     function _clearComfyDragHighlight() {
       try {
-        if (app.dragOverNode) app.dragOverNode = null;
-        app.canvas?.setDirty?.(true, true);
+        if (app.dragOverNode) {
+          app.dragOverNode = null;
+          app.canvas?.setDirty?.(true, true);
+        }
       } catch { }
     }
 
+    // The point is in the coordinates of the graph on screen, which inside an
+    // open subgraph is the canvas's graph. ComfyUI's `app.graph` is always the
+    // root graph, where the same point holds no node or an unrelated one.
     function _nodeUnderDrop(e) {
       try {
         const c = app.canvas;
-        if (!c || !app.graph || typeof app.graph.getNodeOnPos !== "function") return null;
-        let pos;
-        if (typeof c.convertEventToCanvasOffset === "function") {
-          pos = c.convertEventToCanvasOffset(e);
-        } else {
-          const rect = c.canvas.getBoundingClientRect();
-          const ds = c.ds || { scale: 1, offset: [0, 0] };
-          pos = [(e.clientX - rect.left) / ds.scale - ds.offset[0], (e.clientY - rect.top) / ds.scale - ds.offset[1]];
-        }
-        return app.graph.getNodeOnPos(pos[0], pos[1]) || null;
+        const graph = c?.graph ?? app.graph;
+        if (!c || !graph || typeof graph.getNodeOnPos !== "function") return null;
+        const pos = c.convertEventToCanvasOffset(e);
+        return graph.getNodeOnPos(pos[0], pos[1]) || null;
       } catch { return null; }
     }
 
     function _isImageLoaderNode(node) {
       if (!node) return false;
-      if (/load.?image|image.?load|loadimagemask/i.test(node.type || node.comfyClass || "")) return true;
+      if (/load.?image|image.?load/i.test(node.type || node.comfyClass || "")) return true;
       return Array.isArray(node.widgets) && node.widgets.some(w => w && w.name === "image" && (w.type === "combo" || (w.options && w.options.values)));
     }
 
-    /** Upload a gallery file into ComfyUI's input dir and point the node at it. */
-    async function _loadImageIntoNode(node, root_id, relpath) {
-      const name = relpath.replace(/\\/g, "/").split("/").pop();
-      const fileResp = await fetch(`/sidebar_gallery/file?root_id=${encodeURIComponent(root_id)}&relpath=${encodeURIComponent(relpath)}`);
-      if (!fileResp.ok) throw new Error("could not read source image");
+    async function _loadImageIntoNode(node, dragged) {
+      const widget = (node.widgets || []).find(w => w && w.name === "image");
+      if (!widget) {
+        showFailure(`load the image into ${node.title || "this node"}`, "the node has no image field");
+        return;
+      }
+      const name = dragged.relpath.split("/").pop();
+      const fileResp = await fetch(fileUrl(dragged));
+      if (!fileResp.ok) throw new Error("the gallery can't read it");
       const blob = await fileResp.blob();
       const file = new File([blob], name, { type: blob.type || "image/png" });
       const fd = new FormData();
       fd.append("image", file);
-      fd.append("overwrite", "true");
-      const up = comfyApi?.fetchApi
-        ? await comfyApi.fetchApi("/upload/image", { method: "POST", body: fd })
-        : await fetch("/upload/image", { method: "POST", body: fd });
-      if (!up.ok) throw new Error("upload failed");
+      const up = await comfyApi.fetchApi("/upload/image", { method: "POST", body: fd });
+      if (!up.ok) throw new Error("the upload to ComfyUI failed");
       const data = await up.json();
       const uploaded = data.subfolder ? `${data.subfolder}/${data.name}` : data.name;
-      const widget = (node.widgets || []).find(w => w && w.name === "image");
-      if (widget) {
-        if (widget.options && Array.isArray(widget.options.values) && !widget.options.values.includes(uploaded)) {
-          widget.options.values.push(uploaded);
-        }
-        widget.value = uploaded;
-        try { widget.callback?.(uploaded); } catch { }
+      // The combo's list lacks a file uploaded since it was filled.
+      if (widget.options && Array.isArray(widget.options.values) && !widget.options.values.includes(uploaded)) {
+        widget.options.values.push(uploaded);
       }
-      app.graph?.setDirtyCanvas?.(true, true);
-      showToast(`Loaded image into ${node.title || node.type}`);
+      widget.value = uploaded;
+      try { widget.callback?.(uploaded); } catch { }
+      app.canvas?.setDirty?.(true, true);
     }
 
     document.body.addEventListener("drop", async (e) => {
       const sbgData = e.dataTransfer.getData("application/x-sbg-workflow");
       if (!sbgData) return;
 
-      // The dropzone overlay has pointer-events:none, so e.target is the
-      // element under it (the Comfy canvas/litegraph). Load the workflow when
-      // the drop lands anywhere over the graph area; otherwise let it pass.
-      const target = e.target;
-      const isOnGraph = target.closest?.(".litegraph, canvas, .comfyui-body-center, .graph-canvas-container, #graph-canvas")
-        || target.tagName === "CANVAS";
-      if (!isOnGraph) {
+      if (_inGallery(e.target)) {
+        e.preventDefault();
+        e.stopImmediatePropagation();
+        _clearComfyDragHighlight();
+        return;
+      }
+      if (!_overGraph(e.target)) {
         return;
       }
 
       e.preventDefault();
       e.stopPropagation();
-      // preventDefault on the drop means ComfyUI's own handler won't clear the
-      // blue per-node drag highlight, so clear it here.
+
       _clearComfyDragHighlight();
       try {
-        const { root_id, relpath } = JSON.parse(sbgData);
+        const dragged = JSON.parse(sbgData);
 
-        // If the drop landed on an image-loading node (LoadImage etc.), load the
-        // IMAGE into that node instead of replacing the whole workflow.
         const node = _nodeUnderDrop(e);
         if (node && _isImageLoaderNode(node)) {
-          await _loadImageIntoNode(node, root_id, relpath);
+          await _loadImageIntoNode(node, dragged);
           return;
         }
 
-        const m = await api("/sidebar_gallery/metadata", { root_id, relpath });
-        if (!m?.workflow) { showToast("No workflow data in this file"); return; }
-        let wf = m.workflow;
-        if (typeof wf === "string") wf = JSON.parse(wf);
-        app.loadGraphData(wf);
-        showToast("Workflow loaded from drag & drop!");
+        await loadWorkflowFrom(await fetchFullMeta(dragged));
       } catch (err) {
-        showToast(`Failed to load: ${err?.message || err}`, 5000);
+        showFailure("load this file", err);
       }
     }, true);
 
-    // Safety net: always clear the per-node highlight when a SBG drag ends,
-    // even if the drop landed off-canvas.
-    document.body.addEventListener("dragend", () => {
+    // Clears the highlight for a drag that ended off the graph, where the drop
+    // handler returned early. Only the payload's types can be read on dragend.
+    document.body.addEventListener("dragend", (e) => {
+      if (!e.dataTransfer?.types?.includes("application/x-sbg-workflow")) return;
       _clearComfyDragHighlight();
     }, true);
 
-    /* Register sidebar tab */
-
     if (!app?.extensionManager?.registerSidebarTab) return;
+
+    let galleryApi = null;
+    let mounted = null;
+    // The gallery reads these when it is built, so a change of one, however it
+    // is made, builds it again as a reopen does when the settings panel over
+    // it closes.
+    const READ_AT_OPEN = [S.THUMB_SIZE, S.THUMB_PER_ROW, S.THUMB_SHAPE, S.CARD_STYLE, S.TOOLBAR_LAYOUT];
+    let rebuildOwed = false;
+    onSettingsChanged((ids) => { if (READ_AT_OPEN.some((id) => ids.has(id))) rebuildOwed = true; });
 
     app.extensionManager.registerSidebarTab({
       id: "sidebarGallery",
@@ -192,52 +198,53 @@ app.registerExtension({
       title: "Gallery",
       tooltip: "Sidebar Gallery",
       type: "custom",
-      render: (mountEl) => {
-        ensureCss();
-        mountEl.innerHTML = "";
-        mountEl.style.position = "relative";
-        mountEl.style.width = "100%";
-        mountEl.style.height = "100%";
-        mountEl.style.overflow = "hidden";
 
-        /* Gallery settings bridge */
-        function openGallerySettings(defaultTab = "layout") {
-          // galleryApi may not be set yet on first render, but state is captured via closure
-          const allItems = galleryApi?.state?.allItems || [];
-          const fetchAll = galleryApi?.fetchAllItems || (() => {});
-          _openGallerySettings({
-            allItems,
-            fetchAllItems: fetchAll,
-            // Lets the Folders settings live-refresh the gallery's root list when a
-            // folder is added/removed, without a full browser reload.
-            refreshConfig: galleryApi?.refreshConfig,
-          }, defaultTab);
-        }
-
-        const galleryApi = initGallery(mountEl, {
-          openLightbox,
-          openGallerySettings,
-        });
-      },
+      destroy: disposeLiveTeardown,
+      render: renderGallery,
     });
 
-    /* Global keyboard shortcuts */
+    function renderGallery(mountEl) {
+      rebuildOwed = false;
+      mounted = mountEl;
+      ensureCss();
+      // ComfyUI's palette can change while the gallery is closed, and a theme
+      // follows it for every base colour it does not name, so each open paints
+      // again.
+      paintTheme();
+      // A tab switch in ComfyUI's own sidebar runs no toggle, so a settings
+      // panel or folder dropdown still open is closed before the mount is
+      // emptied behind it.
+      try { galleryApi?.closePopup?.(); } catch { }
+      try { closeGallerySettings(); } catch { }
+      mountEl.innerHTML = "";
+      mountEl.classList.add("sbg-mount");
 
-    // Only the two GLOBAL shortcuts live here. Lightbox keys are read inside
-    // the lightbox itself. (KEY_REFRESH defaults to disabled, matching the
-    // settings UI's "leave empty to disable".)
-    const _keyDefaults = {
-      [S.KEY_TOGGLE]: "z,0",
-      [S.KEY_REFRESH]: "",
-    };
+      function openGallerySettings() {
+        // Each reads `galleryApi` when called, so work the settings panel
+        // finishes after a remount reaches the new gallery.
+        _openGallerySettings({
+          getAllItems: () => galleryApi?.state?.allItems || [],
+          getRoots: () => galleryApi?.state?.roots || [],
+          fetchAllItems: (opts) => galleryApi?.fetchAllItems?.(opts),
+          refreshConfig: () => galleryApi?.refreshConfig?.(),
+          closed: () => { if (rebuildOwed && mounted?.isConnected) renderGallery(mounted); },
+        });
+      }
 
-    const _bindingOf = (settingId) => getSetting(settingId, _keyDefaults[settingId] || "");
+      galleryApi = initGallery(mountEl, {
+        openLightbox,
+        openGallerySettings,
+      });
+    }
 
-    // The aria-label form matches current ComfyUI frontends directly; the id and
-    // data-tooltip forms cover older frontends, and the icon scan below remains
-    // as the last resort.
+    // The aria-label matches current ComfyUI frontends, the id and data-tooltip
+    // forms older ones, and the icon scan is the last resort. A key press with no
+    // button to click says nothing, since a toast for a shortcut is more noise
+    // than help.
     function _toggleGallery() {
       try {
+        try { galleryApi?.closePopup?.(); } catch { }
+        try { closeGallerySettings(); } catch { }
         const tabBtns = document.querySelectorAll('button[aria-label="Sidebar Gallery"], [id*="sidebarGallery"], [data-tooltip*="Gallery"], [data-tooltip*="Sidebar Gallery"]');
         for (const btn of tabBtns) {
           if (btn.click) { btn.click(); return; }
@@ -248,87 +255,84 @@ app.registerExtension({
             tab.click(); return;
           }
         }
+        console.warn("[SBG] Toggle Gallery found no gallery button in the sidebar");
       } catch (err) {
-        console.warn("[SBG] Could not toggle gallery:", err);
+        console.warn("[SBG] Toggle Gallery failed:", err);
       }
     }
 
-    // Global actions in priority order.
+    // While the lightbox is open the toggle key is still taken and does nothing,
+    // so the gallery is never pulled away behind it. A closed panel keeps its
+    // handle, so refresh checks that the mount is still in the page.
     const _globalActions = [
-      { setting: S.KEY_TOGGLE, run: () => _toggleGallery() },
-      { setting: S.KEY_REFRESH, run: () => { if (_dataCache._fetchAllItems) _dataCache._fetchAllItems({ rescan: true }); } },
+      { setting: S.KEY_TOGGLE, off: () => isLightboxOpen(), run: () => _toggleGallery() },
+      { setting: S.KEY_REFRESH, run: () => { if (galleryApi?.mountEl?.isConnected) galleryApi.fetchAllItems({ rescan: true }); } },
     ];
 
-    // Returns true when the event matched a global binding and acted, so the
-    // pointerdown/auxclick pair below can deduplicate one physical press.
-    // Two-pass: an explicit chord ("Shift+z") is tried across BOTH actions
-    // before any bare key, so a combo binding beats a bare binding on the
-    // other action for the same key.
     function _handleGlobal(e, desc) {
-      if (e.target.tagName === "INPUT" || e.target.tagName === "TEXTAREA" || e.target.isContentEditable) return false;
-      for (const match of [matchExplicit, (b, d) => matchBare(b, d)]) {
+      if (focusOwnsKey(e.target, desc.key)) return false;
+      // Explicit bindings are tried across every action first, so a modified
+      // press never fires another action's bare binding.
+      for (const match of [matchExplicit, matchBare]) {
         for (const a of _globalActions) {
-          if (match(_bindingOf(a.setting), desc)) { e.preventDefault(); a.run(); return true; }
+          if (match(getSetting(a.setting), desc)) {
+            e.preventDefault();
+            if (!a.off?.()) a.run();
+            return true;
+          }
         }
       }
       return false;
     }
 
+    // Keys and buttons are heard in the bubble phase, so the lightbox's capture
+    // handlers win any press both of them bind.
     document.addEventListener("keydown", (e) => _handleGlobal(e, descFromKeyEvent(e)));
-    // Mouse buttons can be bound too (MiddleClick, Mouse4, Mouse5). Bubble
-    // phase, so the lightbox's capture handler wins any button both bind.
-    // Pointerdown covers most surfaces; over a <video>, Firefox's native
-    // controls consume the whole pointer and mouse down/up pair and only
-    // the auxclick survives, so it dispatches as the fallback. The one-shot
-    // token keeps one physical press from acting twice.
-    let _ptrHandledGlobal = { button: -1, t: 0 };
-    document.addEventListener("pointerdown", (e) => {
-      if (e.button === 0 || e.button === 2) return;
-      if (_handleGlobal(e, descFromMouseEvent(e))) {
-        _ptrHandledGlobal = { button: e.button, t: performance.now() };
-      }
-    });
-    document.addEventListener("auxclick", (e) => {
-      if (e.button === 0 || e.button === 2) return;
-      const dupe = e.button === _ptrHandledGlobal.button && performance.now() - _ptrHandledGlobal.t < 800;
-      _ptrHandledGlobal = { button: -1, t: 0 };
-      if (!dupe) _handleGlobal(e, descFromMouseEvent(e));
-    });
 
-    /* Auto-refresh on execution complete */
+    wireMouseBindings(_handleGlobal);
 
     let _refreshTimer = null;
 
+    const _PENDING_FILES_CAP = 500;
+
+    comfyApi.addEventListener("sbg.progress", (event) => {
+      if (event.detail) progressFeed.deliver(event.detail);
+    });
+
+    comfyApi.addEventListener("reconnected", () => { progressFeed.refresh(); });
+    watchIndexEndings();
+
     comfyApi.addEventListener("executed", (event) => {
       try {
-        const detail = event.detail;
-        if (!detail) return;
-
-        const output = detail.output;
+        const output = event.detail?.output;
         if (!output) return;
-        const hasMedia = output.images || output.gifs || output.audio;
-        if (!hasMedia) return;
 
-        const mediaList = [...(output.images || []), ...(output.gifs || []),
-                           ...(output.audio || [])];
-        for (const m of mediaList) {
-          if (m.filename) {
-            _dataCache._pendingFiles.push({
-              filename: m.filename,
-              subfolder: m.subfolder || "",
-              type: m.type || "output",
-            });
-          }
+        // ComfyUI names only the folder type a file went to, so only an output
+        // file can be matched to the Output root by name. An extra root can be
+        // the temp or input folder, so a file written there makes the root on
+        // screen check for new files, unless that root is Output.
+        const media = [...(output.images || []), ...(output.gifs || []), ...(output.audio || [])]
+          .filter((m) => m.filename);
+        const written = media.filter((m) => (m.type || "output") === "output");
+        if (!written.length && (!media.length || galleryCache.view.lastRootId === "output")) return;
+
+        const inbox = galleryCache.inbox;
+        for (const m of written) {
+          inbox.pendingFiles.push({ root_id: "output", filename: m.filename, subfolder: m.subfolder || "" });
         }
+        // Past the cap the list is dropped, and the refresh asks instead for
+        // every file newer than the server's last reply.
+        if (inbox.pendingFiles.length > _PENDING_FILES_CAP) inbox.pendingFiles = [];
 
-        _dataCache.stale = true;
+        inbox.stale = true;
 
+        // A run reports each output node separately, so the fetch waits for
+        // them to stop arriving.
         if (_refreshTimer) clearTimeout(_refreshTimer);
         _refreshTimer = setTimeout(() => {
           _refreshTimer = null;
-          if (_dataCache._mountEl && _dataCache._mountEl.isConnected) {
-            const fn = _dataCache._fetchNewItems || _dataCache._fetchAllItems;
-            if (fn) fn();
+          if (galleryApi && galleryApi.mountEl.isConnected) {
+            galleryApi.fetchNewItems();
           }
         }, 800);
       } catch (err) {

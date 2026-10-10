@@ -4,14 +4,15 @@
 *.sqlite3
 *.db-shm
 *.db-wal
-.index/
 .thumbs/
 *.tmp
 
 # Gallery settings and customizations
 sidebar_gallery_config.json
 sidebar_gallery_settings.json
+*.json.corrupt-*
 themes/
+backups/
 
 # Python
 __pycache__/

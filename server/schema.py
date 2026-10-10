@@ -1,16 +1,6 @@
-"""Single source of truth for the SBG metadata-section schema.
+"""The section and field tables every server module reads, derived from
+`section_catalog.json` so none of them hardcodes one."""
 
-This module loads ``section_catalog.json`` and derives the tables that would
-otherwise be hardcoded in each consumer:
-
-  - ``known_summary_keys()`` feeds ``_KNOWN_SUMMARY_KEYS`` in metadata.py
-  - ``meta_key_buckets()`` feeds the ``get_all_meta_keys`` buckets in db.py
-  - ``section_titles()`` and the non-bindable key sets are served to the
-    frontend by routes.py
-
-Pure stdlib (json + pathlib) so it is importable anywhere, including an
-environment without ComfyUI.
-"""
 from __future__ import annotations
 
 import json
@@ -20,92 +10,109 @@ from typing import Any
 
 _CATALOG_PATH = Path(__file__).resolve().parents[1] / "section_catalog.json"
 
-
 @lru_cache(maxsize=1)
 def load_catalog() -> dict[str, Any]:
     with open(_CATALOG_PATH, encoding="utf-8") as f:
         return json.load(f)
 
-
 def sections() -> list[dict[str, Any]]:
-    return load_catalog().get("sections", [])
-
+    return load_catalog()["sections"]
 
 def known_summary_keys() -> set[str]:
-    """Every top-level key the parser is allowed to emit on a summary."""
     keys: set[str] = set()
     for entry in sections():
-        keys.update(entry.get("summary_keys", []))
-    keys.update(load_catalog().get("flags", []))
+        keys.update(entry["summary_keys"])
+    keys.update(load_catalog()["flags"])
     return keys
-
 
 def meta_key_buckets() -> dict[str, str]:
-    """Drives ``db.get_all_meta_keys`` bucketing: array-of-dict sections
-    collect item param keys, object sections collect dict keys.
-    """
     return {e["key"]: e["kind"] for e in sections()}
 
-
 def non_bindable_summary_keys() -> set[str]:
-    """Top-level summary keys the layout editor must NOT offer as bindable
-    field paths: list/object-shaped section keys (their per-item params are
-    offered instead) plus the catalog's non_bindable_flags (list- or
-    boolean-valued flags that render as noise in a kv field). Served through
-    meta_keys so a future list-shaped key only needs a catalog entry, leaving
-    no room for the silent [object Object] fields that appear when a hardcoded
-    frontend skip is forgotten."""
+    # A list or object section has no single value a field could be bound to.
     keys = {k for k, kind in meta_key_buckets().items() if kind in ("array", "object", "nodes")}
-    keys.update(load_catalog().get("non_bindable_flags", []))
+    keys.update(load_catalog()["non_bindable_flags"])
     return keys
 
-
 def non_bindable_element_keys() -> dict[str, list[str]]:
-    """Per-element keys inside array sections that the layout editor must not
-    offer as bindable fields. These are the internal markers the parser stamps
-    on a sampler or lora item for scoping and pairing (stage, role, the node
-    label, the loader id), which render as noise or nothing in the panel.
-    Served through meta_keys next to non_bindable_summary_keys."""
-    return load_catalog().get("non_bindable_element_keys", {})
+    return load_catalog()["non_bindable_element_keys"]
 
+# Read for every stored leaf, so it is built once.
+@lru_cache(maxsize=1)
+def index_exclude_leaf_keys() -> frozenset[str]:
+    return frozenset(load_catalog()["search"]["index_exclude_leaf_keys"])
 
-def search_fields() -> set[str]:
-    """The backend search field names the catalog declares.
+def prose_paths() -> frozenset[str]:
+    return frozenset(load_catalog()["search"]["prose_paths"])
 
-    Must be a subset of the fields handled by ``search.match_summary``.
-    """
-    return {e["search_field"] for e in sections() if e.get("search_field")}
+def prose_length_threshold() -> int:
+    return int(load_catalog()["search"]["prose_length_threshold"])
 
+def plain_exclude_paths() -> frozenset[str]:
+    """Paths a term with no prefix never reads. A word in the negative prompt
+    names what the image avoids, so only a scoped search reaches it."""
+    return frozenset(load_catalog()["search"]["plain_exclude_paths"])
 
-def section_titles() -> dict[str, str]:
-    """Default (catalog) section titles, keyed by section_id.
-
-    Served through /config so the frontend can tell a layout-editor retitle
-    apart from a section's shipped name (TL.getSectionRenames). The shipped
-    default layouts cannot serve this purpose: they are a curated profile
-    snapshot and omit sections that only appear in other apps' profiles.
-    """
-    return {e["section_id"]: e["title"] for e in sections()}
-
-
-def default_layout(media: str = "image") -> list[dict[str, Any]]:
-    """Build the default section profile for a media kind from the catalog."""
-    layout: list[dict[str, Any]] = []
+# Read for every tag of every file the matcher reads, so it is built once.
+@lru_cache(maxsize=1)
+def server_alias_map() -> dict[str, str]:
+    out: dict[str, str] = {}
+    for e in load_catalog()["search"]["extra_fields"]:
+        for a in e.get("server_aliases", []):
+            out[a] = e["field"]
     for e in sections():
-        if media not in e.get("media", ["image", "video"]):
-            continue
-        d = e.get("default", {})
-        params = d.get(f"params_{media}") or d.get("params", [])
-        sec: dict[str, Any] = {
-            "id": e["section_id"],
-            "title": e["title"],
-            "style": d.get("style", "flat"),
-            "open": d.get("open", True),
-            "params": [dict(p) for p in params],
-        }
-        if d.get("source"):
-            sec["source"] = d["source"]
-        if d.get("highlow"):
-            sec["highlow"] = True
-        layout.append(sec)
-    return layout
+        if e["search_field"]:
+            for a in e.get("server_aliases", []):
+                out[a] = e["search_field"]
+    return out
+
+def search_schema_payload() -> dict[str, Any]:
+    blk = load_catalog()["search"]
+    secs: dict[str, Any] = {}
+    for e in sections():
+        row = {"section_id": e["section_id"], "search_field": e["search_field"],
+               "key": e["key"], "kind": e["kind"], "summary_keys": list(e["summary_keys"])}
+        if "display_name" in e:
+            row["display_name"] = e["display_name"]
+        secs[e["title"]] = row
+    searchable = [e for e in sections() if e["search_field"]]
+    # A section's own spellings come first, then an extra field's, and a
+    # section's title takes only a spelling neither claimed.
+    resolve: dict[str, str] = {}
+    for e in searchable:
+        for spelling in [e["search_field"], *e["search_aliases"], *e.get("server_aliases", [])]:
+            resolve.setdefault(spelling.lower(), e["search_field"])
+    for e in blk["extra_fields"]:
+        for spelling in [e["field"], *e["aliases"], *e.get("server_aliases", [])]:
+            resolve.setdefault(spelling.lower(), e["field"])
+    for e in searchable:
+        resolve.setdefault(e["title"].lower(), e["search_field"])
+    # The filename is no catalog section, so its search name is added here.
+    resolve.setdefault("name", "name")
+    reserved = sorted(set(resolve) | {"any"})
+    # Where two extra fields list one root, the one listing fewer paths takes
+    # it, and a section takes only a root no extra field claimed. An extra
+    # field's dotted path claims nothing, since a field reading one key under a
+    # root must not capture every other key under it.
+    root_fields: dict[str, str] = {}
+    for e in sorted(blk["extra_fields"], key=lambda x: len(x["paths"])):
+        for pth in e["paths"]:
+            if "." not in pth:
+                root_fields.setdefault(pth, e["field"])
+    for e in searchable:
+        for pth in e["search_paths"]:
+            root_fields.setdefault(pth.split(".")[0], e["search_field"])
+    owners: dict[str, list[str]] = {}
+    for e in searchable:
+        owners.setdefault(e["search_field"], []).append(e["title"])
+    badge_labels = {f: ts[0] for f, ts in owners.items() if len(ts) == 1}
+    return {
+        "resolve": resolve,
+        "sections": secs,
+        "prefixes": list(blk["offered_prefixes"]),
+        "reserved": reserved,
+        "root_fields": root_fields,
+        "roots": sorted(known_summary_keys() | set(root_fields)),
+        "badge_labels": badge_labels,
+        "plain_exclude_paths": sorted(plain_exclude_paths()),
+    }
